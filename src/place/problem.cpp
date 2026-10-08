@@ -454,9 +454,11 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     pt.pos0 = fp.pos;
     pt.angle0 = fp.angle;
 
-    // Courtyards: convex hull of every courtyard graphic per side (a superset of KiCad's courtyard polygon,
-    // so a placement legal here is legal in KiCad).
+    // Courtyards: per side, the convex hull of the line and arc graphics, and of each closed graphic (circle,
+    // rectangle, polygon) on its own (a superset of KiCad's courtyard, so a placement legal here is legal in
+    // KiCad; one hull over a module's connector and its corner-hole circles would cover the whole module).
     std::array<std::vector<Point>, 2> cpts;
+    std::array<std::vector<std::vector<Point>>, 2> closed;
     for (int gi : fp.graphics) {
       const auto& g = b.graphics[z(gi)];
       const int side = g.layer == "F.CrtYd" ? 0 : g.layer == "B.CrtYd" ? 1 : -1;
@@ -471,10 +473,11 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
         }
         case model::Graphic::Kind::Circle: {
           const Coord rad = geom::kiround(std::hypot(static_cast<double>(g.b.x - g.a.x), static_cast<double>(g.b.y - g.a.y)));
-          const auto c = geom::circle_points(g.a, rad, 5'000);
-          v.insert(v.end(), c.begin(), c.end());
+          closed[z(side)].push_back(geom::circle_points(g.a, rad, 5'000));
           break;
         }
+        case model::Graphic::Kind::Rect:
+        case model::Graphic::Kind::Poly: closed[z(side)].push_back(g.pts); break;
         default: v.insert(v.end(), g.pts.begin(), g.pts.end()); break;
       }
     }
@@ -501,11 +504,14 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     // Courtyard shapes per side (offsets from the origin).
     std::array<std::vector<Shape>, 2> cy0;
     for (int s = 0; s < 2; ++s) {
-      if (cpts[z(s)].size() < 3) continue;
-      auto hull = geom::convex_hull(cpts[z(s)]);
-      if (hull.size() < 3) continue;
-      for (auto& q : hull) q = q - fp.pos;
-      cy0[z(s)].push_back(Shape::polygon(std::move(hull), 0));
+      closed[z(s)].push_back(cpts[z(s)]);
+      for (const auto& pts : closed[z(s)]) {
+        if (pts.size() < 3) continue;
+        auto hull = geom::convex_hull(pts);
+        if (hull.size() < 3) continue;
+        for (auto& q : hull) q = q - fp.pos;
+        cy0[z(s)].push_back(Shape::polygon(std::move(hull), 0));
+      }
     }
     if (!pad_box.empty() && std::find(opt.pads_only.begin(), opt.pads_only.end(), fp.reference) != opt.pads_only.end()) cy0 = {};
     pt.copper_only = std::find(opt.copper_only.begin(), opt.copper_only.end(), fp.reference) != opt.copper_only.end();
