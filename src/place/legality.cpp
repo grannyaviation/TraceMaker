@@ -449,8 +449,9 @@ bool Raster::free_impl(int part, Point pos, int rot, bool sat) const {
     for (int s = 0; s < 2; ++s)
       if (hit(occ_[s], sat_occ_[s], shift(t.box, pos).inflated(tinfl))) return false;
   // Copper: against every other part's copper and the fixed board copper, with the largest clearance.
-  const Coord cinfl = std::max({p_.max_need, p_.clearance, kThroughMargin, kThroughThrough}) + 1;
+  // Own need per shape (the exact check that follows covers a neighbour asking for more).
   for (const auto& cs : g.copper) {
+    const Coord cinfl = std::max({cs.need, p_.clearance, kThroughMargin, kThroughThrough}) + 1;
     const int sides = copper_sides(p_, cs.layers);
     for (int s = 0; s < 2; ++s)
       if ((sides & (1 << s)) && (hit(occ_[s], sat_occ_[s], shift(cs.s.box, pos).inflated(cinfl)) ||

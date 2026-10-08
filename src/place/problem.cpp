@@ -8,6 +8,8 @@
 #include <cmath>
 #include <fstream>
 #include <functional>
+#include <map>
+#include <regex>
 
 #include <nlohmann/json.hpp>
 
@@ -281,14 +283,37 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
   // Copper clearances: net class (or board minimum), local overrides; with custom clearance rules, their
   // largest minimum as an upper bound (conditions are not evaluated here: conservative).
   p.copper_layers = std::max(1, b.copper_count());
+  // A condition made only of "A.NetClass == 'X'" terms joined by "||" raises the need of those classes' nets;
+  // any other condition is not evaluated and applies its minimum to every pad.
   Coord custom_max = 0;
+  std::map<std::string, Coord> class_need;
+  static const std::regex class_term(R"(^\s*A\.NetClass\s*==\s*'([^']+)'\s*$)");
   for (const auto& r : rules.custom)
-    for (const auto& k : r.constraints)
-      if (k.type == "clearance" && k.min) custom_max = std::max(custom_max, *k.min);
+    for (const auto& k : r.constraints) {
+      if (k.type != "clearance" || !k.min) continue;
+      std::vector<std::string> classes;
+      bool simple = true;
+      for (std::size_t at = 0; simple;) {
+        const std::size_t bar = r.condition.find("||", at);
+        std::smatch m;
+        const std::string t = r.condition.substr(at, bar == std::string::npos ? std::string::npos : bar - at);
+        if (std::regex_match(t, m, class_term)) classes.push_back(m[1]);
+        else simple = false;
+        if (bar == std::string::npos) break;
+        at = bar + 2;
+      }
+      if (simple)
+        for (const auto& c : classes) class_need[c] = std::max(class_need[c], *k.min);
+      else
+        custom_max = std::max(custom_max, *k.min);
+    }
   if (custom_max > 0) p.notes.push_back("custom clearance rules: placement uses their largest minimum for every pad (conservative)");
+  if (!class_need.empty()) p.notes.push_back("custom clearance rules: " + std::to_string(class_need.size()) + " net classes with their own minimum");
   auto net_need = [&](model::NetId net) {
     const std::string& name = net > 0 && static_cast<std::size_t>(net) < b.nets.size() ? b.nets[z(net)].name : std::string();
-    return std::max({rules.class_for(name).clearance, rules.minimums.clearance, custom_max});
+    const model::NetClass& nc = rules.class_for(name);
+    const auto it = class_need.find(nc.name);
+    return std::max({nc.clearance, rules.minimums.clearance, custom_max, it == class_need.end() ? Coord{0} : it->second});
   };
   const model::LayerMask all_layers = p.copper_layers >= 64 ? ~model::LayerMask{0} : (model::LayerMask{1} << p.copper_layers) - 1;
   const Coord hole_need = std::max({rules.minimums.hole_clearance, rules.default_class().clearance, custom_max});
