@@ -20,6 +20,7 @@
 #include "place/lower_bound.hpp"
 #include "place/placer.hpp"
 #include "place/routable.hpp"
+#include "place/tidy.hpp"
 #include "place/wirelength.hpp"
 #include "route/router.hpp"
 
@@ -586,6 +587,8 @@ int main(int argc, char** argv) {
   int crules_weight_pct = 100;
   bool crules_two_stage = true;
   double clearance_mm = -1;
+  bool tidy = false;
+  double tidy_grid_mm = 0.25, tidy_align_mm = 0.5;
   app.add_option("board", in, "Input .kicad_pcb")->required()->check(CLI::ExistingFile);
   app.add_option("-o,--output", out, "Output .kicad_pcb")->required();
   app.add_option("--mode", o.mode, "full (place from scratch) or refine (improve the current placement)")
@@ -616,6 +619,11 @@ int main(int argc, char** argv) {
   app.add_option("--rules-override", rules_override,
                  "User override file for --component-rules (JSON, doc 15 §6.3): disable rules, assert/deny categories, set parameters")
       ->check(CLI::ExistingFile);
+  app.add_flag("--tidy", tidy,
+               "full/refine/auto: after placing, snap parts to a grid, align nearly aligned parts exactly and turn clusters of two-pad "
+               "passives to one axis; only exactly legal moves (doc 04 §11)");
+  app.add_option("--tidy-grid", tidy_grid_mm, "With --tidy: grid for footprint origins, mm (0 = no snap)")->check(CLI::NonNegativeNumber);
+  app.add_option("--tidy-align", tidy_align_mm, "With --tidy: align body centres closer than this, mm (0 = no alignment)")->check(CLI::NonNegativeNumber);
   app.add_option("--json", json_path, "Write the placement report as JSON");
   app.add_flag("-v,--verbose", o.verbose, "Log the spreading iterations");
   std::string debug_part;
@@ -685,6 +693,7 @@ int main(int argc, char** argv) {
   }
 
   if (o.mode == "routable" || o.mode == "eco") {
+    if (tidy) std::fprintf(stderr, "warning: --tidy applies to full, refine and auto; ignored in %s\n", o.mode.c_str());
     lc.in = in;
     lc.out = out;
     lc.json_path = json_path;
@@ -730,6 +739,7 @@ int main(int argc, char** argv) {
                         (no_decap_affinity ? " --no-decap-affinity" : "") + " --component-rules " + component_rules + " --decap-weight " + std::to_string(decap_weight) +
                         " --crules-weight " + std::to_string(crules_weight_pct) + (crules_two_stage ? "" : " --no-crules-two-stage") + (rules_override.empty() ? "" : " --rules-override '" + rules_override + "'") + (edge_attraction ? " --edge-attraction" : "") +
                         (o.flip ? " --flip --flip-via-mm " + std::to_string(o.via_mm) + " --flip-rate " + std::to_string(o.flip_rate) + (keep_side.empty() ? "" : " --keep-side '" + keep_side + "'") : "") +
+                        (tidy ? " --tidy --tidy-grid " + std::to_string(tidy_grid_mm) + " --tidy-align " + std::to_string(tidy_align_mm) : "") +
                         " > /dev/null 2>&1";
       const int rc = std::system(cmd.c_str());
       if (rc != 0 && rc != 2 * 256) continue;
@@ -812,6 +822,16 @@ int main(int argc, char** argv) {
     p = std::move(x.p);
     pl = std::move(x.pl);
     place::PlaceReport r = std::move(x.r);
+    place::TidyStats ts;
+    if (tidy) {
+      place::TidyOptions to;
+      to.grid = mm_to_nm(tidy_grid_mm);
+      to.align = mm_to_nm(tidy_align_mm);
+      ts = place::tidy(p, pl, to);
+      // Every tidy move lands on an exactly legal spot, so it adds no violation and r.legal stands.
+      const place::Placement input = place::Placement::initial(p);
+      r.after = place::measure(p, pl, &input);
+    }
     int moved = apply(lb, p, pl, o.seed);
     io::BoardEditor ed(lb, o.seed);
     ed.save(out);
@@ -876,6 +896,9 @@ int main(int argc, char** argv) {
                 r.legalise_mean_disp_mm, r.legalise_max_disp_mm);
     std::printf("  annealing: best run %d, %llu moves, %llu accepted%s\n", r.anneal.best_run, static_cast<unsigned long long>(r.anneal.moves),
                 static_cast<unsigned long long>(r.anneal.accepted), r.anneal.time_limited ? " (stopped by --time)" : "");
+    if (tidy)
+      std::printf("  tidy: %d snapped to the %.2f mm grid, %d aligned (within %.2f mm), %d re-oriented\n", ts.snapped, tidy_grid_mm, ts.aligned,
+                  tidy_align_mm, ts.reoriented);
     std::printf("  %d footprints moved, %.1f s, %s -> %s\n", moved, r.seconds_total, r.legal ? "legal" : "NOT LEGAL", out.c_str());
     if (!json_path.empty()) {
       auto j = place::report_json(p, r);
@@ -883,6 +906,7 @@ int main(int argc, char** argv) {
       j["output"] = out;
       j["moved"] = moved;
       j["component_rules"] = {{"mode", component_rules}, {"pseudo_nets", crules_ties}, {"edge_attraction", edge_attraction}, {"rules_override", rules_override}};
+      if (tidy) j["tidy"] = {{"grid_mm", tidy_grid_mm}, {"align_mm", tidy_align_mm}, {"snapped", ts.snapped}, {"aligned", ts.aligned}, {"reoriented", ts.reoriented}};
       if (route_check > 0) j["route_check"] = {{"work", route_check}, {"routed_input", routed_in}, {"routed_output", routed_out}, {"connections", conns}, {"connections_input", conns_in}, {"connections_output", conns_out}, {"kept_input", reverted}};
       // Final placement (footprint origins and courtyard boxes, mm) for plotting and inspection.
       nlohmann::json parts = nlohmann::json::array();

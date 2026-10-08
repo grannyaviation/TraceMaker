@@ -17,6 +17,7 @@
 #include "place/lower_bound.hpp"
 #include "place/placer.hpp"
 #include "place/routable.hpp"
+#include "place/tidy.hpp"
 #include "place/wirelength.hpp"
 
 using namespace tmk;
@@ -48,6 +49,7 @@ int add_part(Problem& p, Point pos, Coord hx, Coord hy, const std::vector<Point>
   pt.movable = movable;
   pt.side = side;
   pt.pos0 = pos;
+  pt.pad_count = static_cast<int>(offs.size());
   pt.shape_key = std::hash<std::string>{}(pt.lib_id) * 31u + static_cast<std::uint64_t>(side);
   for (int r = 0; r < 4; ++r) {
     std::vector<Point> c = {{-hx, -hy}, {hx, -hy}, {hx, hy}, {-hx, hy}};
@@ -1062,4 +1064,143 @@ TEST_CASE("courtyard segments that close no loop keep one hull", "[place][kicad]
   REQUIRE(cy.size() == 1);
   CHECK((cy[0].box.x0 == -3 * MM && cy[0].box.y0 == -MM && cy[0].box.x1 == 3 * MM && cy[0].box.y1 == MM));
   CHECK(geom::closer_than(cy[0], Shape::point({0, 0}, 0), 1));
+}
+
+// ------------------------------------------------------------------------------------------------ tidy pass
+
+namespace {
+// Every conflicting pair after is one that existed before (tidy moves parts only onto exactly legal spots).
+void check_no_new_violation(const Violations& before, const Violations& after) {
+  CHECK(after.overlaps <= before.overlaps);
+  CHECK(after.outside <= before.outside);
+  for (const auto& pr : after.pairs) CHECK(std::find(before.pairs.begin(), before.pairs.end(), pr) != before.pairs.end());
+  for (const int a : after.outside_parts) CHECK(std::find(before.outside_parts.begin(), before.outside_parts.end(), a) != before.outside_parts.end());
+}
+}  // namespace
+
+TEST_CASE("tidy: grid snap puts free parts on the grid, keeps blocked ones, adds no conflict", "[place][tidy]") {
+  Problem p = board(20 * MM, 20 * MM);
+  const std::vector<Point> two = {{-MM / 4, 0}, {MM / 4, 0}};
+  const int f1 = add_part(p, {8'050'000, 10 * MM}, MM, MM, {{0, 0}}, false);   // courtyard right edge at 9.05
+  const int f2 = add_part(p, {11'600'000, 10 * MM}, MM, MM, {{0, 0}}, false);  // left edge at 10.60
+  const int b = add_part(p, {9'820'000, 10 * MM}, MM / 2, MM / 2, two, true);  // legal for x in [9.80, 9.85] only
+  const int a = add_part(p, {4'130'000, 15'370'000}, MM / 2, MM / 4, two, true);
+  const int c = add_part(p, {15'610'000, 4'120'000}, MM / 2, MM / 4, two, true);
+  Placement pl = Placement::initial(p);
+  REQUIRE(check_all(p, pl).overlaps == 0);
+  TidyOptions o;
+  o.align = 0;
+  o.orient = false;
+  const TidyStats st = tidy(p, pl, o);
+  CHECK(st.snapped == 2);
+  CHECK(pl.pos[z(a)] == Point{4'250'000, 15'250'000});
+  CHECK(pl.pos[z(c)] == Point{15'500'000, 4'000'000});
+  CHECK(pl.pos[z(b)] == p.parts[z(b)].pos0);  // 9.75 and 10.00 both conflict: stays
+  CHECK(pl.pos[z(f1)] == p.parts[z(f1)].pos0);
+  CHECK(pl.pos[z(f2)] == p.parts[z(f2)].pos0);
+  const Violations v = check_all(p, pl);
+  CHECK(v.overlaps == 0);
+  CHECK(v.outside == 0);
+
+  // Random problems, overlapping (as generated) and legalised: never a new conflict, snapped parts on the grid.
+  for (const bool legalised : {false, true}) {
+    Problem q = random_problem(60, 7, 30 * MM);
+    Placement ql = Placement::initial(q);
+    if (legalised) legalise(q, ql, false);
+    const Violations v0 = check_all(q, ql);
+    const TidyStats ts = tidy(q, ql, o);
+    CHECK(ts.snapped > 0);
+    check_no_new_violation(v0, check_all(q, ql));
+    int on_grid = 0;
+    for (std::size_t i = 0; i < q.parts.size(); ++i)
+      if (q.parts[i].movable) on_grid += ql.pos[i].x % o.grid == 0 && ql.pos[i].y % o.grid == 0 ? 1 : 0;
+    CHECK(on_grid >= ts.snapped);
+  }
+}
+
+TEST_CASE("tidy: alignment makes nearly aligned pairs exact, the lighter part moves", "[place][tidy]") {
+  Problem p = board(30 * MM, 30 * MM);
+  auto small = [&](Point at) { return add_part(p, at, MM / 2, 300'000, {{-MM / 4, 0}, {MM / 4, 0}}, true); };
+  const int f = add_part(p, {10 * MM, 10 * MM}, MM, MM, {{0, 0}}, false);
+  const int a = small({10'300'000, 13 * MM});                                         // 0.3 mm off the fixed part in x
+  const int big = add_part(p, {20 * MM, 20 * MM}, MM, MM / 2, {{-MM / 2, 0}, {MM / 2, 0}}, true);
+  const int c = small({23 * MM, 20'200'000});                                         // 0.2 mm off the larger part in y
+  const int d = small({5 * MM, 25 * MM}), e = small({8 * MM, 25'600'000});            // 0.6 mm: beyond the tolerance
+  const int g = small({25 * MM, 5 * MM}), h = small({25'300'000, 12 * MM});           // 7 mm apart in y: no partners
+  Placement pl = Placement::initial(p);
+  REQUIRE(check_all(p, pl).overlaps == 0);
+  TidyOptions o;
+  o.grid = 0;
+  o.orient = false;
+  const TidyStats st = tidy(p, pl, o);
+  CHECK(st.aligned == 2);
+  CHECK(pl.pos[z(a)] == Point{10 * MM, 13 * MM});
+  CHECK(pl.pos[z(c)] == Point{23 * MM, 20 * MM});
+  for (const int i : {f, big, d, e, g, h}) CHECK(pl.pos[z(i)] == p.parts[z(i)].pos0);
+  CHECK(check_all(p, pl).overlaps == 0);
+}
+
+TEST_CASE("tidy: a cluster of two-pad passives takes the majority axis unless HPWL rises", "[place][tidy]") {
+  Problem p = board(30 * MM, 30 * MM);
+  // Capacitors in a row at 0°, 180°, 0° and 90°: 180° is the same axis, the 90° one is the minority.
+  std::vector<int> caps;
+  for (int k = 0; k < 4; ++k) {
+    caps.push_back(add_part(p, {(5 + 2 * k) * MM, 5 * MM}, MM / 2, 300'000, {{-MM / 4, 0}, {MM / 4, 0}}, true));
+    p.parts[z(caps.back())].ref = "C" + std::to_string(k + 1);
+  }
+  // Resistors: three at 90°, the one at 0° is wired along x to both sides, so turning it costs 2 mm of HPWL.
+  std::vector<int> res;
+  for (int k = 0; k < 4; ++k) {
+    res.push_back(add_part(p, {(14 + 3 * k) * MM, 15 * MM}, MM, MM / 2, {{-MM / 2, 0}, {MM / 2, 0}}, true));
+    p.parts[z(res.back())].ref = "R" + std::to_string(k + 1);
+  }
+  const int left = add_part(p, {8 * MM, 15 * MM}, MM / 2, MM / 2, {{0, 0}}, false);
+  const int right = add_part(p, {28 * MM, 15 * MM}, MM / 2, MM / 2, {{0, 0}}, false);
+  add_net(p, {{res[0], {-MM / 2, 0}}, {left, {0, 0}}});
+  add_net(p, {{res[0], {MM / 2, 0}}, {right, {0, 0}}});
+  Placement pl = Placement::initial(p);
+  pl.rot[z(caps[1])] = 2;
+  pl.rot[z(caps[3])] = 1;
+  for (int k = 1; k < 4; ++k) pl.rot[z(res[z(k)])] = 1;
+  REQUIRE(check_all(p, pl).overlaps == 0);
+  const std::int64_t hpwl0 = total_hpwl(p, pl);
+  const TidyStats st = tidy(p, pl);
+  CHECK(st.snapped == 0);
+  CHECK(st.aligned == 0);
+  CHECK(st.reoriented == 1);
+  CHECK((pl.rot[z(caps[3])] & 1) == 0);  // turned to 0° or 180°
+  CHECK(pl.rot[z(caps[1])] == 2);        // 180° already had the majority axis
+  CHECK(pl.rot[z(res[0])] == 0);         // turning it would cost 2 mm > 0.5 mm
+  CHECK(total_hpwl(p, pl) == hpwl0);
+  for (const int i : caps) CHECK(pl.pos[z(i)] == p.parts[z(i)].pos0);
+  CHECK(check_all(p, pl).overlaps == 0);
+}
+
+TEST_CASE("tidy: the whole pass never adds a violation, moves only movable parts on their side, is deterministic", "[place][tidy]") {
+  for (std::uint64_t s = 1; s <= 3; ++s)
+    for (const bool legalised : {false, true}) {
+      Problem p = random_problem(80, s, 40 * MM);
+      for (std::size_t i = 0; i < p.parts.size(); ++i)
+        if (p.parts[i].movable) {  // one two-pad footprint, so orientation clusters form
+          p.parts[i].ref = "R" + std::to_string(i);
+          p.parts[i].lib_id = "Resistor_SMD:R_0402";
+        }
+      Placement pl = Placement::initial(p);
+      for (std::size_t i = 0; i < p.parts.size(); ++i)
+        if (p.parts[i].movable) pl.rot[i] = static_cast<std::uint8_t>(i % 2);
+      if (legalised) legalise(p, pl, false);
+      const Placement in = pl;
+      const Violations v0 = check_all(p, pl);
+      const TidyStats st = tidy(p, pl);
+      CHECK(st.snapped + st.aligned + st.reoriented > 0);
+      check_no_new_violation(v0, check_all(p, pl));
+      for (std::size_t i = 0; i < p.parts.size(); ++i) {
+        if (!p.parts[i].movable) CHECK((pl.pos[i] == in.pos[i] && pl.rot[i] == in.rot[i]));
+        CHECK(flipped(pl.rot[i]) == flipped(in.rot[i]));
+      }
+      Placement again = in;
+      tidy(p, again);
+      CHECK(again.pos == pl.pos);
+      CHECK(again.rot == pl.rot);
+    }
 }

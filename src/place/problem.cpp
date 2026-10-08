@@ -477,6 +477,7 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     pt.side = fp.back ? 1 : 0;
     pt.pos0 = fp.pos;
     pt.angle0 = fp.angle;
+    pt.pad_count = static_cast<int>(fp.pads.size());
 
     // Courtyards: per side, the convex hull of each closed loop of line and arc graphics, one hull over the line
     // and arc graphics that close no loop, and one of each closed graphic (circle, rectangle, polygon) on its own

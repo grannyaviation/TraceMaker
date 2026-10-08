@@ -81,6 +81,7 @@ struct Part {
   int side_in(int state) const { return side ^ (flipped(state) ? 1 : 0); }
   double angle_of(int state) const { return flipped(state) ? -angle0 + 90.0 * (state & 3) : angle0 + 90.0 * (state & 3); }
   std::vector<int> pins;        // indices into Problem::pins
+  int pad_count = 0;            // pads of the footprint (the tidy pass turns two-pad passives)
   Coord area = 0;               // courtyard box area incl. clearance (nm², saturating), for spreading
   std::uint64_t shape_key = 0;  // equal keys = interchangeable footprints (swap moves)
 };

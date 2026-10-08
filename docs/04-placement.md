@@ -538,3 +538,26 @@ has one board to act on (kitspace_hack) and does not close it; on the developmen
 (§8). *CP-SAT windows*: OR-tools is not available as a C++ library here, and exact windows by branch and bound
 already equal full enumeration (§8).
 
+
+## 11. Tidy pass (`--tidy`, 2026-10-08)
+
+Opt-in: `tracemaker-place ... --tidy [--tidy-grid 0.25] [--tidy-align 0.5]` (full, refine and auto; ignored with a
+warning in routable/eco). It runs once on the final full/refine result, before the board is written, and makes the
+placement look like a hand layout (`tidy.cpp`). Three greedy, deterministic steps; every move is of a movable part,
+keeps its side, and is accepted only where the exact test passes (`Legality::legal` with the part taken out of the
+index, as the legaliser does), so the pass never adds a violation:
+
+1. **Grid snap**: each movable footprint origin goes to the nearest legal one of the four surrounding grid points
+   (`--tidy-grid`, mm; 0 = off), else stays.
+2. **Axis alignment**: a part whose body centre is within `--tidy-align` of another same-side part's in x, and within
+   6 mm in y, takes that x exactly (and the same for y). The part that moves is the lighter one; anchors in order of
+   preference are fixed parts, then larger area, then more pins, then lower index. Already exactly aligned with an
+   anchor: left alone. Up to 3 passes, heaviest movers first.
+3. **Orientation**: two-pad passives (reference R, C, L, FB or D; exactly two pads) of one footprint on one side whose
+   bodies are less than 3 mm apart form a cluster (fixed members vote). With a strict majority axis (0/180 vs
+   90/270), each minority part turns a quarter (either way, the lower HPWL first) if legal and the summed HPWL of its
+   real nets rises by at most 0.5 mm.
+
+Reported as `tidy: N snapped, N aligned, N re-oriented` and `"tidy"` in the JSON. Limits: alignment may take a part
+off the grid (alignment wins); a part blocked at every grid point stays off it; the pass does not re-route or
+re-check routability (with `--route-check` the check sees the tidied board). Tests: `[tidy]` in `test_place.cpp`.
