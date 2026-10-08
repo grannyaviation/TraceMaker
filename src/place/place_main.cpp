@@ -101,14 +101,21 @@ Placed place_with_fallbacks(const io::LoadedBoard& lb, const model::DesignRules&
   x.p = place::extract(lb.board, rules, in, e2);
   if (x.p.parts.size() != s1.p.parts.size()) return s1;
   x.pl = s1.pl;
+  // Stage 1 seen with stage 2's full courtyards: a part its fallbacks placed by pads or copper only may overlap
+  // others. Such a part stays movable, or once locked its overlaps would only count as fixed-only pairs and stay.
+  const place::Violations v1 = place::check_all(x.p, x.pl);
+  std::vector<char> clash(x.p.parts.size(), 0);
+  for (const auto& [a, b] : v1.pairs) clash[static_cast<std::size_t>(a)] = clash[static_cast<std::size_t>(b)] = 1;
+  for (int a : v1.outside_parts) clash[static_cast<std::size_t>(a)] = 1;
   int locked = 0;
   for (const auto& n : x.p.nets)
     if (n.affinity && (n.name.starts_with("~decap ") || n.name.starts_with("~DEC-")) && !n.pins.empty()) {
       // Both ends: the capacitor and the IC it decouples (an IC pulled towards its crystal would leave its
       // capacitors behind).
       for (int pin : n.pins) {
-        auto& pt = x.p.parts[static_cast<std::size_t>(x.p.pins[static_cast<std::size_t>(pin)].part)];
-        if (pt.movable) {
+        const auto part = static_cast<std::size_t>(x.p.pins[static_cast<std::size_t>(pin)].part);
+        auto& pt = x.p.parts[part];
+        if (pt.movable && !clash[part]) {
           pt.movable = false;
           pt.fixed_reason = "decoupling capacitor or its IC, placed in stage 1";
           ++locked;
