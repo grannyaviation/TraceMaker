@@ -351,7 +351,7 @@ Raster::Raster(const Problem& p, Coord cell) : p_(p), h_(cell) {
   for (const auto& cs : p.fixed_copper) {
     const int sides = copper_sides(p, cs.layers);
     for (int s = 0; s < 2; ++s)
-      if (sides & (1 << s)) bump(fixed_[s], cs.s.box.inflated(cs.need), 1);
+      if (sides & (1 << s)) bump(fixed_[s], cs.s.box, 1);
   }
   for (int s = 0; s < 2; ++s) {
     build_sat(blocked_[s], sat_blocked_[s]);
@@ -422,7 +422,7 @@ void Raster::add(int part, Point pos, int rot, int delta) {
   for (const auto& cs : g.copper) {
     const int sides = copper_sides(p_, cs.layers);
     for (int s = 0; s < 2; ++s)
-      if (sides & (1 << s)) bump(occ_[s], shift(cs.s.box, pos).inflated(cs.need), delta);  // with its own need
+      if (sides & (1 << s)) bump(occ_[s], shift(cs.s.box, pos), delta);
   }
 }
 
@@ -454,8 +454,8 @@ bool Raster::free_impl(int part, Point pos, int rot, bool sat) const {
   for (const auto& t : g.through)
     for (int s = 0; s < 2; ++s)
       if (hit(occ_[s], sat_occ_[s], shift(t.box, pos).inflated(tinfl))) return false;
-  // Copper: against every other part's copper and the fixed board copper. Both sides carry their own need (the
-  // raster grew the others' boxes by theirs), and need_a + need_b >= max(need_a, need_b) keeps this conservative.
+  // Copper: against every other part's copper and the fixed board copper, with the largest clearance.
+  // Own need per shape (the exact check that follows covers a neighbour asking for more).
   for (const auto& cs : g.copper) {
     const Coord cinfl = std::max({cs.need, p_.clearance, kThroughMargin, kThroughThrough}) + 1;
     const int sides = copper_sides(p_, cs.layers);

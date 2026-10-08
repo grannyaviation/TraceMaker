@@ -73,8 +73,11 @@ class Legality {
   Coord reach_ = 0;                            // neighbour search inflation (largest clearance of any kind)
 };
 
-// Conservative occupancy raster per side (cell 0.05–0.1 mm). `free()` returning true proves that the part is
-// legal against the board and every part in the raster; false means "maybe illegal" (run the exact test).
+// Occupancy raster per side (cell 0.05–0.1 mm), a fast filter in front of the exact test. Courtyards, keepouts and
+// the board edge are conservative (`free()` true means legal against them); copper is checked with each probe's
+// own net-class need only, so a neighbour that asks for more is left to the exact test, which always decides.
+// (Growing every copper box by its own need made legalisation fail more often: 7 instead of 14 of 24 sensor_ts
+// placements without new DRC errors.)
 class Raster {
  public:
   Raster(const Problem& p, Coord cell);
