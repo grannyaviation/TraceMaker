@@ -2,6 +2,7 @@
 // Unit tests for the placer (tm::place).
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <set>
 
@@ -927,4 +928,74 @@ TEST_CASE("flip: swap states exchange absolute poses on either side", "[place][f
     const int back = swap_state(sa, -1);
     CHECK(std::fmod(b.angle_of(back) - a.angle_of(sa) + 720.0, 360.0) == 0.0);
   }
+}
+
+TEST_CASE("custom clearance rules that name only net classes apply per class", "[place][rules]") {
+  model::DesignRules r;
+  auto rule = [&](const std::string& condition, Coord min) {
+    model::CustomRule cr;
+    cr.condition = condition;
+    cr.constraints.push_back(model::Constraint{"clearance", min, {}, {}, {}});
+    r.custom.push_back(cr);
+  };
+  rule("A.NetClass == 'AIRCRAFT_IN' || A.NetClass == 'AIRCRAFT_IN_2A'", 1'500'000);
+  rule("A.NetClass == 'HV'", 600'000);
+  rule("A.NetClass == 'HV' && B.Type == 'Pad'", 400'000);  // not evaluated: every pad
+  Coord other = 0;
+  const auto need = class_clearance_rules(r, other);
+  CHECK(need.size() == 3);
+  CHECK(need.at("AIRCRAFT_IN") == 1'500'000);
+  CHECK(need.at("AIRCRAFT_IN_2A") == 1'500'000);
+  CHECK(need.at("HV") == 600'000);
+  CHECK(other == 400'000);
+}
+
+TEST_CASE("low parts may enter low-ok keep-outs, other parts may not", "[place]") {
+  Problem p = board(20 * MM, 20 * MM);
+  const int lo = add_part(p, {5 * MM, 5 * MM}, MM, MM, {{0, 0}}, true);
+  const int hi = add_part(p, {15 * MM, 5 * MM}, MM, MM, {{0, 0}}, true);
+  p.parts[z(lo)].low = true;
+  Keepout k;
+  k.poly = Shape::polygon({{6 * MM, 8 * MM}, {14 * MM, 8 * MM}, {14 * MM, 16 * MM}, {6 * MM, 16 * MM}}, 0);
+  k.side[0] = true;
+  k.low_ok = true;
+  p.keepouts.push_back(k);
+  const Point in{10 * MM, 12 * MM};
+  {
+    Legality L(p);
+    Raster R(p, 50'000);
+    CHECK(L.inside_ok(lo, in, 0));
+    CHECK(R.free(lo, in, 0));
+    CHECK(!L.inside_ok(hi, in, 0));
+    CHECK(!R.free(hi, in, 0));
+  }
+  p.keepouts[0].low_ok = false;  // a plain keep-out keeps every part out
+  Legality L(p);
+  Raster R(p, 50'000);
+  CHECK(!L.inside_ok(lo, in, 0));
+  CHECK(!R.free(lo, in, 0));
+}
+
+TEST_CASE("each closed courtyard shape gets its own hull", "[place][kicad]") {
+  // A module footprint: a connector rectangle and a corner-hole circle 7 mm away (KiCad 10.99 transform).
+  const auto doc = sexpr::Document::parse(R"((kicad_pcb (version 20260624) (generator "pcbnew") (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user) (31 "F.CrtYd" user) (29 "B.CrtYd" user))
+    (setup (pad_to_mask_clearance 0)) (net 0 "") (net 1 "A")
+    (footprint "t:M" (layer "F.Cu") (transform (translate 10 10) (rotate 0) (scale 1 1))
+      (property "Reference" "M1" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -3 -1) (end 3 1) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (fp_circle (center 7 0) (end 8 0) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "A"))
+      (pad "2" smd rect (at 2 0) (size 1 1) (layers "F.Cu") (net 1 "A")))
+    (gr_rect (start 0 0) (end 30 30) (layer "Edge.Cuts") (stroke (width 0.1) (type solid)) (fill no))))");
+  const auto b = io::read_board(doc);
+  const auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  const Problem p = extract(b, rules, "/nonexistent/board.kicad_pcb", ExtractOptions{});
+  const auto it = std::find_if(p.parts.begin(), p.parts.end(), [](const Part& pt) { return pt.ref == "M1"; });
+  REQUIRE(it != p.parts.end());
+  const auto& cy = it->geom[0].cy[0];
+  REQUIRE(cy.size() == 2);
+  // Between the rectangle (x <= 3) and the circle (x >= 6) nothing is courtyard: the old single hull covered it.
+  const Shape probe = Shape::point({4'500'000, 0}, 0);
+  for (const auto& s : cy) CHECK(!geom::closer_than(s, probe, 1));
 }

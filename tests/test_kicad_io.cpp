@@ -361,3 +361,24 @@ TEST_CASE("flipping a KiCad 5 module: user copper names, signed arc sweeps", "[k
   CHECK(has(out, "(pad 1 smd rect (at 1 -2 90) (size 1 1) (layers Back B.Mask))"));
   CHECK(tmk::io::read_board(lb.doc).footprints[0].back);
 }
+
+TEST_CASE("footprint zones: relative in the 10.99 transform format, absolute before", "[kicad][io]") {
+  // The same local point (1 0) as a courtyard line end and as a zone corner must land at the same board point.
+  auto board = [](const std::string& pose, const std::string& zone_pt) {
+    return tmk::io::read_board(tmk::sexpr::Document::parse(
+        "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (31 \"F.CrtYd\" user)) "
+        "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (footprint \"t:M\" (layer \"F.Cu\") " + pose +
+        " (fp_line (start 1 0) (end 2 0) (layer \"F.CrtYd\") (stroke (width 0.05) (type solid)))"
+        " (zone (net 0) (net_name \"\") (layer \"F.Cu\") (name \"k\") (keepout (tracks not_allowed) (vias allowed) (pads allowed)"
+        " (copperpour allowed) (footprints allowed)) (polygon (pts " + zone_pt + " (xy 2 0) (xy 2 1))))))"));
+  };
+  const auto local = board("(transform (translate 10 20) (rotate 90) (scale 1 1))", "(xy 1 0)");
+  REQUIRE(local.zones.size() == 1);
+  REQUIRE(!local.graphics.empty());
+  CHECK(local.zones[0].footprint == 0);
+  CHECK(local.zones[0].outline.at(0).at(0) == local.graphics[0].a);
+  CHECK(local.zones[0].outline.at(0).at(0) != tmk::geom::Point{1'000'000, 0});
+  const auto absolute = board("(at 10 20 90)", "(xy 11 20)");
+  REQUIRE(absolute.zones.size() == 1);
+  CHECK(absolute.zones[0].outline.at(0).at(0) == tmk::geom::Point{11'000'000, 20'000'000});
+}

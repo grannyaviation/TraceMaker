@@ -5,6 +5,7 @@
 // geometry is stored as offsets from its footprint origin for each of the four 90° rotations.
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -188,6 +189,10 @@ struct ExtractOptions {
 };
 
 // Builds the problem. `rules` and `board_path` give the courtyard clearance (custom rules or .kicad_pro).
+// Custom clearance rules that name only net classes of A ("A.NetClass == 'X' || ..."): class -> minimum. The
+// minimum of any other clearance rule goes to other_max.
+std::map<std::string, Coord> class_clearance_rules(const model::DesignRules& rules, Coord& other_max);
+
 Problem extract(const model::Board& b, const model::DesignRules& rules, const std::string& board_path,
                 const ExtractOptions& opt = {});
 

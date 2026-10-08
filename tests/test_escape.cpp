@@ -278,3 +278,23 @@ TEST_CASE("escape flow: shallow packages are planned exactly as version 1", "[es
   CHECK(rings[0] == 1);
   CHECK(rings[static_cast<std::size_t>(3 * 7 + 3)] == 4);
 }
+
+TEST_CASE("track keep-outs let vias through, via keep-outs let tracks through", "[route]") {
+  auto zone = [](const std::string& tracks, const std::string& vias, const std::string& x0, const std::string& x1) {
+    return "(zone (net 0) (net_name \"\") (layers \"F.Cu\" \"B.Cu\") (name \"k\") (keepout (tracks " + tracks + ") (vias " + vias +
+           ") (pads allowed) (copperpour allowed) (footprints allowed)) (polygon (pts (xy " + x0 + " 2) (xy " + x1 + " 2) (xy " + x1 +
+           " 28) (xy " + x0 + " 28))))";
+  };
+  auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) "
+      "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (net 1 \"A\") "
+      "(gr_rect (start 0 0) (end 30 30) (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid)) (fill no)) " +
+      zone("not_allowed", "allowed", "2", "10") + " " + zone("allowed", "not_allowed", "20", "28") + ")"));
+  const auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  route::Obstacles obs(b, rules);
+  constexpr Coord MM = 1'000'000;
+  CHECK(obs.segment_state({4 * MM, 15 * MM}, {8 * MM, 15 * MM}, 0, 200'000, 1, false, nullptr) == 2);
+  CHECK(obs.via_state({6 * MM, 15 * MM}, 600'000, 300'000, 1, 0, false, nullptr) != 2);
+  CHECK(obs.segment_state({22 * MM, 15 * MM}, {26 * MM, 15 * MM}, 0, 200'000, 1, false, nullptr) != 2);
+  CHECK(obs.via_state({24 * MM, 15 * MM}, 600'000, 300'000, 1, 0, false, nullptr) == 2);
+}

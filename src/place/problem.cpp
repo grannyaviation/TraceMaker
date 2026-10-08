@@ -255,6 +255,33 @@ Shape text_box(const model::Text& t) {
 
 }  // namespace
 
+// Custom clearance rules for placement: a condition made only of "A.NetClass == 'X'" terms joined by "||" gives
+// those classes their minimum; any other condition is not evaluated and its minimum goes to other_max (every pad).
+std::map<std::string, Coord> class_clearance_rules(const model::DesignRules& rules, Coord& other_max) {
+  std::map<std::string, Coord> class_need;
+  static const std::regex class_term(R"(^\s*A\.NetClass\s*==\s*'([^']+)'\s*$)");
+  for (const auto& r : rules.custom)
+    for (const auto& k : r.constraints) {
+      if (k.type != "clearance" || !k.min) continue;
+      std::vector<std::string> classes;
+      bool simple = true;
+      for (std::size_t at = 0; simple;) {
+        const std::size_t bar = r.condition.find("||", at);
+        std::smatch m;
+        const std::string t = r.condition.substr(at, bar == std::string::npos ? std::string::npos : bar - at);
+        if (std::regex_match(t, m, class_term)) classes.push_back(m[1]);
+        else simple = false;
+        if (bar == std::string::npos) break;
+        at = bar + 2;
+      }
+      if (simple)
+        for (const auto& c : classes) class_need[c] = std::max(class_need[c], *k.min);
+      else
+        other_max = std::max(other_max, *k.min);
+    }
+  return class_need;
+}
+
 Problem extract(const model::Board& b, const model::DesignRules& rules, const std::string& board_path, const ExtractOptions& opt) {
   Problem p;
   // Spacing rules.
@@ -283,30 +310,8 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
   // Copper clearances: net class (or board minimum), local overrides; with custom clearance rules, their
   // largest minimum as an upper bound (conditions are not evaluated here: conservative).
   p.copper_layers = std::max(1, b.copper_count());
-  // A condition made only of "A.NetClass == 'X'" terms joined by "||" raises the need of those classes' nets;
-  // any other condition is not evaluated and applies its minimum to every pad.
   Coord custom_max = 0;
-  std::map<std::string, Coord> class_need;
-  static const std::regex class_term(R"(^\s*A\.NetClass\s*==\s*'([^']+)'\s*$)");
-  for (const auto& r : rules.custom)
-    for (const auto& k : r.constraints) {
-      if (k.type != "clearance" || !k.min) continue;
-      std::vector<std::string> classes;
-      bool simple = true;
-      for (std::size_t at = 0; simple;) {
-        const std::size_t bar = r.condition.find("||", at);
-        std::smatch m;
-        const std::string t = r.condition.substr(at, bar == std::string::npos ? std::string::npos : bar - at);
-        if (std::regex_match(t, m, class_term)) classes.push_back(m[1]);
-        else simple = false;
-        if (bar == std::string::npos) break;
-        at = bar + 2;
-      }
-      if (simple)
-        for (const auto& c : classes) class_need[c] = std::max(class_need[c], *k.min);
-      else
-        custom_max = std::max(custom_max, *k.min);
-    }
+  const std::map<std::string, Coord> class_need = class_clearance_rules(rules, custom_max);
   if (custom_max > 0) p.notes.push_back("custom clearance rules: placement uses their largest minimum for every pad (conservative)");
   if (!class_need.empty()) p.notes.push_back("custom clearance rules: " + std::to_string(class_need.size()) + " net classes with their own minimum");
   auto net_need = [&](model::NetId net) {
