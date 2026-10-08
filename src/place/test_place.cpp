@@ -999,3 +999,67 @@ TEST_CASE("each closed courtyard shape gets its own hull", "[place][kicad]") {
   const Shape probe = Shape::point({4'500'000, 0}, 0);
   for (const auto& s : cy) CHECK(!geom::closer_than(s, probe, 1));
 }
+
+namespace {
+
+// A board with one footprint F1 at (20, 20) turned by `angle`, whose F.CrtYd is drawn by `crtyd` (fp_line items).
+Problem courtyard_board(const std::string& angle, const std::string& crtyd) {
+  const auto doc = sexpr::Document::parse(R"((kicad_pcb (version 20260624) (generator "pcbnew") (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user) (31 "F.CrtYd" user) (29 "B.CrtYd" user))
+    (setup (pad_to_mask_clearance 0)) (net 0 "") (net 1 "GND")
+    (footprint "t:F" (layer "F.Cu") (transform (translate 20 20) (rotate )" + angle + R"() (scale 1 1))
+      (property "Reference" "F1" (at 0 0 0) (layer "F.SilkS")))" + crtyd + R"(
+      (pad "1" smd rect (at -7.5 0) (size 1 1) (layers "F.Cu") (net 1 "GND"))
+      (pad "2" smd rect (at 7.5 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+    (gr_rect (start 0 0) (end 40 40) (layer "Edge.Cuts") (stroke (width 0.1) (type solid)) (fill no))))");
+  const auto b = io::read_board(doc);
+  const auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  return extract(b, rules, "/nonexistent/board.kicad_pcb", ExtractOptions{});
+}
+
+std::string crtyd_line(double x0, double y0, double x1, double y1) {
+  return "(fp_line (start " + std::to_string(x0) + " " + std::to_string(y0) + ") (end " + std::to_string(x1) + " " + std::to_string(y1) +
+         ") (layer \"F.CrtYd\") (stroke (width 0.05) (type solid)))\n";
+}
+
+std::string crtyd_square(double h) {
+  return crtyd_line(-h, -h, h, -h) + crtyd_line(h, -h, h, h) + crtyd_line(h, h, -h, h) + crtyd_line(-h, h, -h, -h);
+}
+
+}  // namespace
+
+TEST_CASE("a shield can frame courtyard (two nested rectangles) is a ring of four bands", "[place][kicad]") {
+  // Laird BMI-S-202-F style: outer 16.5 mm square, inner one 1.5 mm inside it, as 8 fp_line segments.
+  for (const char* angle : {"0", "30"}) {
+    const Problem p = courtyard_board(angle, crtyd_square(8.25) + crtyd_square(6.75));
+    const auto it = std::find_if(p.parts.begin(), p.parts.end(), [](const Part& pt) { return pt.ref == "F1"; });
+    REQUIRE(it != p.parts.end());
+    const auto& cy = it->geom[0].cy[0];
+    REQUIRE(cy.size() == 4);
+    const double a = std::stod(angle);
+    auto covered = [&](Point local) {
+      const Shape probe = Shape::point(geom::rotate(local, a), 0);
+      return std::any_of(cy.begin(), cy.end(), [&](const Shape& s) { return geom::closer_than(s, probe, 1); });
+    };
+    CHECK(!covered({0, 0}));                       // the middle is free for the parts under the can
+    CHECK(!covered({6 * MM, 6 * MM}));
+    CHECK(covered({7'500'000, 0}));                // inside the wall
+    CHECK(covered({0, -7'500'000}));
+    CHECK(covered({8 * MM, 8 * MM}));
+    if (a == 0) {                                  // the body box is still the outer square
+      const Box& body = it->geom[0].body;
+      CHECK((body.x0 == -8'250'000 && body.y0 == -8'250'000 && body.x1 == 8'250'000 && body.y1 == 8'250'000));
+    }
+  }
+}
+
+TEST_CASE("courtyard segments that close no loop keep one hull", "[place][kicad]") {
+  // Three sides of a 6 x 2 mm rectangle: no loop, so one hull over all of their points (the whole rectangle).
+  const Problem p = courtyard_board("0", crtyd_line(-3, -1, 3, -1) + crtyd_line(3, -1, 3, 1) + crtyd_line(3, 1, -3, 1));
+  const auto it = std::find_if(p.parts.begin(), p.parts.end(), [](const Part& pt) { return pt.ref == "F1"; });
+  REQUIRE(it != p.parts.end());
+  const auto& cy = it->geom[0].cy[0];
+  REQUIRE(cy.size() == 1);
+  CHECK((cy[0].box.x0 == -3 * MM && cy[0].box.y0 == -MM && cy[0].box.x1 == 3 * MM && cy[0].box.y1 == MM));
+  CHECK(geom::closer_than(cy[0], Shape::point({0, 0}, 0), 1));
+}

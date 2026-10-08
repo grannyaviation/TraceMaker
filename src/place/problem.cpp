@@ -50,9 +50,10 @@ bool mounting_hole(const model::Board& b, const model::Footprint& fp) {
   return (ref_like && netless) || upper(fp.lib_id).find("MOUNTINGHOLE") != std::string::npos;
 }
 
-// Closed loops of Edge.Cuts pieces (as route/obstacles does), joining endpoints closer than `tol`: each step
-// appends the piece whose nearest end is closest to the chain's end.
-std::vector<std::vector<Point>> edge_loops(const std::vector<Shape>& edges, Coord tol) {
+// Closed loops of Edge.Cuts pieces (as route/obstacles does) or courtyard lines and arcs, joining endpoints closer
+// than `tol`: each step appends the piece whose nearest end is closest to the chain's end. The points of chains
+// that do not close go to `open` when given.
+std::vector<std::vector<Point>> edge_loops(const std::vector<Shape>& edges, Coord tol, std::vector<Point>* open = nullptr) {
   std::vector<std::vector<Point>> pieces;
   for (const auto& e : edges) pieces.push_back(e.pts);
   auto dist = [](Point a, Point c) { return std::max(std::llabs(a.x - c.x), std::llabs(a.y - c.y)); };
@@ -77,6 +78,7 @@ std::vector<std::vector<Point>> edge_loops(const std::vector<Shape>& edges, Coor
       else chain.insert(chain.end(), pieces[best].begin() + 1, pieces[best].end());
     }
     if (chain.size() >= 4 && dist(chain.front(), chain.back()) <= tol) loops.push_back(std::move(chain));
+    else if (open) open->insert(open->end(), chain.begin(), chain.end());
   }
   return loops;
 }
@@ -86,6 +88,23 @@ long double loop_area(const std::vector<Point>& l) {
   for (std::size_t i = 0, j = l.size() - 1; i < l.size(); j = i++)
     a += static_cast<long double>(l[j].x) * static_cast<long double>(l[i].y) - static_cast<long double>(l[i].x) * static_cast<long double>(l[j].y);
   return std::fabs(a) / 2;
+}
+
+// The box of a closed loop (last point repeating the first) in the frame `to_local` maps into, if the loop is a
+// rectangle along that frame's axes: 4 corners once collinear points are dropped, every side within 10 nm of an axis.
+std::optional<Box> axis_rect(std::vector<Point> l, const std::function<Point(Point)>& to_local) {
+  l.pop_back();
+  std::vector<Point> c;
+  for (std::size_t i = 0; i < l.size(); ++i)
+    if (geom::orient(l[(i + l.size() - 1) % l.size()], l[i], l[(i + 1) % l.size()]) != 0) c.push_back(to_local(l[i]));
+  if (c.size() != 4) return std::nullopt;
+  Box b;
+  for (std::size_t i = 0; i < 4; ++i) {
+    const Point d = c[(i + 1) % 4] - c[i];
+    if (std::min(std::llabs(d.x), std::llabs(d.y)) > 10) return std::nullopt;
+    b.add(c[i]);
+  }
+  return b;
 }
 
 // The outline is the largest loop, accepted only if it contains most pad centres (a lone mounting-hole circle
@@ -459,9 +478,13 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     pt.pos0 = fp.pos;
     pt.angle0 = fp.angle;
 
-    // Courtyards: per side, the convex hull of the line and arc graphics, and of each closed graphic (circle,
-    // rectangle, polygon) on its own (a superset of KiCad's courtyard, so a placement legal here is legal in
-    // KiCad; one hull over a module's connector and its corner-hole circles would cover the whole module).
+    // Courtyards: per side, the convex hull of each closed loop of line and arc graphics, one hull over the line
+    // and arc graphics that close no loop, and one of each closed graphic (circle, rectangle, polygon) on its own
+    // (a superset of KiCad's courtyard, so a placement legal here is legal in KiCad; one hull over a module's
+    // connector and its corner-hole circles would cover the whole module). A loop inside another is a hole: an
+    // RF shield can's frame (outer and inner rectangle) gives the four bands of the ring, any other ring the
+    // outer hull.
+    std::array<std::vector<Shape>, 2> pieces;
     std::array<std::vector<Point>, 2> cpts;
     std::array<std::vector<std::vector<Point>>, 2> closed;
     for (int gi : fp.graphics) {
@@ -470,12 +493,8 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
       if (side < 0) continue;
       auto& v = cpts[z(side)];
       switch (g.kind) {
-        case model::Graphic::Kind::Line: v.push_back(g.a); v.push_back(g.b); break;
-        case model::Graphic::Kind::Arc: {
-          const auto a = geom::arc_points(g.a, g.c, g.b, 5'000);
-          v.insert(v.end(), a.begin(), a.end());
-          break;
-        }
+        case model::Graphic::Kind::Line: pieces[z(side)].push_back(Shape::segment(g.a, g.b, 0)); break;
+        case model::Graphic::Kind::Arc: pieces[z(side)].push_back(Shape::polyline(geom::arc_points(g.a, g.c, g.b, 5'000), 0)); break;
         case model::Graphic::Kind::Circle: {
           const Coord rad = geom::kiround(std::hypot(static_cast<double>(g.b.x - g.a.x), static_cast<double>(g.b.y - g.a.y)));
           closed[z(side)].push_back(geom::circle_points(g.a, rad, 5'000));
@@ -508,7 +527,41 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     }
     // Courtyard shapes per side (offsets from the origin).
     std::array<std::vector<Shape>, 2> cy0;
+    const auto to_local = [&](Point q) { return geom::rotate(q - fp.pos, -fp.angle); };
     for (int s = 0; s < 2; ++s) {
+      const auto loops = edge_loops(pieces[z(s)], 1'000, &cpts[z(s)]);
+      // Holes: a loop's parent is the smallest larger loop around it; loops at even depth are solid, each with
+      // the loops right inside it as its holes.
+      std::vector<int> depth(loops.size(), 0), parent(loops.size(), -1);
+      for (std::size_t i = 0; i < loops.size(); ++i)
+        for (std::size_t j = 0; j < loops.size(); ++j) {
+          if (loop_area(loops[j]) <= loop_area(loops[i]) ||
+              !std::all_of(loops[i].begin(), loops[i].end(), [&](Point q) { return geom::point_in_polygon(q, loops[j]); }))
+            continue;
+          ++depth[i];
+          if (parent[i] < 0 || loop_area(loops[j]) < loop_area(loops[z(parent[i])])) parent[i] = static_cast<int>(j);
+        }
+      for (std::size_t o = 0; o < loops.size(); ++o) {
+        if (depth[o] % 2) continue;
+        std::vector<std::size_t> holes;
+        for (std::size_t i = 0; i < loops.size(); ++i)
+          if (parent[i] == static_cast<int>(o)) holes.push_back(i);
+        const auto out = holes.size() == 1 ? axis_rect(loops[o], to_local) : std::nullopt;
+        const auto in = out ? axis_rect(loops[holes[0]], to_local) : std::nullopt;
+        if (!in) {
+          closed[z(s)].push_back(loops[o]);
+          continue;
+        }
+        // Outer box minus the inner one (shrunk by the 10 nm rectangle tolerance) as top, bottom, left and right
+        // bands, back in board orientation. ponytail: inset one by one for cy_in, the bands leave 0.5 mm wide notches
+        // in the outer edge at their seams; inset the outer box as a whole if the edge test ever needs them closed.
+        const Box h = in->inflated(-10);
+        for (const Box& r : {Box{out->x0, out->y0, out->x1, h.y0}, Box{out->x0, h.y1, out->x1, out->y1},
+                             Box{out->x0, h.y0, h.x0, h.y1}, Box{h.x1, h.y0, out->x1, h.y1}})
+          if (r.x1 > r.x0 && r.y1 > r.y0)
+            cy0[z(s)].push_back(Shape::polygon({geom::rotate({r.x0, r.y0}, fp.angle), geom::rotate({r.x1, r.y0}, fp.angle),
+                                                geom::rotate({r.x1, r.y1}, fp.angle), geom::rotate({r.x0, r.y1}, fp.angle)}, 0));
+      }
       closed[z(s)].push_back(cpts[z(s)]);
       for (const auto& pts : closed[z(s)]) {
         if (pts.size() < 3) continue;
