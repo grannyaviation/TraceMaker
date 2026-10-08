@@ -265,6 +265,29 @@ class Condition {
         const std::string& name = b.nets[net].name;
         v.b = model::wildcard_match(n.args[0], name.substr(0, name.size() - 1)) || model::wildcard_match(n.args[0], name);
       }
+    } else if ((n.name == "insideCourtyard" || n.name == "intersectsCourtyard" || n.name == "intersectsFrontCourtyard" ||
+                n.name == "intersectsBackCourtyard") && !n.args.empty()) {
+      // KiCad: true when any part of the item lies within the named footprint's courtyard, the one on its own
+      // side unless Front/Back says which (insideCourtyard is the older name of intersectsCourtyard).
+      auto test = [&](std::size_t fi) {
+        const auto& fp = b.footprints[fi];
+        const int side = n.name == "intersectsFrontCourtyard" ? 0 : n.name == "intersectsBackCourtyard" ? 1 : fp.back ? 1 : 0;
+        for (const auto& cy : ctx.eng->courtyard_[fi][static_cast<std::size_t>(side)]) {
+          if (!cy.box.inflated(1).intersects(it->box)) continue;
+          if (geom::point_in_polygon(it->pos, cy.pts)) return true;
+          for (const auto& s : it->shapes)
+            if (geom::closer_than(s, cy, 1)) return true;
+        }
+        return false;
+      };
+      const std::string& pat = n.args[0];
+      if (pat.find_first_of("*?") == std::string::npos) {
+        const auto f = ctx.eng->fp_by_ref_.find(pat);
+        v.b = f != ctx.eng->fp_by_ref_.end() && test(static_cast<std::size_t>(f->second));
+      } else {
+        for (std::size_t fi = 0; fi < b.footprints.size() && !v.b; ++fi)
+          v.b = model::wildcard_match(pat, b.footprints[fi].reference) && test(fi);
+      }
     } else if (n.name == "memberOfFootprint" && !n.args.empty()) {
       v.b = it->footprint >= 0 && model::wildcard_match(n.args[0], b.footprints[static_cast<std::size_t>(it->footprint)].reference);
     } else {
@@ -298,6 +321,40 @@ class Condition {
 // ---------------------------------------------------------------------------------------------------------
 
 RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r, const CopperModel& cm) : b_(b), r_(r), cm_(cm) {
+  // Courtyards for the courtyard functions: closed graphics one hull each, lines and arcs one hull together.
+  courtyard_.resize(b_.footprints.size());
+  {
+    std::vector<std::array<std::vector<geom::Point>, 2>> open(b_.footprints.size());
+    std::vector<std::array<std::vector<std::vector<geom::Point>>, 2>> closed(b_.footprints.size());
+    for (const auto& g : b_.graphics) {
+      const int side = g.layer == "F.CrtYd" ? 0 : g.layer == "B.CrtYd" ? 1 : -1;
+      if (side < 0 || g.footprint < 0) continue;
+      const auto fi = static_cast<std::size_t>(g.footprint);
+      const auto si = static_cast<std::size_t>(side);
+      switch (g.kind) {
+        case model::Graphic::Kind::Line: open[fi][si].push_back(g.a); open[fi][si].push_back(g.b); break;
+        case model::Graphic::Kind::Arc: {
+          const auto a = geom::arc_points(g.a, g.c, g.b);
+          open[fi][si].insert(open[fi][si].end(), a.begin(), a.end());
+          break;
+        }
+        case model::Graphic::Kind::Circle:
+          closed[fi][si].push_back(geom::circle_points(g.a, geom::kiround(std::hypot(static_cast<double>(g.b.x - g.a.x), static_cast<double>(g.b.y - g.a.y)))));
+          break;
+        default: closed[fi][si].push_back(g.pts); break;
+      }
+    }
+    for (std::size_t fi = 0; fi < b_.footprints.size(); ++fi)
+      for (std::size_t si = 0; si < 2; ++si) {
+        closed[fi][si].push_back(open[fi][si]);
+        for (auto& pts : closed[fi][si]) {
+          if (pts.size() < 3) continue;
+          auto hull = geom::convex_hull(std::move(pts));
+          if (hull.size() >= 3) courtyard_[fi][si].push_back(geom::Shape::polygon(std::move(hull), 0));
+        }
+      }
+    for (std::size_t fi = 0; fi < b_.footprints.size(); ++fi) fp_by_ref_.emplace(b_.footprints[fi].reference, static_cast<int>(fi));
+  }
   for (const auto& rule : r_.custom) {
     Compiled c{&rule, nullptr, true};
     if (!rule.condition.empty()) {

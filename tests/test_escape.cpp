@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <set>
 
+#include "drc/copper.hpp"
+#include "drc/rule_engine.hpp"
 #include "io/kicad/board_reader.hpp"
 #include "io/kicad/project_reader.hpp"
 #include "route/escape.hpp"
@@ -297,4 +299,39 @@ TEST_CASE("track keep-outs let vias through, via keep-outs let tracks through", 
   CHECK(obs.via_state({6 * MM, 15 * MM}, 600'000, 300'000, 1, 0, false, nullptr) != 2);
   CHECK(obs.segment_state({22 * MM, 15 * MM}, {26 * MM, 15 * MM}, 0, 200'000, 1, false, nullptr) != 2);
   CHECK(obs.via_state({24 * MM, 15 * MM}, 600'000, 300'000, 1, 0, false, nullptr) == 2);
+}
+
+TEST_CASE("courtyard functions in custom rules", "[route][rules]") {
+  // U1's courtyard is (8,8)-(12,12); a rule lowers the clearance for anything touching it, as KiCad does.
+  auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (31 \"F.CrtYd\" user)) "
+      "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (net 1 \"A\") (net 2 \"B\") "
+      "(footprint \"t:U\" (layer \"F.Cu\") (transform (translate 10 10) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"U1\" (at 0 0 0) (layer \"F.SilkS\")) "
+      "(fp_rect (start -2 -2) (end 2 2) (layer \"F.CrtYd\") (stroke (width 0.05) (type solid)) (fill no)) "
+      "(pad \"1\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net 1 \"A\"))) "
+      "(segment (start 10 11) (end 11 11) (width 0.2) (layer \"F.Cu\") (net 2)) "
+      "(segment (start 20 20) (end 21 20) (width 0.2) (layer \"F.Cu\") (net 2)) "
+      "(segment (start 20 22) (end 21 22) (width 0.2) (layer \"F.Cu\") (net 1)))"));
+  auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  model::CustomRule cr;
+  cr.name = "fine pitch U1";
+  cr.condition = "A.insideCourtyard('U1')";
+  cr.constraints.push_back(model::Constraint{"clearance", 100'000, {}, {}, {}});
+  rules.custom.push_back(cr);
+  const auto cm = drc::build_copper(b);
+  const drc::RuleEngine eng(b, rules, cm);
+  const drc::CopperItem *pad = nullptr, *inside = nullptr, *out_b = nullptr, *out_a = nullptr;
+  for (const auto& it : cm.items) {
+    if (it.kind == drc::ItemKind::Pad) pad = &it;
+    if (it.kind != drc::ItemKind::Track) continue;
+    const Coord y = (it.box.y0 + it.box.y1) / 2;
+    if (y == 11'000'000) inside = &it;
+    if (y == 20'000'000) out_b = &it;
+    if (y == 22'000'000) out_a = &it;
+  }
+  REQUIRE((pad && inside && out_b && out_a));
+  CHECK(eng.clearance(*pad, *inside, 0) == 100'000);   // both touch the courtyard
+  CHECK(eng.clearance(*pad, *out_b, 0) == 100'000);    // one of them does (KiCad tries A,B and B,A)
+  CHECK(eng.clearance(*out_a, *out_b, 0) == rules.default_class().clearance);  // neither
 }

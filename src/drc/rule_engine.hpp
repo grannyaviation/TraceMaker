@@ -2,6 +2,7 @@
 #pragma once
 // Resolves KiCad constraints for pairs of copper items (design doc 03 §6): net-class clearances, local pad
 // overrides, board minimums and custom .kicad_dru rules with their conditions.
+#include <array>
 #include <tuple>
 #include <mutex>
 #include <map>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "drc/copper.hpp"
+#include "geom/shape.hpp"
 #include "model/board.hpp"
 #include "model/rules.hpp"
 
@@ -73,6 +75,10 @@ class RuleEngine {
   // Area functions (insideArea, intersectsArea, enclosedByArea) of a zone fill, by (condition node, zone, fill):
   // a fill has tens of thousands of points and is asked again for every pair it is in (vme-wren: 80 s of a DRC).
   mutable std::map<std::tuple<const void*, int, int>, bool> area_cache_;
+  // Courtyard functions (insideCourtyard, intersectsCourtyard, intersectsFront/BackCourtyard): per footprint and
+  // side (0 front, 1 back), one convex hull per closed courtyard graphic and one over its lines and arcs.
+  std::vector<std::array<std::vector<geom::Shape>, 2>> courtyard_;
+  std::map<std::string, int> fp_by_ref_;
   mutable std::mutex area_mutex_;
   bool any_custom_clearance_ = false;
   bool zone_overrides_ = false;
