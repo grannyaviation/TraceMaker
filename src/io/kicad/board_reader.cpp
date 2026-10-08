@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 
 namespace tmk::io {
@@ -247,6 +248,7 @@ class Reader {
 
   void read_footprint(NodeId f) {
     model::Footprint fp;
+    bool local_zones = false;
     fp.node = f;
     fp.lib_id = d_.str_at(f, 1);
     fp.locked = yes(f, "locked");
@@ -260,7 +262,9 @@ class Reader {
       fp.angle = d_.number_at(a, 3).value_or(0.0);
     } else if (NodeId t = d_.find(f, "transform"); t != kNoNode) {
       // KiCad 10.99 (file version 20260624) writes (transform (translate x y) (rotate a) (scale sx sy)) in place
-      // of (at x y a); the children keep their old conventions (pad angles absolute).
+      // of (at x y a); the children keep their old conventions (pad angles absolute), except zones, whose
+      // points are now relative to the footprint like its graphics.
+      local_zones = true;
       if (NodeId tr = d_.find(t, "translate"); tr != kNoNode) fp.pos = xy(tr);
       if (NodeId ro = d_.find(t, "rotate"); ro != kNoNode) fp.angle = d_.number_at(ro, 1).value_or(0.0);
       if (NodeId sc = d_.find(t, "scale"); sc != kNoNode &&
@@ -309,13 +313,14 @@ class Reader {
     if (NodeId dn = d_.find(f, "dnp"); dn != kNoNode) fp.dnp = yes(f, "dnp");
     const int fi = static_cast<int>(b_.footprints.size());
     b_.footprints.push_back(fp);
+    const auto zone_tf = [&, pos = fp.pos, angle = fp.angle](Point p) { return local_zones ? pos + geom::rotate(p, angle) : p; };
     for (NodeId c : d_.children(f)) {
       if (!d_.is_list(c)) continue;
       const std::string_view h = d_.head(c);
       if (h == "pad") read_pad(c, fi);
       else if (h.starts_with("fp_") && h != "fp_text" && h != "fp_text_box") read_graphic(c, fi, fp.pos, fp.angle, true);
       else if (h == "fp_text") read_text(c, fi, fp.pos, fp.angle);
-      else if (h == "zone") read_zone(c, fi);
+      else if (h == "zone") read_zone(c, fi, zone_tf);
     }
   }
 
@@ -578,7 +583,7 @@ class Reader {
     b_.vias.push_back(via);
   }
 
-  void read_zone(NodeId z, int fi) {
+  void read_zone(NodeId z, int fi, const std::function<Point(Point)>& tf = [](Point p) { return p; }) {
     model::Zone zone;
     zone.node = z;
     zone.footprint = fi;
@@ -609,6 +614,7 @@ class Reader {
     for (NodeId poly : d_.find_all(z, "polygon")) {
       std::vector<Point> pts;
       if (NodeId p = d_.find(poly, "pts"); p != kNoNode) read_pts(p, pts, Point{}, 0);
+      for (auto& q : pts) q = tf(q);
       zone.outline.push_back(std::move(pts));
     }
     for (NodeId fill : d_.find_all(z, "filled_polygon")) {
@@ -616,6 +622,7 @@ class Reader {
       if (NodeId l = d_.find(fill, "layer"); l != kNoNode) li = b_.copper_index(d_.str_at(l, 1));
       std::vector<Point> pts;
       if (NodeId p = d_.find(fill, "pts"); p != kNoNode) read_pts(p, pts, Point{}, 0);
+      for (auto& q : pts) q = tf(q);
       zone.fills.emplace_back(li, std::move(pts));
     }
     b_.zones.push_back(std::move(zone));
