@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
-#include <functional>
 #include <stdexcept>
 
 namespace tmk::io {
@@ -313,14 +312,13 @@ class Reader {
     if (NodeId dn = d_.find(f, "dnp"); dn != kNoNode) fp.dnp = yes(f, "dnp");
     const int fi = static_cast<int>(b_.footprints.size());
     b_.footprints.push_back(fp);
-    const auto zone_tf = [&, pos = fp.pos, angle = fp.angle](Point p) { return local_zones ? pos + geom::rotate(p, angle) : p; };
     for (NodeId c : d_.children(f)) {
       if (!d_.is_list(c)) continue;
       const std::string_view h = d_.head(c);
       if (h == "pad") read_pad(c, fi);
       else if (h.starts_with("fp_") && h != "fp_text" && h != "fp_text_box") read_graphic(c, fi, fp.pos, fp.angle, true);
       else if (h == "fp_text") read_text(c, fi, fp.pos, fp.angle);
-      else if (h == "zone") read_zone(c, fi, zone_tf);
+      else if (h == "zone") read_zone(c, fi, local_zones ? fp.pos : Point{}, local_zones ? fp.angle : 0.0);
     }
   }
 
@@ -583,7 +581,7 @@ class Reader {
     b_.vias.push_back(via);
   }
 
-  void read_zone(NodeId z, int fi, const std::function<Point(Point)>& tf = [](Point p) { return p; }) {
+  void read_zone(NodeId z, int fi, Point origin = {}, double angle = 0) {
     model::Zone zone;
     zone.node = z;
     zone.footprint = fi;
@@ -613,16 +611,14 @@ class Reader {
     }
     for (NodeId poly : d_.find_all(z, "polygon")) {
       std::vector<Point> pts;
-      if (NodeId p = d_.find(poly, "pts"); p != kNoNode) read_pts(p, pts, Point{}, 0);
-      for (auto& q : pts) q = tf(q);
+      if (NodeId p = d_.find(poly, "pts"); p != kNoNode) read_pts(p, pts, origin, angle);
       zone.outline.push_back(std::move(pts));
     }
     for (NodeId fill : d_.find_all(z, "filled_polygon")) {
       int li = -1;
       if (NodeId l = d_.find(fill, "layer"); l != kNoNode) li = b_.copper_index(d_.str_at(l, 1));
       std::vector<Point> pts;
-      if (NodeId p = d_.find(fill, "pts"); p != kNoNode) read_pts(p, pts, Point{}, 0);
-      for (auto& q : pts) q = tf(q);
+      if (NodeId p = d_.find(fill, "pts"); p != kNoNode) read_pts(p, pts, origin, angle);
       zone.fills.emplace_back(li, std::move(pts));
     }
     b_.zones.push_back(std::move(zone));
