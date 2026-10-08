@@ -258,6 +258,14 @@ class Reader {
     if (NodeId a = d_.find(f, "at"); a != kNoNode) {
       fp.pos = xy(a);
       fp.angle = d_.number_at(a, 3).value_or(0.0);
+    } else if (NodeId t = d_.find(f, "transform"); t != kNoNode) {
+      // KiCad 10.99 (file version 20260624) writes (transform (translate x y) (rotate a) (scale sx sy)) in place
+      // of (at x y a); the children keep their old conventions (pad angles absolute).
+      if (NodeId tr = d_.find(t, "translate"); tr != kNoNode) fp.pos = xy(tr);
+      if (NodeId ro = d_.find(t, "rotate"); ro != kNoNode) fp.angle = d_.number_at(ro, 1).value_or(0.0);
+      if (NodeId sc = d_.find(t, "scale"); sc != kNoNode &&
+          (d_.number_at(sc, 1).value_or(1.0) != 1.0 || d_.number_at(sc, 2).value_or(1.0) != 1.0))
+        throw std::runtime_error("footprint " + fp.lib_id + ": a scaled transform is not supported");
     }
     if (NodeId u = d_.find(f, "uuid"); u != kNoNode) fp.uuid = d_.str_at(u, 1);
     if (NodeId c = d_.find(f, "clearance"); c != kNoNode) fp.clearance = d_.nm_at(c, 1).value_or(-1);

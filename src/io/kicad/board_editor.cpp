@@ -68,15 +68,33 @@ void BoardEditor::add_via(const model::Via& v) {
 void BoardEditor::remove_track(std::size_t index) { lb_.doc.remove(lb_.board.tracks.at(index).node); }
 void BoardEditor::remove_via(std::size_t index) { lb_.doc.remove(lb_.board.vias.at(index).node); }
 
+namespace {
+
+using sexpr::Document;
+using sexpr::NodeId;
+
+// Writes a footprint's pose: (at x y a) up to KiCad 10, the (translate …)/(rotate …) of (transform …) on 10.99.
+void set_pose(Document& doc, NodeId fp, model::Point pos, const std::string& a) {
+  if (const NodeId t = doc.find(fp, "transform"); t != kNoNode) {
+    if (const NodeId tr = doc.find(t, "translate"); tr != kNoNode)
+      doc.replace(tr, "(translate " + format_mm(pos.x) + " " + format_mm(pos.y) + ")");
+    if (const NodeId ro = doc.find(t, "rotate"); ro != kNoNode) doc.replace(ro, "(rotate " + a + ")");
+    return;
+  }
+  const NodeId at = doc.find(fp, "at");
+  const std::string at_text = "(at " + format_mm(pos.x) + " " + format_mm(pos.y) + (a == "0" ? "" : " " + a) + ")";
+  if (at != kNoNode) doc.replace(at, at_text);
+  else doc.append_child(fp, at_text);
+}
+
+}  // namespace
+
 void BoardEditor::move_footprint(std::size_t index, model::Point pos, double angle) {
   auto& doc = lb_.doc;
   const auto& fp = lb_.board.footprints.at(index);
   const double delta = angle - fp.angle;
   const std::string a = format_angle(angle);
-  const sexpr::NodeId at = doc.find(fp.node, "at");
-  std::string at_text = "(at " + format_mm(pos.x) + " " + format_mm(pos.y) + (a == "0" ? "" : " " + a) + ")";
-  if (at != kNoNode) doc.replace(at, at_text);
-  else doc.append_child(fp.node, at_text);
+  set_pose(doc, fp.node, pos, a);
   if (geom::norm_deg(delta) == 0.0) return;
 
   // KiCad stores pad and text orientations as absolute angles: rotate them with the footprint.
@@ -250,7 +268,7 @@ bool flip_supported(const LoadedBoard& lb, std::size_t index, std::string* why) 
   for (NodeId c : doc.children(fp.node)) {
     if (!doc.is_list(c)) continue;
     const std::string_view h = doc.head(c);
-    if (h == "layer" || h == "at" || inert_child(h)) continue;
+    if (h == "layer" || h == "at" || h == "transform" || inert_child(h)) continue;
     if (h == "pad") {
       if (doc.find(c, "padstack") != kNoNode) return no("pad with a padstack");
       if (doc.find(c, "zone_layer_connections") != kNoNode) return no("pad with zone layer connections");
@@ -276,10 +294,7 @@ void BoardEditor::flip_footprint(std::size_t index, model::Point pos, double ang
   const double delta = angle + fp.angle;  // the flip alone gives −angle0; then rotate by delta
   Flipper fl{lb_.board, doc};
   const std::string a = format_angle(angle);
-  const NodeId at = doc.find(fp.node, "at");
-  std::string at_text = "(at " + format_mm(pos.x) + " " + format_mm(pos.y) + (a == "0" ? "" : " " + a) + ")";
-  if (at != kNoNode) doc.replace(at, at_text);
-  else doc.append_child(fp.node, at_text);
+  set_pose(doc, fp.node, pos, a);
   for (NodeId c : doc.children(fp.node)) {
     if (!doc.is_list(c)) continue;
     const std::string_view h = doc.head(c);
