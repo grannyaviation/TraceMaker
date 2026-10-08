@@ -483,11 +483,11 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     // and arc graphics that close no loop, and one of each closed graphic (circle, rectangle, polygon) on its own
     // (a superset of KiCad's courtyard, so a placement legal here is legal in KiCad; one hull over a module's
     // connector and its corner-hole circles would cover the whole module). A loop inside another is a hole: an
-    // RF shield can's frame (outer and inner rectangle) gives the four bands of the ring, any other ring the
-    // outer hull.
+    // RF shield can's frame (outer and inner rectangle, drawn as lines or as two rectangles) gives the four bands of
+    // the ring, any other ring the outer hull.
     std::array<std::vector<Shape>, 2> pieces;
     std::array<std::vector<Point>, 2> cpts;
-    std::array<std::vector<std::vector<Point>>, 2> closed;
+    std::array<std::vector<std::vector<Point>>, 2> closed, polys;
     for (int gi : fp.graphics) {
       const auto& g = b.graphics[z(gi)];
       const int side = g.layer == "F.CrtYd" ? 0 : g.layer == "B.CrtYd" ? 1 : -1;
@@ -502,7 +502,7 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
           break;
         }
         case model::Graphic::Kind::Rect:
-        case model::Graphic::Kind::Poly: closed[z(side)].push_back(g.pts); break;
+        case model::Graphic::Kind::Poly: polys[z(side)].push_back(g.pts); break;
         default: v.insert(v.end(), g.pts.begin(), g.pts.end()); break;
       }
     }
@@ -530,7 +530,13 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     std::array<std::vector<Shape>, 2> cy0;
     const auto to_local = [&](Point q) { return geom::rotate(q - fp.pos, -fp.angle); };
     for (int s = 0; s < 2; ++s) {
-      const auto loops = edge_loops(pieces[z(s)], 1'000, &cpts[z(s)]);
+      // Closed rectangles and polygons take part in the nesting too: a can frame may be two nested fp_rects.
+      auto loops = edge_loops(pieces[z(s)], 1'000, &cpts[z(s)]);
+      for (auto l : polys[z(s)]) {
+        if (l.size() < 3) continue;
+        if (l.front() != l.back()) l.push_back(l.front());  // closed like edge_loops' rings
+        loops.push_back(std::move(l));
+      }
       // Holes: a loop's parent is the smallest larger loop around it; loops at even depth are solid, each with
       // the loops right inside it as its holes.
       std::vector<int> depth(loops.size(), 0), parent(loops.size(), -1);

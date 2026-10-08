@@ -1204,3 +1204,26 @@ TEST_CASE("tidy: the whole pass never adds a violation, moves only movable parts
       CHECK(again.rot == pl.rot);
     }
 }
+
+TEST_CASE("a shield can frame drawn as two nested rectangles is a ring of four bands too", "[place][kicad]") {
+  auto rect = [](double h) {
+    return "(fp_rect (start " + std::to_string(-h) + " " + std::to_string(-h) + ") (end " + std::to_string(h) + " " + std::to_string(h) +
+           ") (layer \"F.CrtYd\") (stroke (width 0.05) (type solid)) (fill no))\n";
+  };
+  for (const char* angle : {"0", "30"}) {
+    const Problem p = courtyard_board(angle, rect(8.25) + rect(6.75));
+    const auto it = std::find_if(p.parts.begin(), p.parts.end(), [](const Part& pt) { return pt.ref == "F1"; });
+    REQUIRE(it != p.parts.end());
+    const auto& cy = it->geom[0].cy[0];
+    REQUIRE(cy.size() == 4);
+    const double a = std::stod(angle);
+    auto covered = [&](Point local) {
+      const Shape probe = Shape::point(geom::rotate(local, a), 0);
+      return std::any_of(cy.begin(), cy.end(), [&](const Shape& s) { return geom::closer_than(s, probe, 1); });
+    };
+    CHECK(!covered({0, 0}));
+    CHECK(!covered({6 * MM, 6 * MM}));
+    CHECK(covered({7'500'000, 0}));
+    CHECK(covered({0, -7'500'000}));
+  }
+}
