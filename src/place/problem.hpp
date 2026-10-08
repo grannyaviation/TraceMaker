@@ -71,6 +71,7 @@ struct Part {
   // May move to the other side (states 4–7): movable, surface mount only (no holes), the board has two copper
   // sides, flipping was asked for, and the writer can mirror the footprint (doc 04 §3 C/E, D48).
   bool flippable = false;
+  bool low = false;             // ExtractOptions::low: keepouts whose name contains low-ok do not apply
   std::string flip_reason;      // why a movable part may not flip (empty when it may, or when flipping is off)
   Point pos0;                   // original origin
   double angle0 = 0;            // original absolute orientation (degrees); see kStates for state angles
@@ -107,6 +108,7 @@ struct PNet {
 struct Keepout {
   Shape poly;
   bool side[2] = {false, false};
+  bool low_ok = false;  // zone name contains low-ok: parts in ExtractOptions::low may go inside
 };
 
 struct Problem {
@@ -171,6 +173,7 @@ struct ExtractOptions {
   std::vector<std::uint8_t> flip_ok;
   std::vector<std::string> flip_why;
   std::vector<std::string> keep_side;
+  std::vector<std::string> low;  // references that keepouts whose name contains low-ok do not apply to (height-limited areas)
   // References whose courtyard is ignored: the part is as large as its pads (box + 0.25 mm), like a footprint
   // drawn without a courtyard. Full mode's fallback for parts whose courtyard fits nowhere (designers overlap
   // courtyards routinely: 24 of the 40 boards of set H do; doc 04 §9).

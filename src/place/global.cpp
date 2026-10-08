@@ -101,8 +101,9 @@ Bins make_bins(const Problem& p) {
           if (pred(c)) freem[z(y * sx + x)] = 0;
         }
     };
+    // A low-ok keepout counts as free: most parts may go there, legalisation moves the others out.
     for (const auto& k : p.keepouts)
-      if (k.side[s]) clear_box(k.poly.box, [&](Point c) { return geom::point_in_polygon(c, k.poly.pts); });
+      if (k.side[s] && !k.low_ok) clear_box(k.poly.box, [&](Point c) { return geom::point_in_polygon(c, k.poly.pts); });
     for (const auto& pt : p.parts) {
       if (pt.movable) continue;
       const PartGeom& g = pt.geom[0];

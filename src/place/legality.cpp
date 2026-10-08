@@ -112,7 +112,7 @@ bool Legality::inside_ok(int part, Point pos, int rot, bool lenient) const {
     }
     for (const Shape& cy : g.cy[z(s)])
       for (const auto& k : p_.keepouts)
-        if (k.side[s] && closer(k.poly, Point{}, cy, pos, 1)) return false;
+        if (k.side[s] && !(k.low_ok && p_.parts[z(part)].low) && closer(k.poly, Point{}, cy, pos, 1)) return false;
   }
   const Coord ec = lenient ? 1 : std::max<Coord>(p_.edge_clearance, 1);
   for (const auto& pd : g.pads) {
@@ -328,6 +328,7 @@ Raster::Raster(const Problem& p, Coord cell) : p_(p), h_(cell) {
   for (int s = 0; s < 2; ++s) {
     for (std::size_t i = 0; i < n; ++i) blocked_[s][i] = inside[i] ? 0 : 1;
     keep_[s].assign(n, 0);
+    keeplo_[s].assign(n, 0);
   }
   // Keepouts: cells whose centre is inside, or that an edge of the keepout crosses.
   for (const auto& k : p.keepouts) {
@@ -341,8 +342,10 @@ Raster::Raster(const Problem& p, Coord cell) : p_(p), h_(cell) {
       }
     mark_path(k.poly.pts, true, m, 1);
     for (int s = 0; s < 2; ++s)
-      if (k.side[s])
-        for (std::size_t i = 0; i < n; ++i) keep_[s][i] = static_cast<std::uint16_t>(keep_[s][i] | m[i]);
+      if (k.side[s]) {
+        auto& g = k.low_ok ? keeplo_[s] : keep_[s];
+        for (std::size_t i = 0; i < n; ++i) g[i] = static_cast<std::uint16_t>(g[i] | m[i]);
+      }
   }
   for (int s = 0; s < 2; ++s) fixed_[s].assign(n, 0);
   for (const auto& cs : p.fixed_copper) {
@@ -353,6 +356,7 @@ Raster::Raster(const Problem& p, Coord cell) : p_(p), h_(cell) {
   for (int s = 0; s < 2; ++s) {
     build_sat(blocked_[s], sat_blocked_[s]);
     build_sat(keep_[s], sat_keep_[s]);
+    build_sat(keeplo_[s], sat_keeplo_[s]);
     build_sat(fixed_[s], sat_fixed_[s]);
   }
 }
@@ -443,7 +447,9 @@ bool Raster::free_impl(int part, Point pos, int rot, bool sat) const {
     if (g.cy[z(s)].empty()) continue;
     if (hit(blocked_[s], sat_blocked_[s], shift(g.edge_box, pos))) return false;
     for (const Shape& cy : g.cy[z(s)])
-      if (hit(keep_[s], sat_keep_[s], shift(cy.box, pos)) || hit(occ_[s], sat_occ_[s], shift(cy.box, pos).inflated(infl))) return false;
+      if (hit(keep_[s], sat_keep_[s], shift(cy.box, pos)) || (!p_.parts[z(part)].low && hit(keeplo_[s], sat_keeplo_[s], shift(cy.box, pos))) ||
+          hit(occ_[s], sat_occ_[s], shift(cy.box, pos).inflated(infl)))
+        return false;
   }
   for (const auto& t : g.through)
     for (int s = 0; s < 2; ++s)

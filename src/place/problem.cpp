@@ -420,6 +420,7 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
     if (!zn.rule_area || !zn.keepout_footprints || zn.outline.empty() || zn.outline.front().size() < 3) continue;
     Keepout k;
     k.poly = Shape::polygon(zn.outline.front(), 0);
+    k.low_ok = zn.name.find("low-ok") != std::string::npos;
     for (const auto& l : zn.layers) {
       if (l == "F.Cu" || l == "*.Cu" || l == "F&B.Cu") k.side[0] = true;
       if (l == "B.Cu" || l == "*.Cu" || l == "F&B.Cu") k.side[1] = true;
@@ -788,6 +789,7 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
   // Flipped states: pin offsets mirrored in y, then turned (see kStates).
   for (auto& q : p.pins)
     for (int r = 0; r < 4; ++r) q.off[z(4 + r)] = rot90(mirror_y(q.off[0]), r);
+  for (auto& pt : p.parts) pt.low = std::find(opt.low.begin(), opt.low.end(), pt.ref) != opt.low.end();
   // Side assignment: only parts that may move at all, never parts the user pinned to their side (rule 6).
   if (opt.flip) {
     int n = 0;

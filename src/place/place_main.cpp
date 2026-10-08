@@ -235,7 +235,16 @@ int apply(io::LoadedBoard& lb, const place::Problem& p, const place::Placement& 
 }
 
 // Side assignment (D48): which footprints the writer can mirror, and the user's side pins.
-void setup_flip(const io::LoadedBoard& lb, bool flip, const std::string& keep_side, place::ExtractOptions& eo) {
+void setup_flip(const io::LoadedBoard& lb, bool flip, const std::string& keep_side, const std::string& low, place::ExtractOptions& eo) {
+  std::string ref;
+  for (char ch : low + ",") {
+    if (ch == ',' || ch == ' ') {
+      if (!ref.empty()) eo.low.push_back(ref);
+      ref.clear();
+    } else {
+      ref += ch;
+    }
+  }
   eo.flip = flip;
   if (!flip) return;
   eo.flip_ok.assign(lb.board.footprints.size(), 0);
@@ -321,6 +330,7 @@ struct LoopCli {
   long final_work = -1;    // routable/eco: verification budget for the winner vs the input (-1: 4 x work, 0: off)
   std::string record;      // routable: write the placement timelapse (JSONL) here
   std::string keep_side;   // --keep-side (D48)
+  std::string low;         // --low
 };
 
 // --component-rules (doc 15 §3.5, P1): detect component categories and add their proximity rules as objective-only
@@ -372,7 +382,7 @@ int run_loop_mode(const LoopCli& c) {
   eo.crules_weight_pct = c.crules_weight_pct;
   eo.crules_two_stage = c.crules_two_stage;
   apply_component_rules(lb.board, c.component_rules, c.rules_override, c.edge_attraction, eo);
-  setup_flip(lb, c.o.flip, c.keep_side, eo);
+  setup_flip(lb, c.o.flip, c.keep_side, c.low, eo);
   if (c.clearance_mm >= 0) eo.courtyard_clearance = mm_to_nm(c.clearance_mm);
   // The loop works on the refine problem (the board's courtyard rule, else KiCad's 0): every full-mode result,
   // placed with 0.25 mm or 0, is legal in it.
@@ -624,13 +634,14 @@ int main(int argc, char** argv) {
   app.add_option("--lns-window", o.lns_window, "Parts per LNS window (2..12)");
   app.add_option("--lns-polish", o.lns_polish, "LNS windows run on the annealing result");
   app.add_option("--beta", o.beta_congestion, "Routability weight: mm of signal HPWL per mm of RUDY overflow (0 = off)");
-  std::string keep_side, debug_flip;
+  std::string keep_side, debug_flip, low;
   app.add_flag("--flip", o.flip,
                "Side assignment (D48): movable surface-mount parts may move to the other side (KiCad-mirrored footprints); "
                "through-hole, locked and fixed parts never do");
   app.add_option("--flip-via-mm", o.via_mm, "With --flip: cost of one estimated via (a net's surface-mount pin on its minority side) in mm of signal HPWL");
   app.add_option("--flip-rate", o.flip_rate, "With --flip: share of annealing moves that are flips");
   app.add_option("--keep-side", keep_side, "With --flip: references that must stay on their side (comma separated)");
+  app.add_option("--low", low, "References that footprint keepouts whose name contains low-ok do not apply to (comma separated)");
   app.add_option("--debug-flip", debug_flip,
                  "Write the input with these footprints (comma separated references, or 'all') flipped in place, KiCad style, and exit");
   app.add_option("--rounds", lc.rounds, "routable: re-placement rounds after the seeds");
@@ -692,6 +703,7 @@ int main(int argc, char** argv) {
     lc.route_threads = route_threads;
     lc.no_fallback = no_fallback;
     lc.keep_side = keep_side;
+    lc.low = low;
     try {
       return run_loop_mode(lc);
     } catch (const std::exception& e) {
@@ -765,7 +777,7 @@ int main(int argc, char** argv) {
     eo.crules_weight_pct = crules_weight_pct;
     eo.crules_two_stage = crules_two_stage;
     const int crules_ties = apply_component_rules(lb.board, component_rules, rules_override, edge_attraction, eo);
-    setup_flip(lb, o.flip, keep_side, eo);
+    setup_flip(lb, o.flip, keep_side, low, eo);
     if (clearance_mm >= 0) eo.courtyard_clearance = mm_to_nm(clearance_mm);
     // Refine keeps the human's spacing rule (KiCad's default courtyard clearance is 0); full mode aims for
     // 0.25 mm and falls back to 0 when the board is too dense for it.

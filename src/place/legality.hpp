@@ -98,9 +98,10 @@ class Raster {
   int nx_ = 0, ny_ = 0;
   std::vector<std::uint16_t> blocked_[2];  // static: not entirely inside the board
   std::vector<std::uint16_t> keep_[2];     // static: touched by a footprint keepout on that side
+  std::vector<std::uint16_t> keeplo_[2];   // static: touched by a low-ok keepout (not for Part::low parts)
   std::vector<std::uint16_t> occ_[2];      // courtyard and through-obstacle boxes of placed parts
   std::vector<std::uint16_t> fixed_[2];    // static: fixed board copper boxes
-  std::vector<std::int32_t> sat_blocked_[2], sat_keep_[2], sat_fixed_[2];  // summed-area tables (cell != 0)
+  std::vector<std::int32_t> sat_blocked_[2], sat_keep_[2], sat_keeplo_[2], sat_fixed_[2];  // summed-area tables (cell != 0)
   mutable std::vector<std::int32_t> sat_occ_[2];           // rebuilt lazily after add()
   mutable bool occ_dirty_ = true;
 };
