@@ -38,6 +38,10 @@ class Legality {
   bool inside_ok(int part, Point pos, int rot, bool lenient = false) const;
   // Exact test of two parts.
   bool pair_conflict(int a, Point pa, int ra, int b, Point pb, int rb) const;
+  // A point inside the outline and outside every cut-out (always true without an outline). in_board answers from a
+  // per-cell cache where no outline or cut-out edge enters the cell; in_board_exact is its reference path.
+  bool in_board(Point q) const;
+  bool in_board_exact(Point q) const;
 
   // Index of placed parts (all parts present after reset).
   void reset(const Placement& pl);
@@ -70,6 +74,7 @@ class Legality {
   std::vector<Shape> segs_;
   std::vector<std::vector<int>> seg_cells_;
   std::vector<std::vector<int>> fixed_cells_;  // Problem::fixed_copper in the same grid
+  std::vector<std::int8_t> board_cell_;        // 1 inside the board, 0 outside, -1 an edge enters (empty: no outline)
   Coord reach_ = 0;                            // neighbour search inflation (largest clearance of any kind)
 };
 

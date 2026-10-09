@@ -1491,3 +1491,45 @@ TEST_CASE("a plated through pad keeps clear of the other side's courtyard, also 
     CHECK(L.find_conflict(u, clear, 0) < 0);
   }
 }
+
+TEST_CASE("Legality::in_board: the per-cell cache answers as the exact test does", "[place]") {
+  // Round corners flattened at 0.1 µm (as the reader does), a round cut-out and a slot, and the outline closed by a
+  // 4 mm chamfer no Edge.Cuts piece covers (a loop closed with a gap tolerance): only the cells its edges enter may
+  // need the exact test.
+  const Coord W = 40 * MM, H = 30 * MM, R = 3 * MM, k = 878'680;   // k = R (1 - sqrt(1/2))
+  std::vector<Point> o;
+  auto add = [&](const std::vector<Point>& pts) { o.insert(o.end(), pts.begin() + (o.empty() ? 0 : 1), pts.end()); };
+  add({{R, 0}, {W - R, 0}});
+  add(geom::arc_points({W - R, 0}, {W - k, k}, {W, R}, 100));
+  add({{W, R}, {W, H - R}});
+  add(geom::arc_points({W, H - R}, {W - k, H - k}, {W - R, H}, 100));
+  add({{W - R, H}, {R, H}});
+  add(geom::arc_points({R, H}, {k, H - k}, {0, H - R}, 100));
+  add({{0, H - R}, {0, R + 300'000}});
+  Problem p;
+  p.outline = o;
+  p.cutouts = {geom::circle_points({20 * MM, 15 * MM}, 2 * MM, 100), {{30 * MM, 10 * MM}, {31 * MM, 10 * MM}, {31 * MM, 20 * MM}, {30 * MM, 20 * MM}}};
+  p.edges.push_back(Shape::polyline(o, 0));
+  for (auto c : p.cutouts) {
+    c.push_back(c.front());
+    p.edges.push_back(Shape::polyline(c, 0));
+  }
+  for (const auto& q : o) p.region.add(q);
+  const Legality L(p);
+  std::vector<Point> probes;
+  for (Coord y = -MM; y <= H + MM; y += 100'000)
+    for (Coord x = -MM; x <= W + MM; x += 100'000) probes.push_back({x, y});
+  for (const auto* l : {&p.outline, &p.cutouts[0], &p.cutouts[1]})   // on the edges: vertices and edge midpoints
+    for (std::size_t i = 0, j = l->size() - 1; i < l->size(); j = i++) {
+      probes.push_back((*l)[i]);
+      probes.push_back(Point{((*l)[i].x + (*l)[j].x) / 2, ((*l)[i].y + (*l)[j].y) / 2});
+    }
+  int differ = 0;
+  for (const auto& q : probes) differ += L.in_board(q) != L.in_board_exact(q) ? 1 : 0;
+  CHECK(differ == 0);
+  CHECK(L.in_board({10 * MM, 10 * MM}));
+  CHECK_FALSE(L.in_board({20 * MM, 15 * MM}));      // in the round cut-out
+  CHECK_FALSE(L.in_board({200'000, 200'000}));      // past the chamfer
+  CHECK_FALSE(L.in_board({W - 200'000, 200'000}));  // past a round corner
+  CHECK_FALSE(L.in_board({100 * MM, 15 * MM}));     // off the grid
+}

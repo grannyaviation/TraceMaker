@@ -73,6 +73,44 @@ Legality::Legality(const Problem& p) : p_(p) {
     for (int y = y0; y <= y1; ++y)
       for (int x = x0; x <= x1; ++x) seg_cells_[z(y * nx_ + x)].push_back(static_cast<int>(i));
   }
+  // A cell no outline or cut-out edge enters (closing edges included) lies wholly in or out of the board: its centre
+  // decides. (sensor_ts's 421-point round-cornered outline made the exact test a third of a shield pass's wall time.)
+  if (!p.outline.empty()) {
+    board_cell_.assign(z(nx_ * ny_), 0);
+    auto mark = [&](const std::vector<Point>& l) {
+      for (std::size_t i = 0, j = l.size() - 1; i < l.size(); j = i++) {
+        Box e;
+        e.add(l[j]);
+        e.add(l[i]);
+        int x0, y0, x1, y1;
+        cells_of(e, x0, y0, x1, y1);
+        for (int y = y0; y <= y1; ++y)
+          for (int x = x0; x <= x1; ++x) board_cell_[z(y * nx_ + x)] = -1;
+      }
+    };
+    mark(p.outline);
+    for (const auto& c : p.cutouts) mark(c);
+    for (int y = 0; y < ny_; ++y)
+      for (int x = 0; x < nx_; ++x)
+        if (auto& v = board_cell_[z(y * nx_ + x)]; v == 0)
+          v = in_board_exact(Point{ox_ + x * cell_ + cell_ / 2, oy_ + y * cell_ + cell_ / 2}) ? 1 : 0;
+  }
+}
+
+bool Legality::in_board_exact(Point q) const {
+  if (p_.outline.empty()) return true;
+  if (!geom::point_in_polygon(q, p_.outline)) return false;
+  for (const auto& c : p_.cutouts)
+    if (geom::point_in_polygon(q, c)) return false;
+  return true;
+}
+
+bool Legality::in_board(Point q) const {
+  if (board_cell_.empty()) return true;
+  int x0, y0, x1, y1;
+  cells_of(Box{q.x, q.y, q.x, q.y}, x0, y0, x1, y1);
+  const std::int8_t v = board_cell_[z(y0 * nx_ + x0)];
+  return v >= 0 ? v != 0 : in_board_exact(q);
 }
 
 void Legality::cells_of(const Box& b, int& cx0, int& cy0, int& cx1, int& cy1) const {
@@ -97,13 +135,6 @@ bool Legality::inside_ok(int part, Point pos, int rot, bool lenient) const {
         for (int si : seg_cells_[z(y * nx_ + x)])
           if (closer(segs_[z(si)], Point{}, s, pos, c)) return true;
     return false;
-  };
-  auto in_board = [&](Point q) {
-    if (p_.outline.empty()) return true;
-    if (!geom::point_in_polygon(q, p_.outline)) return false;
-    for (const auto& c : p_.cutouts)
-      if (geom::point_in_polygon(q, c)) return false;
-    return true;
   };
   for (int s = 0; s < 2; ++s) {
     for (const Shape& cy : g.cy_in[z(s)]) {
