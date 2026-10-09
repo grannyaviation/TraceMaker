@@ -1438,3 +1438,56 @@ TEST_CASE("a closed outline with round corners is the board even when most parts
   CHECK(geom::point_in_polygon(Point{15 * MM, 10 * MM}, p.outline));
   CHECK_FALSE(geom::point_in_polygon(Point{300'000, 300'000}, p.outline));   // the corner outside the arc
 }
+
+TEST_CASE("a plated through pad keeps clear of the other side's courtyard, also on a composite's leader", "[place][kicad]") {
+  // sensor_ts r43: U38 (top, three 0.45 mm plated vias in its paddle, pad 9 on *.Cu) over the bottom courtyards of U33
+  // and R118. TraceMaker's model flags that pose; the farm's fill() had put U38 there. U1 is U38's paddle and middle
+  // via; B1 a bottom 0402 courtyard; C1 a top member for the composite case.
+  const auto doc = sexpr::Document::parse(R"((kicad_pcb (version 20260624) (generator "pcbnew") (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user) (31 "F.CrtYd" user) (29 "B.CrtYd" user))
+    (setup (pad_to_mask_clearance 0)) (net 0 "") (net 1 "GND") (net 2 "A")
+    (footprint "t:U" (layer "F.Cu") (transform (translate 10 10) (rotate 0) (scale 1 1))
+      (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -1.33 -1.62) (end 1.33 1.62) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at 0 -0.9) (size 0.3 0.6) (layers "F.Cu") (net 2 "A"))
+      (pad "9" thru_hole circle (at 0 0) (size 0.45 0.45) (drill 0.254) (layers "*.Cu") (net 1 "GND"))
+      (pad "9" smd roundrect (at 0 0) (size 1.6 0.7) (layers "F.Cu") (roundrect_rratio 0.25) (net 1 "GND")))
+    (footprint "t:C" (layer "F.Cu") (transform (translate 14 10) (rotate 0) (scale 1 1))
+      (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -0.93 -0.47) (end 0.93 0.47) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu") (net 2 "A")) (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu") (net 1 "GND")))
+    (footprint "t:B" (locked yes) (layer "B.Cu") (transform (translate 20 20) (rotate 0) (scale 1 1))
+      (property "Reference" "B1" (at 0 0 0) (layer "B.SilkS"))
+      (fp_rect (start -0.93 -0.47) (end 0.93 0.47) (layer "B.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "B.Cu")) (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "B.Cu")))
+    (gr_rect (start 0 0) (end 40 40) (layer "Edge.Cuts") (stroke (width 0.1) (type solid)) (fill no))))");
+  const auto b = io::read_board(doc);
+  const auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  for (const bool grouped : {false, true}) {
+    ExtractOptions eo;
+    if (grouped) eo.groups = {{"U1", "C1"}};
+    const Problem p = extract(b, rules, "/nonexistent/board.kicad_pcb", eo);
+    auto index = [&](const std::string& ref) {
+      const auto it = std::find_if(p.parts.begin(), p.parts.end(), [&](const Part& pt) { return pt.ref == ref; });
+      REQUIRE(it != p.parts.end());
+      return static_cast<int>(it - p.parts.begin());
+    };
+    const int u = index("U1"), b1 = index("B1");
+    REQUIRE(p.parts[z(u)].movable);
+    REQUIRE(p.parts[z(u)].leader < 0);
+    CHECK((p.parts[z(index("C1"))].leader == u) == grouped);
+    Legality L(p);
+    Placement pl = Placement::initial(p);
+    if (grouped) place_followers(p, pl);
+    L.reset(pl);
+    // B1's courtyard edge x = 20.93; the via's copper reaches 0.225 mm from U1's origin, KiCad's margin is none,
+    // TraceMaker's kThroughMargin 0.1 mm. 0.05 mm inside that margin: a conflict, found through the index too.
+    const Point over{20'930'000 + 225'000 + kThroughMargin - 50'000, 20 * MM};
+    CHECK(L.pair_conflict(u, over, 0, b1, pl.pos[z(b1)], 0));
+    CHECK(L.find_conflict(u, over, 0) == b1);
+    // 0.05 mm beyond it: legal, though U1's top courtyard lies over B1's bottom one (surface-mount copper only there).
+    const Point clear = over + Point{100'000, 0};
+    CHECK_FALSE(L.pair_conflict(u, clear, 0, b1, pl.pos[z(b1)], 0));
+    CHECK(L.find_conflict(u, clear, 0) < 0);
+  }
+}
