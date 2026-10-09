@@ -84,6 +84,9 @@ struct Part {
   int pad_count = 0;            // pads of the footprint (the tidy pass turns two-pad passives)
   Coord area = 0;               // courtyard box area incl. clearance (nm², saturating), for spreading
   std::uint64_t shape_key = 0;  // equal keys = interchangeable footprints (swap moves)
+  // --groups (groups.hpp): a member of a composite part is placed by its leader; it keeps no geometry and no pins.
+  int leader = -1;              // index of the leader part, -1 when not a group member
+  Point group_off;              // origin relative to the leader's at the input (leader state 0)
 };
 
 struct Pin {

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <set>
 
 #include "core/rng.hpp"
@@ -13,6 +14,7 @@
 #include "io/kicad/project_reader.hpp"
 #include "place/anneal.hpp"
 #include "place/global.hpp"
+#include "place/groups.hpp"
 #include "place/legalize.hpp"
 #include "place/lower_bound.hpp"
 #include "place/placer.hpp"
@@ -1226,4 +1228,87 @@ TEST_CASE("a shield can frame drawn as two nested rectangles is a ring of four b
     CHECK(covered({7'500'000, 0}));
     CHECK(covered({0, -7'500'000}));
   }
+}
+
+TEST_CASE("groups: a composite carries its members' courtyards and pins, followers keep their offsets", "[place][groups]") {
+  Problem p = board(40 * MM, 40 * MM);
+  const int ic = add_part(p, {10 * MM, 10 * MM}, 2 * MM, 2 * MM, {{-MM, 0}, {MM, 0}}, true);    // U0
+  const int c1 = add_part(p, {13 * MM, 10 * MM}, MM / 2, MM / 4, {{-MM / 4, 0}, {MM / 4, 0}}, true);  // U1
+  const int c2 = add_part(p, {10 * MM, 13 * MM}, MM / 2, MM / 4, {{-MM / 4, 0}, {MM / 4, 0}}, true);  // U2
+  add_net(p, {{ic, {MM, 0}}, {c1, {-MM / 4, 0}}});    // pins 0 (U0), 1 (U1)
+  add_net(p, {{ic, {-MM, 0}}, {c2, {-MM / 4, 0}}});   // pins 2 (U0), 3 (U2)
+  REQUIRE(merge_groups(p, {{"U0", "U1", "U2"}}) == 1);
+  CHECK(p.parts[z(c1)].leader == ic);
+  CHECK(p.parts[z(c2)].leader == ic);
+  CHECK_FALSE(p.parts[z(c1)].movable);
+  CHECK(p.parts[z(c1)].pins.empty());
+  CHECK(p.parts[z(c1)].geom[0].cy[0].empty());
+  CHECK_FALSE(p.parts[z(ic)].flippable);
+  CHECK(p.parts[z(ic)].pins.size() == 4);
+  REQUIRE(p.parts[z(ic)].geom[0].cy[0].size() == 3);
+  for (int r = 0; r < 4; ++r) {      // the member's courtyard sits at its offset in every turn
+    const Box b = p.parts[z(ic)].geom[z(r)].cy[0][1].box;
+    CHECK(Point{(b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2} == rot90(Point{3 * MM, 0}, r));
+  }
+  // At the input pose every pin is where it was.
+  const Placement pl0 = Placement::initial(p);
+  CHECK(pl0.pin(p, 1) == Point{13 * MM - MM / 4, 10 * MM});
+  CHECK(pl0.pin(p, 3) == Point{10 * MM - MM / 4, 13 * MM});
+  // Moving and turning the leader carries the members.
+  Placement pl = pl0;
+  pl.pos[z(ic)] = {20 * MM, 20 * MM};
+  pl.rot[z(ic)] = 1;
+  place_followers(p, pl);
+  CHECK(pl.pos[z(c1)] == Point{20 * MM, 20 * MM} + rot90(Point{3 * MM, 0}, 1));
+  CHECK(pl.pos[z(c2)] == Point{20 * MM, 20 * MM} + rot90(Point{0, 3 * MM}, 1));
+  CHECK(pl.rot[z(c1)] == 1);
+  CHECK(pl.pin(p, 1) == pl.pos[z(ic)] + rot90(Point{3 * MM - MM / 4, 0}, 1));
+}
+
+TEST_CASE("groups: a group with a fixed, missing, repeated or other-side part is left alone", "[place][groups]") {
+  Problem p = board(40 * MM, 40 * MM);
+  add_part(p, {10 * MM, 10 * MM}, 2 * MM, 2 * MM, {{0, 0}}, true);       // U0
+  add_part(p, {13 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, false);      // U1 fixed
+  add_part(p, {16 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, true, 1);    // U2 on the back
+  add_part(p, {19 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, true);       // U3
+  CHECK(merge_groups(p, {{"U0", "U1"}, {"U0", "U2"}, {"U0", "U9"}, {"U0", "U3", "U3"}, {"U0"}}) == 0);
+  for (const auto& pt : p.parts) CHECK(pt.leader < 0);
+  CHECK(merge_groups(p, {{"U0", "U3"}}) == 1);
+  CHECK(merge_groups(p, {{"U3", "U0"}}) == 0);    // U0 leads a group now, U3 is a member
+}
+
+TEST_CASE("groups: the placer moves a composite as one and the result is legal", "[place][groups]") {
+  Problem p = random_problem(20, 5, 40 * MM);
+  const int ic = add_part(p, {20 * MM, 20 * MM}, 2 * MM, 2 * MM, {{-MM, 0}, {MM, 0}}, true);
+  const int c1 = add_part(p, {23 * MM, 20 * MM}, MM / 2, MM / 4, {{-MM / 4, 0}, {MM / 4, 0}}, true);
+  const int c2 = add_part(p, {17 * MM, 20 * MM}, MM / 2, MM / 4, {{-MM / 4, 0}, {MM / 4, 0}}, true);
+  add_net(p, {{ic, {MM, 0}}, {c1, {-MM / 4, 0}}});
+  add_net(p, {{ic, {-MM, 0}}, {c2, {MM / 4, 0}}});
+  add_net(p, {{c1, {MM / 4, 0}}, {0, {0, 0}}});     // a fixed anchor pulls the group
+  REQUIRE(merge_groups(p, {{p.parts[z(ic)].ref, p.parts[z(c1)].ref, p.parts[z(c2)].ref}}) == 1);
+  PlaceOptions o;
+  o.threads = 2;
+  o.runs = 2;
+  o.effort = 0.3;
+  Placement pl = Placement::initial(p);
+  const PlaceReport r = tmk::place::place(p, pl, o);
+  CHECK(r.legal);
+  place_followers(p, pl);
+  for (int k : {c1, c2})
+    CHECK(pl.pos[z(k)] == pl.pos[z(ic)] + rot90(p.parts[z(k)].group_off, pl.rot[z(ic)] & 3));
+  CHECK(check_all(p, pl).pairs.empty());
+}
+
+TEST_CASE("groups: read_groups reads a JSON array of reference arrays", "[place][groups]") {
+  const auto path = std::filesystem::temp_directory_path() / "tm_groups_test.json";
+  {
+    std::ofstream f(path);
+    f << R"([["U1", "C1", "C2"], ["U2", "R3"]])";
+  }
+  const auto g = read_groups(path.string());
+  REQUIRE(g.size() == 2);
+  CHECK(g[0] == std::vector<std::string>{"U1", "C1", "C2"});
+  CHECK(g[1] == std::vector<std::string>{"U2", "R3"});
+  std::filesystem::remove(path);
+  CHECK_THROWS(read_groups(path.string()));
 }
