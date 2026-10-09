@@ -35,6 +35,9 @@ int merge_groups(Problem& p, const std::vector<std::vector<std::string>>& groups
   std::map<std::string, int> index;
   for (std::size_t i = 0; i < p.parts.size(); ++i) index[p.parts[i].ref] = static_cast<int>(i);
   int merged = 0;
+  std::set<int> grouped;    // leaders and members of the groups merged so far
+  for (std::size_t i = 0; i < p.parts.size(); ++i)    // also those merged by an earlier call
+    if (p.parts[i].leader >= 0) grouped.insert({static_cast<int>(i), p.parts[i].leader});
   for (const auto& g : groups) {
     if (g.size() < 2) continue;
     std::vector<int> ix;
@@ -48,6 +51,7 @@ int merge_groups(Problem& p, const std::vector<std::vector<std::string>>& groups
       }
       ix.push_back(it->second);
     }
+    for (int i : ix) ok = ok && !grouped.count(i);
     if (!ok) continue;
     const int lead_i = ix.front();
     for (int i : ix) {
@@ -75,11 +79,14 @@ int merge_groups(Problem& p, const std::vector<std::vector<std::string>>& groups
       m.group_off = d;
       lead.area = m.area > std::numeric_limits<Coord>::max() - lead.area ? std::numeric_limits<Coord>::max() : lead.area + m.area;
       m.area = 0;
+      lead.pad_count += m.pad_count;
+      grouped.insert(ix[k]);
     }
     // A composite keeps its side (no flipped states) and is interchangeable with nothing (no swap moves).
     lead.flippable = false;
     for (int s = 4; s < kStates; ++s) lead.geom[z(s)] = PartGeom{};
     lead.shape_key = std::hash<std::string>{}("group:" + lead.ref);
+    grouped.insert(lead_i);
     ++merged;
   }
   return merged;
@@ -100,8 +107,15 @@ std::vector<std::vector<std::string>> read_groups(const std::string& path) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("cannot read --groups file " + path);
   const auto j = nlohmann::json::parse(f);
+  const auto bad = std::runtime_error("--groups file " + path + " is not a JSON array of reference arrays");
+  if (!j.is_array()) throw bad;
   std::vector<std::vector<std::string>> out;
-  for (const auto& g : j) out.push_back(g.get<std::vector<std::string>>());
+  for (const auto& g : j) {
+    if (!g.is_array()) throw bad;
+    for (const auto& r : g)
+      if (!r.is_string()) throw bad;
+    out.push_back(g.get<std::vector<std::string>>());
+  }
   return out;
 }
 

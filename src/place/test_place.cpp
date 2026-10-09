@@ -1245,6 +1245,7 @@ TEST_CASE("groups: a composite carries its members' courtyards and pins, followe
   CHECK(p.parts[z(c1)].geom[0].cy[0].empty());
   CHECK_FALSE(p.parts[z(ic)].flippable);
   CHECK(p.parts[z(ic)].pins.size() == 4);
+  CHECK(p.parts[z(ic)].pad_count == 6);
   REQUIRE(p.parts[z(ic)].geom[0].cy[0].size() == 3);
   for (int r = 0; r < 4; ++r) {      // the member's courtyard sits at its offset in every turn
     const Box b = p.parts[z(ic)].geom[z(r)].cy[0][1].box;
@@ -1271,9 +1272,12 @@ TEST_CASE("groups: a group with a fixed, missing, repeated or other-side part is
   add_part(p, {13 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, false);      // U1 fixed
   add_part(p, {16 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, true, 1);    // U2 on the back
   add_part(p, {19 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, true);       // U3
+  add_part(p, {22 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, true);       // U4
   CHECK(merge_groups(p, {{"U0", "U1"}, {"U0", "U2"}, {"U0", "U9"}, {"U0", "U3", "U3"}, {"U0"}}) == 0);
   for (const auto& pt : p.parts) CHECK(pt.leader < 0);
   CHECK(merge_groups(p, {{"U0", "U3"}}) == 1);
+  CHECK(merge_groups(p, {{"U4", "U0"}}) == 0);    // U0 already leads
+  CHECK(p.parts[0].leader < 0);
   CHECK(merge_groups(p, {{"U3", "U0"}}) == 0);    // U0 leads a group now, U3 is a member
 }
 
@@ -1311,4 +1315,10 @@ TEST_CASE("groups: read_groups reads a JSON array of reference arrays", "[place]
   CHECK(g[1] == std::vector<std::string>{"U2", "R3"});
   std::filesystem::remove(path);
   CHECK_THROWS(read_groups(path.string()));
+  {
+    std::ofstream f(path);
+    f << R"({"a": ["U1", "C1"]})";
+  }
+  CHECK_THROWS(read_groups(path.string()));
+  std::filesystem::remove(path);
 }
