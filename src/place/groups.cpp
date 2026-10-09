@@ -80,6 +80,7 @@ int merge_groups(Problem& p, const std::vector<std::vector<std::string>>& groups
       lead.area = m.area > std::numeric_limits<Coord>::max() - lead.area ? std::numeric_limits<Coord>::max() : lead.area + m.area;
       m.area = 0;
       lead.pad_count += m.pad_count;
+      lead.low = lead.low && m.low;    // a composite goes under low-ok keep-outs only if every part may
       grouped.insert(ix[k]);
     }
     // A composite keeps its side (no flipped states) and is interchangeable with nothing (no swap moves).

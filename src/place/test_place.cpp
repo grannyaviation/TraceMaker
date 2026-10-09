@@ -1266,6 +1266,19 @@ TEST_CASE("groups: a composite carries its members' courtyards and pins, followe
   CHECK(pl.pin(p, 1) == pl.pos[z(ic)] + rot90(Point{3 * MM - MM / 4, 0}, 1));
 }
 
+TEST_CASE("groups: a composite is low only when the leader and every member are low", "[place][groups]") {
+  Problem p = board(40 * MM, 40 * MM);
+  const int a = add_part(p, {10 * MM, 10 * MM}, 2 * MM, 2 * MM, {{0, 0}}, true);    // U0
+  const int b = add_part(p, {13 * MM, 10 * MM}, MM / 2, MM / 4, {{0, 0}}, true);    // U1
+  const int c = add_part(p, {10 * MM, 20 * MM}, 2 * MM, 2 * MM, {{0, 0}}, true);    // U2
+  const int d = add_part(p, {13 * MM, 20 * MM}, MM / 2, MM / 4, {{0, 0}}, true);    // U3
+  for (int i : {a, b, c}) p.parts[z(i)].low = true;    // U3 is not low
+  REQUIRE(merge_groups(p, {{"U0", "U1"}, {"U2", "U3"}}) == 2);
+  CHECK(p.parts[z(a)].low);
+  CHECK_FALSE(p.parts[z(c)].low);
+  (void)d;
+}
+
 TEST_CASE("groups: a group with a fixed, missing, repeated or other-side part is left alone", "[place][groups]") {
   Problem p = board(40 * MM, 40 * MM);
   add_part(p, {10 * MM, 10 * MM}, 2 * MM, 2 * MM, {{0, 0}}, true);       // U0
