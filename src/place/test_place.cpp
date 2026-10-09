@@ -1401,3 +1401,40 @@ TEST_CASE("a custom pad's primitive polygon is as large as KiCad draws it with i
   // 0.05 mm beyond it: legal.
   CHECK_FALSE(L.pair_conflict(q, pq, 0, u, near + Point{100'000, 0}, 0));
 }
+
+TEST_CASE("a closed outline with round corners is the board even when most parts are parked beside it", "[place][kicad]") {
+  // The layout farm's outline (four lines, four 3 mm arcs) with one part on the board and the unplaced ones parked to
+  // its right, as in a --scratch input. sensor_ts r23-r43 had 51-57 % of the pad centres inside, below the 80 % the
+  // outline needed, so it fell back to the Edge.Cuts box and never checked the round corners. Pads outside that box
+  // are off the board either way and do not vote.
+  const auto doc = sexpr::Document::parse(R"((kicad_pcb (version 20260624) (generator "pcbnew") (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user) (31 "F.CrtYd" user) (29 "B.CrtYd" user))
+    (setup (pad_to_mask_clearance 0)) (net 0 "")
+    (footprint "t:R" (layer "F.Cu") (transform (translate 15 10) (rotate 0) (scale 1 1))
+      (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -1 -0.5) (end 1 0.5) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu")) (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu")))
+    (footprint "t:R" (layer "F.Cu") (transform (translate 60 10) (rotate 0) (scale 1 1))
+      (property "Reference" "R2" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -1 -0.5) (end 1 0.5) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu")) (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu")))
+    (footprint "t:R" (layer "F.Cu") (transform (translate 60 15) (rotate 0) (scale 1 1))
+      (property "Reference" "R3" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -1 -0.5) (end 1 0.5) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu")) (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu")))
+    (gr_line (start 3 0) (end 27 0) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
+    (gr_arc (start 27 0) (mid 29.12132 0.87868) (end 30 3) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
+    (gr_line (start 30 3) (end 30 17) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
+    (gr_arc (start 30 17) (mid 29.12132 19.12132) (end 27 20) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
+    (gr_line (start 27 20) (end 3 20) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
+    (gr_arc (start 3 20) (mid 0.87868 19.12132) (end 0 17) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
+    (gr_line (start 0 17) (end 0 3) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
+    (gr_arc (start 0 3) (mid 0.87868 0.87868) (end 3 0) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))))");
+  const auto b = io::read_board(doc);
+  const Problem p = extract(b, io::read_design_rules("/nonexistent/board.kicad_pcb"), "/nonexistent/board.kicad_pcb");
+  CHECK(std::none_of(p.notes.begin(), p.notes.end(), [](const std::string& n) { return n.starts_with("Edge.Cuts do not form"); }));
+  REQUIRE(p.outline.size() > 8);   // the arcs are flattened into the loop
+  CHECK(p.cutouts.empty());
+  CHECK(geom::point_in_polygon(Point{15 * MM, 10 * MM}, p.outline));
+  CHECK_FALSE(geom::point_in_polygon(Point{300'000, 300'000}, p.outline));   // the corner outside the arc
+}

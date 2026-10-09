@@ -70,6 +70,7 @@
 | D62 | M9 is closed with two items unbuilt (negotiated fallback for escapes, escape templates) and its gate not met | Build both | The flow planner the fallback belongs to measured below the simple corridors and is off; planning takes 0.1–2 s, so a template cache saves nothing (doc 05 §23) |
 | D63 | One portfolio variant (cheap vias) routes small boards at half the lattice pitch; no gridless arm is built | A gridless tile-plane router as a portfolio arm | Half pitch at four times the work: 4,140 → 4,153 routed on 12 nearly clean boards, one more complete. As a variant: tier B 27 → 28 clean, tier C equal, routed +7 and +8, no added errors (doc 05 §25) |
 | D64 | Coupled pairs may twist at a layer change (on with pair routing); learned ordering and congestion models are not built | Twists off; a learned net-ordering model | Twists: 59 pairs, one gains coupling (0 → 86 %), none loses, median share 57 → 63 %. Ordering changes measured no effect on completion and tile congestion is absent (doc 05 §24, §25) |
+| D65 | The board outline needs 80 % of the pad centres inside the Edge.Cuts bounding box, not of all pads | All pads vote | Parts parked beside the board (a --scratch input) are off the board with the fallback box too; sensor_ts had 51-57 % of all pads inside its closed round-cornered outline, so the corners were never checked (doc 04 §7.1) |
 
 ## Risks
 

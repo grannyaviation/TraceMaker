@@ -108,9 +108,14 @@ std::optional<Box> axis_rect(std::vector<Point> l, const std::function<Point(Poi
   return b;
 }
 
-// The outline is the largest loop, accepted only if it contains most pad centres (a lone mounting-hole circle
-// must not become the board). Gaps in sloppy outlines are closed with growing tolerances (2 µm .. 0.5 mm).
+// The outline is the largest loop, accepted only if it contains most pad centres inside the Edge.Cuts bounding box (a
+// lone mounting-hole circle must not become the board). Pads outside that box (parts parked beside the board, as in a
+// --scratch input) do not vote: the fallback region is that box, so they are off the board either way. Gaps in sloppy
+// outlines are closed with growing tolerances (2 µm .. 0.5 mm).
 void assemble_outline(Problem& p, const model::Board& b) {
+  const Box eb = b.edge_bbox();
+  std::size_t voters = 0;
+  for (const auto& pd : b.pads) voters += eb.intersects(Box{pd.pos.x, pd.pos.y, pd.pos.x, pd.pos.y}) ? 1u : 0u;
   for (const Coord tol : {Coord{2'000}, Coord{50'000}, Coord{200'000}, Coord{500'000}}) {
     auto loops = edge_loops(p.edges, tol);
     std::size_t best = loops.size();
@@ -119,7 +124,7 @@ void assemble_outline(Problem& p, const model::Board& b) {
     if (best == loops.size()) continue;
     std::size_t inside = 0;
     for (const auto& pd : b.pads) inside += geom::point_in_polygon(pd.pos, loops[best]) ? 1u : 0u;
-    if (inside * 10 < b.pads.size() * 8u) continue;
+    if (inside * 10 < voters * 8u) continue;
     p.outline = loops[best];
     for (std::size_t i = 0; i < loops.size(); ++i)
       if (i != best) p.cutouts.push_back(loops[i]);
