@@ -78,10 +78,11 @@ std::vector<Shape> pad_shapes(const model::Pad& p) {
       break;
     }
     case model::PadShape::Custom: {
-      // Anchor (a small circle or rect of the pad size) plus the primitive polygons.
+      // Anchor (a small circle or rect of the pad size) plus the primitive polygons, each grown by half its outline
+      // width as KiCad draws it (TI VSON-CLIP-8: 0.01 mm, else 5 µm short of KiCad's DRC).
       out.push_back(rect(w / 2, h / 2, 0));
-      for (const auto& cp : p.custom_polys)
-        if (cp.size() >= 3) out.push_back(poly(cp, 0));
+      for (std::size_t i = 0; i < p.custom_polys.size(); ++i)
+        if (p.custom_polys[i].size() >= 3) out.push_back(poly(p.custom_polys[i], i < p.custom_widths.size() ? p.custom_widths[i] / 2 : 0));
       break;
     }
   }

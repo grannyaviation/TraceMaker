@@ -390,6 +390,8 @@ class Reader {
         std::vector<Point> poly;
         if (NodeId pts = d_.find(g, "pts"); pts != kNoNode) read_pts(pts, poly, Point{}, 0);
         pad.custom_polys.push_back(std::move(poly));
+        const NodeId st = d_.find(g, "stroke");
+        pad.custom_widths.push_back(std::max<Coord>(0, child_nm(st != kNoNode ? st : g, "width")));
       }
     }
     if (NodeId pf = d_.find(p, "pinfunction"); pf != kNoNode) pad.pinfunction = d_.str_at(pf, 1);

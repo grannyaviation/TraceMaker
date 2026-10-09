@@ -58,6 +58,7 @@ struct Pad {
   std::uint8_t chamfer_corners = 0;  // bit 0 TL, 1 TR, 2 BL, 3 BR
   Coord trapezoid_dx = 0, trapezoid_dy = 0;  // rect_delta
   std::vector<std::vector<Point>> custom_polys;  // custom primitives (gr_poly) in the pad frame
+  std::vector<Coord> custom_widths;              // outline width of each: KiCad grows the polygon by half of it
   Coord clearance = -1;      // local override, -1 = none
   Coord mask_margin = INT64_MIN;  // local solder-mask expansion (unset = INT64_MIN)
   // Schematic pin name and electrical type (KiCad 6+ boards; empty in older files). Read-only, used to

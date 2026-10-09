@@ -1360,3 +1360,44 @@ TEST_CASE("groups: extract merges ExtractOptions::groups on a KiCad board", "[pl
   CHECK(p.movable_count() == plain.movable_count() - 2);
   CHECK(std::any_of(p.notes.begin(), p.notes.end(), [](const std::string& n) { return n.starts_with("groups: 1 of 1"); }));
 }
+
+TEST_CASE("a custom pad's primitive polygon is as large as KiCad draws it with its outline width", "[place][kicad]") {
+  // Q1's pad is a custom pad: a 2 x 2 mm gr_poly with a 0.2 mm outline, so KiCad's copper reaches 1.1 mm from the
+  // centre. (TI's VSON-CLIP-8 drain pad has a 0.01 mm outline: sensor_ts r24 and r40 placed parts exactly at the
+  // 1.5 mm AIRCRAFT_IN clearance from the bare polygon, and KiCad's DRC measured 1.495 mm.) U1's pad is 1 x 1 mm.
+  const auto doc = sexpr::Document::parse(R"((kicad_pcb (version 20260624) (generator "pcbnew") (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user) (31 "F.CrtYd" user) (29 "B.CrtYd" user))
+    (setup (pad_to_mask_clearance 0)) (net 0 "") (net 1 "A") (net 2 "B")
+    (footprint "t:Q" (layer "F.Cu") (transform (translate 10 10) (rotate 0) (scale 1 1))
+      (property "Reference" "Q1" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -1.1 -1.1) (end 1.1 1.1) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd custom (at 0 0) (size 0.5 0.5) (layers "F.Cu") (net 1 "A") (options (clearance outline) (anchor rect))
+        (primitives (gr_poly (pts (xy -1 -1) (xy 1 -1) (xy 1 1) (xy -1 1)) (width 0.2) (fill yes)))))
+    (footprint "t:U" (layer "F.Cu") (transform (translate 20 10) (rotate 0) (scale 1 1))
+      (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
+      (fp_rect (start -0.5 -0.5) (end 0.5 0.5) (layer "F.CrtYd") (stroke (width 0.05) (type solid)) (fill no))
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 2 "B")))
+    (gr_rect (start 0 0) (end 30 30) (layer "Edge.Cuts") (stroke (width 0.1) (type solid)) (fill no))))");
+  const auto b = io::read_board(doc);
+  const auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  ExtractOptions eo;
+  eo.courtyard_clearance = 0;    // only the copper decides
+  const Problem p = extract(b, rules, "/nonexistent/board.kicad_pcb", eo);
+  auto index = [&](const std::string& ref) {
+    const auto it = std::find_if(p.parts.begin(), p.parts.end(), [&](const Part& pt) { return pt.ref == ref; });
+    REQUIRE(it != p.parts.end());
+    return static_cast<int>(it - p.parts.begin());
+  };
+  const int q = index("Q1"), u = index("U1");
+  Coord need = 0;
+  for (const auto& cs : p.parts[z(q)].geom[0].copper) need = std::max(need, cs.need);
+  REQUIRE(need > 100'000);
+  Legality L(p);
+  const Point pq{10 * MM, 10 * MM};
+  // 0.05 mm short of the clearance from KiCad's pad edge (0.05 mm beyond it from the bare polygon): a conflict.
+  const Point near = pq + Point{1'100'000 + 500'000 + need - 50'000, 0};
+  CHECK(L.pair_conflict(q, pq, 0, u, near, 0));
+  CHECK(L.pair_conflict(u, near, 0, q, pq, 0));
+  // 0.05 mm beyond it: legal.
+  CHECK_FALSE(L.pair_conflict(q, pq, 0, u, near + Point{100'000, 0}, 0));
+}
