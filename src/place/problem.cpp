@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "place/problem.hpp"
+#include "place/groups.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -877,6 +878,11 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
       n += pt.flippable ? 1 : 0;
     }
     p.notes.push_back("side assignment: " + std::to_string(n) + " of " + std::to_string(p.movable_count()) + " movable part(s) may flip");
+  }
+  if (!opt.groups.empty()) {
+    const int merged = merge_groups(p, opt.groups);
+    p.notes.push_back("groups: " + std::to_string(merged) + " of " + std::to_string(opt.groups.size()) +
+                      " merged into composite parts (the others name a missing, fixed or other-side part)");
   }
   return p;
 }

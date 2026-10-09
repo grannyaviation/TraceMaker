@@ -190,6 +190,8 @@ struct ExtractOptions {
   // The input positions of movable parts mean nothing (a board straight from the schematic: parts piled or beside
   // the board). A part that overhangs the edge where the input has it is then not held there.
   bool scratch = false;
+  // --groups (groups.hpp): rigid groups of references, leader first; extract() merges each into one composite part.
+  std::vector<std::vector<std::string>> groups;
 };
 
 // Builds the problem. `rules` and `board_path` give the courtyard clearance (custom rules or .kicad_pro).

@@ -16,6 +16,7 @@
 #include "io/kicad/board_reader.hpp"
 #include "sexpr/sexpr.hpp"
 #include "io/kicad/project_reader.hpp"
+#include "place/groups.hpp"
 #include "place/legality.hpp"
 #include "place/lower_bound.hpp"
 #include "place/placer.hpp"
@@ -229,7 +230,9 @@ Placed place_with_fallbacks_one(const io::LoadedBoard& lb, const model::DesignRu
 }
 
 // Applies a placement to the loaded document; returns the number of footprints moved.
-int apply(io::LoadedBoard& lb, const place::Problem& p, const place::Placement& pl, std::uint64_t seed) {
+int apply(io::LoadedBoard& lb, const place::Problem& p, const place::Placement& pl_in, std::uint64_t seed) {
+  place::Placement pl = pl_in;
+  place::place_followers(p, pl);   // --groups: members take their leader's pose
   io::BoardEditor ed(lb, seed);
   int moved = 0;
   for (std::size_t i = 0; i < p.parts.size(); ++i) {
@@ -339,6 +342,7 @@ struct LoopCli {
   std::string record;      // routable: write the placement timelapse (JSONL) here
   std::string keep_side;   // --keep-side (D48)
   std::string low;         // --low
+  std::string groups;      // --groups
 };
 
 // --component-rules (doc 15 §3.5, P1): detect component categories and add their proximity rules as objective-only
@@ -391,6 +395,7 @@ int run_loop_mode(const LoopCli& c) {
   eo.crules_two_stage = c.crules_two_stage;
   apply_component_rules(lb.board, c.component_rules, c.rules_override, c.edge_attraction, eo);
   setup_flip(lb, c.o.flip, c.keep_side, c.low, eo);
+  if (!c.groups.empty()) eo.groups = place::read_groups(c.groups);
   if (c.clearance_mm >= 0) eo.courtyard_clearance = mm_to_nm(c.clearance_mm);
   // The loop works on the refine problem (the board's courtyard rule, else KiCad's 0): every full-mode result,
   // placed with 0.25 mm or 0, is legal in it.
@@ -649,7 +654,7 @@ int main(int argc, char** argv) {
   app.add_option("--lns-window", o.lns_window, "Parts per LNS window (2..12)");
   app.add_option("--lns-polish", o.lns_polish, "LNS windows run on the annealing result");
   app.add_option("--beta", o.beta_congestion, "Routability weight: mm of signal HPWL per mm of RUDY overflow (0 = off)");
-  std::string keep_side, debug_flip, low;
+  std::string keep_side, debug_flip, low, groups;
   app.add_flag("--flip", o.flip,
                "Side assignment (D48): movable surface-mount parts may move to the other side (KiCad-mirrored footprints); "
                "through-hole, locked and fixed parts never do");
@@ -657,6 +662,8 @@ int main(int argc, char** argv) {
   app.add_option("--flip-rate", o.flip_rate, "With --flip: share of annealing moves that are flips");
   app.add_option("--keep-side", keep_side, "With --flip: references that must stay on their side (comma separated)");
   app.add_option("--low", low, "References that footprint keepouts whose name contains low-ok do not apply to (comma separated)");
+  app.add_option("--groups", groups,
+                 "JSON file: groups of references, leader first, each placed as one rigid unit (layout-farm IC clusters)");
   app.add_option("--debug-flip", debug_flip,
                  "Write the input with these footprints (comma separated references, or 'all') flipped in place, KiCad style, and exit");
   app.add_option("--rounds", lc.rounds, "routable: re-placement rounds after the seeds");
@@ -720,6 +727,7 @@ int main(int argc, char** argv) {
     lc.no_fallback = no_fallback;
     lc.keep_side = keep_side;
     lc.low = low;
+    lc.groups = groups;
     try {
       return run_loop_mode(lc);
     } catch (const std::exception& e) {
@@ -747,6 +755,7 @@ int main(int argc, char** argv) {
                         " --crules-weight " + std::to_string(crules_weight_pct) + (crules_two_stage ? "" : " --no-crules-two-stage") + (rules_override.empty() ? "" : " --rules-override '" + rules_override + "'") + (edge_attraction ? " --edge-attraction" : "") +
                         (o.flip ? " --flip --flip-via-mm " + std::to_string(o.via_mm) + " --flip-rate " + std::to_string(o.flip_rate) + (keep_side.empty() ? "" : " --keep-side '" + keep_side + "'") : "") +
                         (tidy ? " --tidy --tidy-grid " + std::to_string(tidy_grid_mm) + " --tidy-align " + std::to_string(tidy_align_mm) : "") +
+                        (groups.empty() ? "" : " --groups '" + groups + "'") +
                         " > /dev/null 2>&1";
       const int rc = std::system(cmd.c_str());
       if (rc != 0 && rc != 2 * 256) continue;
@@ -795,6 +804,7 @@ int main(int argc, char** argv) {
     eo.crules_two_stage = crules_two_stage;
     const int crules_ties = apply_component_rules(lb.board, component_rules, rules_override, edge_attraction, eo);
     setup_flip(lb, o.flip, keep_side, low, eo);
+    if (!groups.empty()) eo.groups = place::read_groups(groups);
     if (clearance_mm >= 0) eo.courtyard_clearance = mm_to_nm(clearance_mm);
     // Refine keeps the human's spacing rule (KiCad's default courtyard clearance is 0); full mode aims for
     // 0.25 mm and falls back to 0 when the board is too dense for it.

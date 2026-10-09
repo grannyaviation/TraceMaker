@@ -1322,3 +1322,28 @@ TEST_CASE("groups: read_groups reads a JSON array of reference arrays", "[place]
   CHECK_THROWS(read_groups(path.string()));
   std::filesystem::remove(path);
 }
+
+TEST_CASE("groups: extract merges ExtractOptions::groups on a KiCad board", "[place][groups][fixture]") {
+  const std::string path = std::string(TM_SOURCE_DIR) + "/bench/data/freerouting/scripts/benchmark/fixtures/PCBench/ChirpHardware_chirp/unrouted.kicad_pcb";
+  if (!std::filesystem::exists(path)) SKIP("fixture missing: " + path);
+  const auto lb = io::read_board_file(path);
+  const auto rules = io::read_design_rules(path);
+  const Problem plain = extract(lb.board, rules, path);
+  // The first movable IC and the first two movable capacitors on its side.
+  std::vector<std::string> g;
+  for (const auto& pt : plain.parts)
+    if (pt.movable && pt.ref.starts_with("U")) { g.push_back(pt.ref); break; }
+  REQUIRE(g.size() == 1);
+  const int side = std::find_if(plain.parts.begin(), plain.parts.end(), [&](const Part& pt) { return pt.ref == g[0]; })->side;
+  for (const auto& pt : plain.parts)
+    if (g.size() < 3 && pt.movable && pt.side == side && pt.ref.starts_with("C")) g.push_back(pt.ref);
+  REQUIRE(g.size() == 3);
+  ExtractOptions eo;
+  eo.groups = {g};
+  const Problem p = extract(lb.board, rules, path, eo);
+  int members = 0;
+  for (const auto& pt : p.parts) members += pt.leader >= 0 ? 1 : 0;
+  CHECK(members == 2);
+  CHECK(p.movable_count() == plain.movable_count() - 2);
+  CHECK(std::any_of(p.notes.begin(), p.notes.end(), [](const std::string& n) { return n.starts_with("groups: 1 of 1"); }));
+}
