@@ -52,6 +52,9 @@ class RuleEngine {
   std::optional<Coord> skew_constraint(model::NetId net) const;
   // Last custom constraint of `type` (e.g. diff_pair_gap, diff_pair_uncoupled) whose rule matches a track of `net`.
   std::optional<model::Constraint> net_constraint(model::NetId net, const std::string& type) const;
+  // True if a custom clearance-type rule can tell two nets of one class apart at the same place: its condition
+  // reads NetName or inDiffPair. Every other property a probe exposes is fixed by its class, width and kind.
+  bool net_specific_clearance() const;
   const std::vector<std::string>& warnings() const { return warnings_; }
 
  private:

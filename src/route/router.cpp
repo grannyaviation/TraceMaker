@@ -178,7 +178,10 @@ struct Router::Impl {
 
   void setup() {
     obs = std::make_unique<Obstacles>(b, rules);
-    use_cache = !obs->has_custom_rules();
+    // The fixed-obstacle caches (and the cost-to-go fields built on them) evaluate one representative net per
+    // (class, width, via size). Custom rules agree for every net of such a key unless a clearance rule reads
+    // the net's name (NetName, inDiffPair); only then is each net checked on its own.
+    use_cache = !obs->rules().net_specific_clearance();
     nl = b.copper_count();
     blind_ok = opt.blind_vias && rules.minimums.allow_blind_buried_vias && nl > 2;
     micro_ok = opt.micro_vias && rules.minimums.allow_microvias && nl > 2;

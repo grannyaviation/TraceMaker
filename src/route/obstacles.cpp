@@ -561,7 +561,7 @@ void Obstacles::aperture_codes(const Shape& s, int layer, bool via_probe, const 
 std::int32_t Obstacles::fixed_code(Point p, int layer, Coord hw, Coord margin, model::NetId probe_net, bool via_probe) const {
   if (!inside_board(p, 0)) return kBlocked;
   const Shape s = Shape::point(p, hw + margin);
-  const auto probe = make_probe(drc::ItemKind::Track, s, probe_net, layer, 2 * hw, p);
+  const auto probe = make_probe(via_probe ? drc::ItemKind::Via : drc::ItemKind::Track, s, probe_net, layer, 2 * hw, p);
   std::int32_t code = kFree;
   auto add_net = [&](model::NetId n) {
     if (n == 0) code = kBlocked;

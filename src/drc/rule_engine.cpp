@@ -502,6 +502,17 @@ std::optional<model::Constraint> RuleEngine::net_constraint(model::NetId net, co
   return out;
 }
 
+bool RuleEngine::net_specific_clearance() const {
+  for (const auto& c : rules_) {
+    // The text is enough: a property or function the engine evaluates appears verbatim in it.
+    const std::string& t = c.rule->condition;
+    if (!c.valid || (t.find("NetName") == std::string::npos && t.find("inDiffPair") == std::string::npos)) continue;
+    for (const auto& k : c.rule->constraints)
+      if (k.type == "clearance" || k.type == "hole_clearance" || k.type == "edge_clearance" || k.type == "hole_to_hole") return true;
+  }
+  return false;
+}
+
 bool RuleEngine::coupled_diff_pair(model::NetId a, model::NetId b) const {
   if (a == 0 || b == 0 || a == b) return false;
   if (static_cast<std::size_t>(a) < dp_partner_.size()) return dp_partner_[static_cast<std::size_t>(a)] == b;

@@ -358,3 +358,56 @@ TEST_CASE("allow_soldermask_bridges: the footprint's mask opening is ignored, li
   CHECK(op.segment_state({9 * MM, 11 * MM}, {11 * MM, 11 * MM}, 0, 200'000, 1, false, nullptr) == 2);
   CHECK(oa.segment_state({9 * MM, 11 * MM}, {11 * MM, 11 * MM}, 0, 200'000, 1, false, nullptr) == 0);
 }
+
+TEST_CASE("custom rules: only NetName and inDiffPair clearance rules tell nets of a class apart", "[route][rules]") {
+  const auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal)) (net 0 \"\") (net 1 \"N1\"))"));
+  const auto cm = drc::build_copper(b);
+  auto flag = [&](const char* cond, const char* type) {
+    auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+    rules.custom.push_back(model::CustomRule{"r", cond, "", "", {model::Constraint{type, 100'000, {}, {}, {}}}});
+    return drc::RuleEngine(b, rules, cm).net_specific_clearance();
+  };
+  CHECK_FALSE(flag("A.NetClass == 'X'", "clearance"));
+  CHECK_FALSE(flag("A.insideCourtyard('U1') && A.Type != 'Zone'", "clearance"));
+  CHECK(flag("A.NetName == 'N1'", "clearance"));
+  CHECK(flag("B.inDiffPair('USB')", "hole_clearance"));
+  CHECK_FALSE(flag("A.NetName == 'N1'", "disallow"));
+}
+
+TEST_CASE("custom rules without net names: the class cache decides like the per-net check", "[route][rules]") {
+  // N1 and N2 share the Default class; pad P sits in U1's courtyard, a track of N1 passes beside it.
+  constexpr Coord MM = 1'000'000;
+  auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (31 \"F.CrtYd\" user)) "
+      "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (net 1 \"N1\") (net 2 \"N2\") (net 3 \"P\") "
+      "(footprint \"t:U\" (layer \"F.Cu\") (transform (translate 10 10) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"U1\" (at 0 0 0) (layer \"F.SilkS\")) "
+      "(fp_rect (start -0.6 -0.6) (end 0.6 0.6) (layer \"F.CrtYd\") (stroke (width 0.05) (type solid)) (fill no)) "
+      "(pad \"1\" smd rect (at 0 0) (size 0.5 0.5) (layers \"F.Cu\") (net 3 \"P\"))) "
+      "(segment (start 9 11) (end 11 11) (width 0.2) (layer \"F.Cu\") (net 1)))"));
+  auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  rules.custom.push_back(model::CustomRule{"near U1", "A.insideCourtyard('U1') && A.Type != 'Pad'", "", "", {model::Constraint{"clearance", 500'000, {}, {}, {}}}});
+  rules.custom.push_back(model::CustomRule{"vias", "A.Type == 'Via'", "", "", {model::Constraint{"clearance", 600'000, {}, {}, {}}}});
+  const route::Obstacles obs(b, rules);
+  REQUIRE_FALSE(obs.rules().net_specific_clearance());
+  auto ok = [](std::int32_t code, model::NetId n) { return code == route::Obstacles::kFree || code == n; };
+  const Coord hw = 100'000, d = 600'000, drill = 300'000;
+  const model::NetId rep = 1;
+  int blocked = 0, own = 0;
+  for (Coord x = 8 * MM; x <= 12 * MM; x += 50'000)
+    for (Coord y = 8 * MM; y <= 12 * MM; y += 50'000) {
+      const Point p{x, y};
+      for (model::NetId n : {1, 2}) {
+        for (int l : {0, 1}) {
+          const std::int32_t c = obs.fixed_code(p, l, hw, 0, rep);
+          CHECK(ok(c, n) == (obs.disk_state(p, l, hw, n, 0, true) != 2));
+          blocked += c == route::Obstacles::kBlocked;
+          own += c == 1;
+        }
+        CHECK(ok(obs.fixed_via_code(p, d, drill, 0, rep), n) == (obs.via_state(p, d, drill, n, 0, true) != 2));
+      }
+    }
+  CHECK(blocked > 0);  // the grid meets the pad's clearance and the N1 track's
+  CHECK(own > 0);
+}
