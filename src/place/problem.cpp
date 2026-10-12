@@ -359,6 +359,7 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
       // copper gap must be at least the sum of both expansions, so each pad asks for twice its own.
       bool masked = false;
       for (const auto& l : pd.layers) masked |= l == "F.Mask" || l == "B.Mask" || l == "*.Mask" || l == "F&B.Mask";
+      if (pd.footprint >= 0 && b.footprints[z(pd.footprint)].allow_soldermask_bridges) masked = false;
       if (masked) {
         Coord exp = b.pad_to_mask_clearance;
         if (pd.footprint >= 0 && b.footprints[z(pd.footprint)].mask_margin != INT64_MIN) exp = b.footprints[z(pd.footprint)].mask_margin;
@@ -395,6 +396,7 @@ Problem extract(const model::Board& b, const model::DesignRules& rules, const st
   for (const auto& g : b.graphics) {
     const int side = g.layer == "F.Mask" ? 0 : g.layer == "B.Mask" ? 1 : -1;
     if (side < 0 || p.copper_layers < 1) continue;
+    if (g.footprint >= 0 && b.footprints[z(g.footprint)].allow_soldermask_bridges) continue;
     std::optional<Shape> sh;
     if ((g.kind == model::Graphic::Kind::Poly || g.kind == model::Graphic::Kind::Rect) && g.pts.size() >= 3 && (g.filled || g.kind == model::Graphic::Kind::Poly)) {
       // The convex hull: logo outlines have thousands of points, and every candidate position of every part is

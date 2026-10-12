@@ -102,7 +102,8 @@ struct Footprint {
   bool back = false;
   bool locked = false;
   bool attr_smd = false, attr_through_hole = false, board_only = false, exclude_from_pos = false,
-       exclude_from_bom = false, dnp = false, allow_missing_courtyard = false;
+       exclude_from_bom = false, dnp = false, allow_missing_courtyard = false,
+       allow_soldermask_bridges = false;  // KiCad ignores this footprint's mask apertures entirely
   std::vector<int> pads;
   std::vector<int> graphics;
   Coord clearance = -1;      // footprint-level clearance override, -1 = none

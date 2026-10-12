@@ -97,7 +97,8 @@ Obstacles::Obstacles(model::Board& board, const model::DesignRules& rules) : b_(
     const char* ln = side == 0 ? "F.Mask" : "B.Mask";
     std::vector<std::vector<Point>> pieces;
     for (const auto& g : b_.graphics)
-      if (g.layer == ln && g.kind == model::Graphic::Kind::Line) pieces.push_back({g.a, g.b});
+      if (g.footprint >= 0 && b_.footprints[static_cast<std::size_t>(g.footprint)].allow_soldermask_bridges) continue;
+      else if (g.layer == ln && g.kind == model::Graphic::Kind::Line) pieces.push_back({g.a, g.b});
       else if (g.layer == ln && g.kind == model::Graphic::Kind::Arc) pieces.push_back(geom::arc_points(g.a, g.c, g.b, 5'000));
     auto near = [](Point a, Point c) { return std::llabs(a.x - c.x) < 2000 && std::llabs(a.y - c.y) < 2000; };
     std::vector<std::uint8_t> used(pieces.size(), 0);
@@ -127,6 +128,7 @@ Obstacles::Obstacles(model::Board& board, const model::DesignRules& rules) : b_(
   for (const auto& g : b_.graphics) {
     const int side = g.layer == "F.Mask" ? 0 : g.layer == "B.Mask" ? 1 : -1;
     if (side < 0) continue;
+    if (g.footprint >= 0 && b_.footprints[static_cast<std::size_t>(g.footprint)].allow_soldermask_bridges) continue;
     std::optional<Shape> sh;
     if ((g.kind == model::Graphic::Kind::Poly || g.kind == model::Graphic::Kind::Rect) && g.pts.size() >= 3 && (g.filled || g.kind == model::Graphic::Kind::Poly))
       sh = Shape::polygon(g.pts, g.width / 2 + gexp);
@@ -215,6 +217,7 @@ Obstacles::Obstacles(model::Board& board, const model::DesignRules& rules) : b_(
     agrid_[side] = std::make_unique<index::UniformGrid>(bounds_, cell, b_.pads.size() + 16);
     const char* mask = side == 0 ? "F.Mask" : "B.Mask";
     for (const auto& pad : b_.pads) {
+      if (pad.footprint >= 0 && b_.footprints[static_cast<std::size_t>(pad.footprint)].allow_soldermask_bridges) continue;
       bool has = false;
       for (const auto& ln : pad.layers)
         if (ln == mask || ln == "*.Mask" || ln == "F&B.Mask") has = true;

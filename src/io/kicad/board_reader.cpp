@@ -308,6 +308,7 @@ class Reader {
       fp.exclude_from_bom = has_symbol(at, "exclude_from_bom");
       fp.allow_missing_courtyard = has_symbol(at, "allow_missing_courtyard");
       fp.dnp = has_symbol(at, "dnp");
+      fp.allow_soldermask_bridges = has_symbol(at, "allow_soldermask_bridges");
     }
     if (NodeId dn = d_.find(f, "dnp"); dn != kNoNode) fp.dnp = yes(f, "dnp");
     const int fi = static_cast<int>(b_.footprints.size());

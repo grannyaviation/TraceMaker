@@ -335,3 +335,26 @@ TEST_CASE("courtyard functions in custom rules", "[route][rules]") {
   CHECK(eng.clearance(*pad, *out_b, 0) == 100'000);    // one of them does (KiCad tries A,B and B,A)
   CHECK(eng.clearance(*out_a, *out_b, 0) == rules.default_class().clearance);  // neither
 }
+
+TEST_CASE("allow_soldermask_bridges: the footprint's mask opening is ignored, like KiCad", "[route]") {
+  constexpr Coord MM = 1'000'000;
+  auto board = [](const char* attr) {
+    return io::read_board(sexpr::Document::parse(
+        std::string("(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (1 \"F.Mask\" user)) "
+                    "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (net 1 \"A\") (net 2 \"B\") "
+                    "(footprint \"t:U\" (layer \"F.Cu\") (transform (translate 10 10) (rotate 0) (scale 1 1)) ") +
+        attr + " (property \"Reference\" \"U1\" (at 0 0 0) (layer \"F.SilkS\")) "
+               "(fp_rect (start -2 -2) (end 2 2) (layer \"F.Mask\") (stroke (width 0) (type solid)) (fill yes)) "
+               "(pad \"1\" smd rect (at -1 0) (size 0.4 0.4) (layers \"F.Cu\") (net 1 \"A\")) "
+               "(pad \"2\" smd rect (at 1 0) (size 0.4 0.4) (layers \"F.Cu\") (net 2 \"B\"))))"));
+  };
+  const auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  auto plain = board("(attr smd)");
+  auto allowed = board("(attr smd allow_soldermask_bridges)");
+  CHECK_FALSE(plain.footprints[0].allow_soldermask_bridges);
+  REQUIRE(allowed.footprints[0].allow_soldermask_bridges);
+  route::Obstacles op(plain, rules), oa(allowed, rules);
+  // Net A copper inside the opening, well away from both pads.
+  CHECK(op.segment_state({9 * MM, 11 * MM}, {11 * MM, 11 * MM}, 0, 200'000, 1, false, nullptr) == 2);
+  CHECK(oa.segment_state({9 * MM, 11 * MM}, {11 * MM, 11 * MM}, 0, 200'000, 1, false, nullptr) == 0);
+}
