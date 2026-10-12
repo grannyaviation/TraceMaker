@@ -2465,8 +2465,8 @@ struct Router::Impl {
       if (!probe_hit) {
         ok = false;
         ++(c == u ? chain_nopath : chain_victim);
-        cs[static_cast<std::size_t>(u)].why = c == u ? "completion LNS: no path even across other connections (fixed copper, pads or rules in the way)"
-                                                     : "completion LNS: " + b.nets[static_cast<std::size_t>(cc.net)].name + ", lifted for it, found no way back";
+        cs[static_cast<std::size_t>(u)].why = c == u ? "completion LNS: no path even across other connections (" + why + ")"
+                                                     : "completion LNS: " + b.nets[static_cast<std::size_t>(cc.net)].name + ", lifted for it, found no way back (" + why + ")";
         break;
       }
       for (int v : probe_victims) {
