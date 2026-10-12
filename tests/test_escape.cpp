@@ -336,6 +336,42 @@ TEST_CASE("courtyard functions in custom rules", "[route][rules]") {
   CHECK(eng.clearance(*out_a, *out_b, 0) == rules.default_class().clearance);  // neither
 }
 
+TEST_CASE("courtyard functions: a stepped courtyard is not its hull, and a touch is not inside", "[route][rules]") {
+  // U1's courtyard, 12 lines around (10,10): |x| <= 2 where |y| <= 1, |x| <= 1 where 1 < |y| <= 2 (like TI's WQFN
+  // courtyards). Tracks of net 2: one in a corner of the hull only, one tangent to the outline, one inside.
+  const double c[][2] = {{-1, -2}, {1, -2}, {1, -1}, {2, -1}, {2, 1}, {1, 1}, {1, 2}, {-1, 2}, {-1, 1}, {-2, 1}, {-2, -1}, {-1, -1}};
+  std::string outline;
+  for (int i = 0; i < 12; ++i)
+    outline += "(fp_line (start " + std::to_string(c[i][0]) + " " + std::to_string(c[i][1]) + ") (end " + std::to_string(c[(i + 1) % 12][0]) + " " +
+               std::to_string(c[(i + 1) % 12][1]) + ") (layer \"F.CrtYd\") (stroke (width 0.05) (type solid))) ";
+  auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (31 \"F.CrtYd\" user)) "
+      "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (net 1 \"A\") (net 2 \"B\") "
+      "(footprint \"t:U\" (layer \"F.Cu\") (transform (translate 10 10) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"U1\" (at 0 0 0) (layer \"F.SilkS\")) " + outline + ") "
+      "(segment (start 11.3 11.4) (end 11.4 11.3) (width 0.1) (layer \"F.Cu\") (net 2)) "
+      "(segment (start 12.1 9.5) (end 12.1 10.5) (width 0.2) (layer \"F.Cu\") (net 2)) "
+      "(segment (start 10 10.5) (end 10.5 10.5) (width 0.2) (layer \"F.Cu\") (net 2)) "
+      "(segment (start 20 20) (end 21 20) (width 0.2) (layer \"F.Cu\") (net 1)))"));
+  auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  rules.custom.push_back(model::CustomRule{"fine pitch U1", "A.insideCourtyard('U1')", "", "", {model::Constraint{"clearance", 100'000, {}, {}, {}}}});
+  const auto cm = drc::build_copper(b);
+  const drc::RuleEngine eng(b, rules, cm);
+  const drc::CopperItem *corner = nullptr, *tangent = nullptr, *inside = nullptr, *far = nullptr;
+  for (const auto& it : cm.items) {
+    if (it.kind != drc::ItemKind::Track) continue;
+    if (it.box.x0 == 11'250'000) corner = &it;
+    if (it.box.x0 == 12'000'000) tangent = &it;
+    if (it.box.y0 == 10'400'000) inside = &it;
+    if (it.box.x0 == 19'900'000) far = &it;
+  }
+  REQUIRE((corner && tangent && inside && far));
+  const Coord base = rules.default_class().clearance;
+  CHECK(eng.clearance(*far, *inside, 0) == 100'000);
+  CHECK(eng.clearance(*far, *corner, 0) == base);   // inside the hull, outside the outline
+  CHECK(eng.clearance(*far, *tangent, 0) == base);  // meets the outline, overlaps nothing
+}
+
 TEST_CASE("allow_soldermask_bridges: the footprint's mask opening is ignored, like KiCad", "[route]") {
   constexpr Coord MM = 1'000'000;
   auto board = [](const char* attr) {

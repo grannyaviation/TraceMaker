@@ -387,8 +387,10 @@ class Condition {
         for (const auto& cy : ctx.eng->courtyard_[fi][static_cast<std::size_t>(side)]) {
           if (!cy.box.inflated(1).intersects(it->box)) continue;
           if (geom::point_in_polygon(it->pos, cy.pts)) return true;
+          // Overlap by 1 um, not a touch: KiCad does not count copper that only meets the outline (a track laid
+          // tangent to a courtyard got its exception from the router and the class clearance from KiCad).
           for (const auto& s : it->shapes)
-            if (geom::closer_than(s, cy, 1)) return true;
+            if (geom::closer_than(s, cy, -1'000)) return true;
         }
         return false;
       };
@@ -431,11 +433,43 @@ class Condition {
 
 // ---------------------------------------------------------------------------------------------------------
 
+namespace {
+// Chains open courtyard pieces (lines, arcs as polylines) end to end into closed outlines, ends within 1 um.
+// False when some piece does not close up; the caller then falls back to their convex hull.
+bool chain_loops(const std::vector<std::vector<geom::Point>>& pieces, std::vector<std::vector<geom::Point>>& loops) {
+  auto near = [](geom::Point p, geom::Point q) { return std::abs(p.x - q.x) <= 1000 && std::abs(p.y - q.y) <= 1000; };
+  std::vector<char> used(pieces.size(), 0);
+  for (std::size_t s = 0; s < pieces.size(); ++s) {
+    if (used[s]) continue;
+    used[s] = 1;
+    std::vector<geom::Point> loop = pieces[s];
+    while (loop.size() < 3 || !near(loop.front(), loop.back())) {
+      bool found = false;
+      for (std::size_t k = 0; k < pieces.size() && !found; ++k) {
+        if (used[k]) continue;
+        const auto& q = pieces[k];
+        if (near(q.front(), loop.back())) loop.insert(loop.end(), q.begin() + 1, q.end());
+        else if (near(q.back(), loop.back())) loop.insert(loop.end(), q.rbegin() + 1, q.rend());
+        else continue;
+        used[k] = 1;
+        found = true;
+      }
+      if (!found) return false;
+    }
+    loop.pop_back();  // the closing point repeats the first
+    loops.push_back(std::move(loop));
+  }
+  return true;
+}
+}  // namespace
+
 RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r, const CopperModel& cm) : b_(b), r_(r), cm_(cm) {
-  // Courtyards for the courtyard functions: closed graphics one hull each, lines and arcs one hull together.
+  // Courtyards for the courtyard functions: closed graphics as they are, lines and arcs chained into closed outlines
+  // (a stepped courtyard is not convex: its hull would take in copper KiCad sees outside), their hull only when they
+  // do not close up.
   courtyard_.resize(b_.footprints.size());
   {
-    std::vector<std::array<std::vector<geom::Point>, 2>> open(b_.footprints.size());
+    std::vector<std::array<std::vector<std::vector<geom::Point>>, 2>> open(b_.footprints.size());
     std::vector<std::array<std::vector<std::vector<geom::Point>>, 2>> closed(b_.footprints.size());
     for (const auto& g : b_.graphics) {
       const int side = g.layer == "F.CrtYd" ? 0 : g.layer == "B.CrtYd" ? 1 : -1;
@@ -443,12 +477,8 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r, const
       const auto fi = static_cast<std::size_t>(g.footprint);
       const auto si = static_cast<std::size_t>(side);
       switch (g.kind) {
-        case model::Graphic::Kind::Line: open[fi][si].push_back(g.a); open[fi][si].push_back(g.b); break;
-        case model::Graphic::Kind::Arc: {
-          const auto a = geom::arc_points(g.a, g.c, g.b);
-          open[fi][si].insert(open[fi][si].end(), a.begin(), a.end());
-          break;
-        }
+        case model::Graphic::Kind::Line: open[fi][si].push_back({g.a, g.b}); break;
+        case model::Graphic::Kind::Arc: open[fi][si].push_back(geom::arc_points(g.a, g.c, g.b)); break;
         case model::Graphic::Kind::Circle:
           closed[fi][si].push_back(geom::circle_points(g.a, geom::kiround(std::hypot(static_cast<double>(g.b.x - g.a.x), static_cast<double>(g.b.y - g.a.y)))));
           break;
@@ -457,12 +487,15 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r, const
     }
     for (std::size_t fi = 0; fi < b_.footprints.size(); ++fi)
       for (std::size_t si = 0; si < 2; ++si) {
-        closed[fi][si].push_back(open[fi][si]);
-        for (auto& pts : closed[fi][si]) {
-          if (pts.size() < 3) continue;
-          auto hull = geom::convex_hull(std::move(pts));
+        auto& pieces = open[fi][si];
+        if (!pieces.empty() && !chain_loops(pieces, closed[fi][si])) {
+          std::vector<geom::Point> all;
+          for (const auto& q : pieces) all.insert(all.end(), q.begin(), q.end());
+          auto hull = geom::convex_hull(std::move(all));
           if (hull.size() >= 3) courtyard_[fi][si].push_back(geom::Shape::polygon(std::move(hull), 0));
         }
+        for (auto& pts : closed[fi][si])
+          if (pts.size() >= 3) courtyard_[fi][si].push_back(geom::Shape::polygon(std::move(pts), 0));
       }
     for (std::size_t fi = 0; fi < b_.footprints.size(); ++fi) fp_by_ref_.emplace(b_.footprints[fi].reference, static_cast<int>(fi));
   }
