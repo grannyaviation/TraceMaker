@@ -1215,6 +1215,7 @@ struct Router::Impl {
 
   // Probe mode (completion LNS): a soft commit only records the path and the connections it would rip.
   bool probing = false, probe_hit = false;
+  bool probe_wide = false;  // completion LNS, later sweeps: probes try every window up to the whole board
   double soft_mult = 1.0;  // crossing cost factor (completion LNS probes: fewer connections crossed)
   std::vector<int> probe_victims;
   std::vector<PathNode> probe_path;
@@ -1320,7 +1321,7 @@ struct Router::Impl {
     // The strict first pass tries two window sizes only; anything harder is left to negotiation.
     // Negotiated searches stop before the whole-board window (they can cross copper, so a reachable target is
     // normally found within 20 mm of the bounding box); strict passes try two sizes.
-    const int attempts = strict_pass ? std::min(2, opt.max_attempts) : soft ? std::min(opt.soft_attempts, opt.max_attempts) : opt.max_attempts;
+    const int attempts = strict_pass ? std::min(2, opt.max_attempts) : soft && !probe_wide ? std::min(opt.soft_attempts, opt.max_attempts) : opt.max_attempts;
     for (int attempt = 0; attempt < attempts; ++attempt) {
       if (out_of_budget()) {
         why = "out of budget";
@@ -2464,6 +2465,8 @@ struct Router::Impl {
       if (!probe_hit) {
         ok = false;
         ++(c == u ? chain_nopath : chain_victim);
+        cs[static_cast<std::size_t>(u)].why = c == u ? "completion LNS: no path even across other connections (fixed copper, pads or rules in the way)"
+                                                     : "completion LNS: " + b.nets[static_cast<std::size_t>(cc.net)].name + ", lifted for it, found no way back";
         break;
       }
       for (int v : probe_victims) {
@@ -2471,6 +2474,7 @@ struct Router::Impl {
         if (v == u || cs[static_cast<std::size_t>(v)].coupled || orig.size() >= cap || queue.size() >= 2 * cap) {
           ok = false;
           ++chain_cap;
+          cs[static_cast<std::size_t>(u)].why = "completion LNS: its path would lift more than " + std::to_string(cap) + " connections";
           break;
         }
         if (orig.count(v)) lift_items(v);  // routed earlier in this transaction: that copper goes
@@ -2482,6 +2486,7 @@ struct Router::Impl {
       if (!commit(probe_conn, probe_path)) {
         ok = false;
         ++chain_victim;
+        cs[static_cast<std::size_t>(u)].why = "completion LNS: exact check rejected a probe path";
       }
     }
     if (ok) {
@@ -2503,7 +2508,8 @@ struct Router::Impl {
     strict_pass = true;  // two windows per search: the many failing searches stay cheap
     static const Coord radii[] = {1'000'000, 2'500'000, 5'000'000};
     static const std::size_t caps[] = {8, 16, 24};
-    int gained = 0, attempts = 0;
+    int gained = 0, attempts = 0, level = 0;  // level: sweeps without gain so far raise the cap (x2 each) and widen probes
+    std::size_t cap = lns_cap;
     for (int sweep = 0; !out_of_budget(); ++sweep) {
       const int gained_before = gained;
       for (std::size_t ui = 0; ui < cs.size() && !out_of_budget(); ++ui) {
@@ -2517,7 +2523,7 @@ struct Router::Impl {
           continue;
         }
         ++attempts;
-        if (lns_chain(uc, lns_cap, probe_soft)) {
+        if (lns_chain(uc, cap, probe_soft)) {
           u.routed = true;
           ++res.routed;
           ++gained;
@@ -2570,10 +2576,16 @@ struct Router::Impl {
           }
         }
       }
-      if (gained == gained_before) break;
+      if (gained == gained_before) {
+        if (level == 2) break;
+        ++level;
+        cap = lns_cap << level;
+        probe_wide = true;
+      }
     }
-    std::fprintf(stderr, "completion LNS: %d connections gained in %d attempts (chains: %ld kept, %ld no soft path, %ld over cap, %ld lifted one failed)\n",
-                 gained, attempts, chain_ok, chain_nopath, chain_cap, chain_victim);
+    probe_wide = false;
+    std::fprintf(stderr, "completion LNS: %d connections gained in %d attempts (chains: %ld kept, %ld no soft path, %ld over cap, %ld lifted one failed; cap %zu)\n",
+                 gained, attempts, chain_ok, chain_nopath, chain_cap, chain_victim, cap);
     int stray = 0;  // invariant: an unrouted connection owns no copper
     for (const auto& st : cs) stray += !st.routed && !st.items.empty();
     if (stray) std::fprintf(stderr, "completion LNS: BUG: %d unrouted connections own copper\n", stray);
