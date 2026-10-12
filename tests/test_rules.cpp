@@ -3,6 +3,9 @@
 
 #include <filesystem>
 
+#include "drc/copper.hpp"
+#include "drc/rule_engine.hpp"
+#include "io/kicad/board_reader.hpp"
 #include "io/kicad/project_reader.hpp"
 
 namespace fs = std::filesystem;
@@ -61,4 +64,71 @@ TEST_CASE("classes inherit null values from Default; explicit assignments and cu
   REQUIRE(r.custom[0].constraints.size() == 2);
   CHECK(r.custom[0].constraints[0].type == "track_width");
   CHECK(r.custom[0].constraints[0].opt == 150'000);
+}
+
+TEST_CASE("custom rule conditions compare strings case-insensitively with wildcards on either side", "[rules]") {
+  using namespace tmk;
+  const auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal)) "
+      "(net 0 \"\") (net 1 \"CLK\") (net 2 \"DATA*\") (net 3 \"usb_dp\"))"));
+  auto rules = read_design_rules("/nonexistent/board.kicad_pcb");
+  model::NetClass hs = rules.default_class();
+  hs.name = "HighSpeed";
+  rules.classes.push_back(hs);
+  rules.assignments["usb_dp"] = {"HighSpeed"};
+  const auto cm = drc::build_copper(b);
+  // Does a 0.2 mm track of `net` on copper layer `layer` match the rule (condition and layer selector)?
+  auto match = [&](const char* cond, model::NetId net, int layer = -1, const char* sel = "") {
+    rules.custom = {model::CustomRule{"r", cond, sel, "", {model::Constraint{"track_width", 123, {}, {}, {}}}}};
+    const drc::RuleEngine eng(b, rules, cm);
+    drc::CopperItem t;
+    t.kind = drc::ItemKind::Track;
+    t.net = net;
+    t.width = 200'000;
+    return eng.track_width(t, layer).first == 123;
+  };
+  CHECK(match("A.NetName == 'clk'", 1));  // case-insensitive
+  CHECK(match("'Clk' == A.NetName", 1));
+  CHECK_FALSE(match("A.NetName == 'CL'", 1));  // a prefix is no match, nor is a longer name
+  CHECK_FALSE(match("A.NetName == 'CLKX'", 1));
+  CHECK_FALSE(match("A.NetName != 'clk'", 1));
+  CHECK(match("A.NetName != 'clk'", 3));
+  CHECK(match("A.NetName == 'c*'", 1));  // wildcards in the literal
+  CHECK(match("A.NetName == 'C?k'", 1));
+  CHECK_FALSE(match("A.NetName == 'D*'", 1));
+  CHECK(match("A.NetName == 'data_7'", 2));  // and in the property: net DATA*
+  CHECK(match("A.NetName == 'Data'", 2));
+  CHECK_FALSE(match("A.NetName == 'clk'", 2));
+  CHECK(match("A.NetClass == 'highspeed'", 3));  // a mixed-case class
+  CHECK(match("A.NetClass == 'HIGH*'", 3));
+  CHECK_FALSE(match("A.NetClass == 'High'", 3));
+  CHECK_FALSE(match("A.NetClass == 'HighSpeed'", 1));
+  CHECK(match("A.NetClass == 'DEFAULT'", 1));
+  CHECK(match("A.NetName == ''", 0));  // empty strings
+  CHECK_FALSE(match("A.NetName == ''", 1));
+  CHECK(match("A.NetName != ''", 1));
+  CHECK(match("A.NetName == '*'", 0));
+  CHECK(match("A.Type == 'TRACK' && A.Type != 'Via'", 1));
+  CHECK(match("A.Width == '0.2'", 1));
+  CHECK(match("A.Layer == 'in1.cu'", 1, 1));
+  CHECK(match("A.Layer == ''", 1));
+  // Layer selectors: outer, inner, a layer name; every selector applies without a layer.
+  CHECK(match("", 1, 0, "outer"));
+  CHECK(match("", 1, 3, "outer"));
+  CHECK_FALSE(match("", 1, 1, "outer"));
+  CHECK(match("", 1, 2, "inner"));
+  CHECK_FALSE(match("", 1, 3, "inner"));
+  CHECK(match("", 1, 2, "In2.Cu"));
+  CHECK_FALSE(match("", 1, 1, "In2.Cu"));
+  CHECK(match("", 1, -1, "In2.Cu"));
+  // A rule on one item's class applies to a pair either way round, and not to other classes.
+  rules.custom = {model::CustomRule{"hs", "A.NetClass == 'HIGHSPEED' || A.NetClass == 'Pwr*'", "", "", {model::Constraint{"clearance", 777, {}, {}, {}}}}};
+  const drc::RuleEngine eng(b, rules, cm);
+  drc::CopperItem clk, usb;
+  clk.kind = usb.kind = drc::ItemKind::Track;
+  clk.net = 1;
+  usb.net = 3;
+  CHECK(eng.clearance(clk, usb, 0) == 777);
+  CHECK(eng.clearance(usb, clk, 0) == 777);
+  CHECK(eng.clearance(clk, clk, 0) == rules.default_class().clearance);
 }

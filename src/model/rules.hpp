@@ -76,6 +76,10 @@ struct DesignRules {
 
 // KiCad net-class pattern match: shell-style wildcards (* and ?), case-sensitive.
 bool wildcard_match(std::string_view pattern, std::string_view text);
+// The same, ASCII case-insensitive (custom rule conditions compare strings this way).
+bool wildcard_match_nocase(std::string_view pattern, std::string_view text);
+// tolower in the C locale, inline: rule conditions compare strings in the router's inner loops.
+constexpr char ascii_lower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; }
 // Net-class pattern: wildcard match or full regular-expression match (KiCad accepts both).
 bool pattern_match(const std::string& pattern, const std::string& text);
 

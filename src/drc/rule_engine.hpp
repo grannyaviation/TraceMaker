@@ -64,14 +64,25 @@ class RuleEngine {
     std::unique_ptr<Condition> cond;  // null = always
     bool valid = true;
   };
+  // Constraint types with a min that custom_min resolves (names in kMinTypes, rule_engine.cpp).
+  enum Min { Clearance, HoleClearance, HoleToHole, EdgeClearance, TrackWidth, ViaDiameter, AnnularWidth, HoleSize, MinCount };
+  // A valid rule's last constraint of one Min type: custom_min asks for one type per clearance query of the
+  // router, so it walks only these instead of every rule's constraint names.
+  struct MinRule {
+    const Condition* cond;   // null = always
+    Coord min;
+    model::LayerMask layers;  // copper layers the rule's layer selector admits
+    std::vector<char> by_class;  // by index in DesignRules::classes: can the condition hold with A in it? empty: yes
+  };
   // Value of the last matching custom constraint of `type` (min field), trying (a,b) and (b,a).
-  std::optional<Coord> custom_min(const char* type, const CopperItem* a, const CopperItem* b, int layer) const;
+  std::optional<Coord> custom_min(Min type, const CopperItem* a, const CopperItem* b, int layer) const;
   bool layer_matches(const std::string& sel, int layer) const;
 
   const model::Board& b_;
   const model::DesignRules& r_;
   const CopperModel& cm_;
   std::vector<Compiled> rules_;
+  std::array<std::vector<MinRule>, MinCount> min_rules_;  // by Min type, in rule order
   std::vector<std::string> warnings_;
   Coord max_clearance_ = 0;
   std::vector<const model::NetClass*> net_class_;  // by net id (nets created later fall back to a lookup)

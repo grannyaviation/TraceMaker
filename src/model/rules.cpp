@@ -5,10 +5,12 @@
 
 namespace tmk::model {
 
-bool wildcard_match(std::string_view p, std::string_view t) {
+namespace {
+template <class Eq>
+bool wildcard(std::string_view p, std::string_view t, Eq eq) {
   std::size_t pi = 0, ti = 0, star = std::string_view::npos, mark = 0;
   while (ti < t.size()) {
-    if (pi < p.size() && (p[pi] == '?' || p[pi] == t[ti])) {
+    if (pi < p.size() && (p[pi] == '?' || eq(p[pi], t[ti]))) {
       ++pi;
       ++ti;
     } else if (pi < p.size() && p[pi] == '*') {
@@ -23,6 +25,15 @@ bool wildcard_match(std::string_view p, std::string_view t) {
   }
   while (pi < p.size() && p[pi] == '*') ++pi;
   return pi == p.size();
+}
+}  // namespace
+
+bool wildcard_match(std::string_view p, std::string_view t) {
+  return wildcard(p, t, [](char a, char b) { return a == b; });
+}
+
+bool wildcard_match_nocase(std::string_view p, std::string_view t) {
+  return wildcard(p, t, [](char a, char b) { return ascii_lower(a) == ascii_lower(b); });
 }
 
 bool pattern_match(const std::string& pattern, const std::string& text) {

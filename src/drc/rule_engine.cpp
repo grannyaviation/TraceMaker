@@ -19,13 +19,35 @@ struct EvalCtx {
   bool unknown = false;  // set when an unsupported property or function is evaluated
 };
 
+// A property or function a condition reads, resolved when the condition is parsed (the router evaluates
+// conditions for every clearance query: comparing names there took most of its time).
+enum class Fn : std::uint8_t {
+  Unknown,
+  NetClass, NetName, Type, Layer, Reference, PadType, Width,  // properties
+  IsPlated, ExistsOnLayer, InsideArea, IntersectsArea, EnclosedByArea, InDiffPair, Courtyard, FrontCourtyard,
+  BackCourtyard, MemberOfFootprint,  // functions
+};
+
 struct Value {
   enum class K { Undef, Bool, Str, Num } k = K::Undef;
   bool b = false;
-  std::string s;
+  std::string_view s;  // into storage that outlives the evaluation: a literal, a net, class, footprint, kind or layer name
   double n = 0;
+  signed char wild = -1;  // s has a '*' or '?': 1 or 0 when known, -1 to look
   bool truthy() const { return k == K::Bool ? b : k == K::Num ? n != 0 : k == K::Str ? !s.empty() : false; }
 };
+
+static bool has_wildcard(const Value& v) {
+  if (v.wild >= 0) return v.wild != 0;
+  return std::any_of(v.s.begin(), v.s.end(), [](char c) { return c == '*' || c == '?'; });
+}
+
+static bool iequal(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    if (model::ascii_lower(a[i]) != model::ascii_lower(b[i])) return false;
+  return true;
+}
 
 class Condition {
  public:
@@ -33,13 +55,18 @@ class Condition {
     enum class Op { Or, And, Not, Eq, Ne, Lit, Prop, Call } op;
     std::vector<std::unique_ptr<Node>> kids;
     Value lit;
+    std::string text;     // a string literal (lit.s views it)
     char who = 'A';       // A or B
     std::string name;     // property or function name
+    Fn fn = Fn::Unknown;
     std::vector<std::string> args;
+    int arg = -1;  // existsOnLayer: copper layer; courtyard functions: footprint index, -1 none, -2 a wildcard pattern
   };
 
-  static std::unique_ptr<Condition> parse(const std::string& text, std::string& err) {
+  // `eng` resolves layer and footprint arguments; its board and footprint index must be complete.
+  static std::unique_ptr<Condition> parse(const std::string& text, const RuleEngine& eng, std::string& err) {
     auto c = std::make_unique<Condition>();
+    c->eng_ = &eng;
     c->src_ = text;
     c->pos_ = 0;
     try {
@@ -54,6 +81,9 @@ class Condition {
   }
 
   bool eval(EvalCtx& ctx) const { return eval(*root_, ctx).truthy(); }
+  // False when no item of net class `cls` can satisfy the condition as A: A.NetClass compared with a literal is
+  // known, everything else unknown (Kleene logic). custom_min then skips most class rules without evaluating them.
+  bool may_hold(std::string_view cls) const { return tri(*root_, cls) != 0; }
 
  private:
   void skip() {
@@ -135,8 +165,10 @@ class Condition {
     }
     if (c == '\'' || c == '"') {
       auto n = make(Node::Op::Lit);
+      n->text = read_string();
       n->lit.k = Value::K::Str;
-      n->lit.s = read_string();
+      n->lit.s = n->text;
+      n->lit.wild = n->text.find_first_of("*?") != std::string::npos;
       return n;
     }
     if (std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '.') {
@@ -175,23 +207,93 @@ class Condition {
         eat(",");
       }
     }
+    resolve(*n);
     return n;
+  }
+
+  void resolve(Node& n) const {
+    const std::string& s = n.name;
+    if (n.op == Node::Op::Prop) {
+      n.fn = s == "NetClass"                              ? Fn::NetClass
+             : s == "NetName"                             ? Fn::NetName
+             : s == "Type"                                ? Fn::Type
+             : s == "Layer"                               ? Fn::Layer
+             : s == "Reference" || s == "Parent.Reference" ? Fn::Reference
+             : s == "Pad_Type"                            ? Fn::PadType
+             : s == "Width"                               ? Fn::Width
+                                                          : Fn::Unknown;
+      return;
+    }
+    if (s == "isPlated") {
+      n.fn = Fn::IsPlated;
+      return;
+    }
+    if (n.args.empty()) return;  // the other functions need their argument
+    n.fn = s == "existsOnLayer"              ? Fn::ExistsOnLayer
+           : s == "insideArea"               ? Fn::InsideArea
+           : s == "intersectsArea"           ? Fn::IntersectsArea
+           : s == "enclosedByArea"           ? Fn::EnclosedByArea
+           : s == "inDiffPair"               ? Fn::InDiffPair
+           : s == "insideCourtyard"          ? Fn::Courtyard
+           : s == "intersectsCourtyard"      ? Fn::Courtyard
+           : s == "intersectsFrontCourtyard" ? Fn::FrontCourtyard
+           : s == "intersectsBackCourtyard"  ? Fn::BackCourtyard
+           : s == "memberOfFootprint"        ? Fn::MemberOfFootprint
+                                             : Fn::Unknown;
+    const std::string& a = n.args[0];
+    if (n.fn == Fn::ExistsOnLayer) n.arg = eng_->b_.copper_index(a);
+    if (n.fn == Fn::Courtyard || n.fn == Fn::FrontCourtyard || n.fn == Fn::BackCourtyard) {
+      if (a.find_first_of("*?") != std::string::npos) n.arg = -2;
+      else if (const auto f = eng_->fp_by_ref_.find(a); f != eng_->fp_by_ref_.end()) n.arg = f->second;
+    }
   }
 
   static bool str_eq(const Value& l, const Value& r) {
     if (l.k == Value::K::Num || r.k == Value::K::Num) {
-      const double a = l.k == Value::K::Num ? l.n : std::atof(l.s.c_str());
-      const double b = r.k == Value::K::Num ? r.n : std::atof(r.s.c_str());
+      // atof needs a terminated copy; a number meets a string rarely (A.Width == '0.2').
+      const double a = l.k == Value::K::Num ? l.n : std::atof(std::string(l.s).c_str());
+      const double b = r.k == Value::K::Num ? r.n : std::atof(std::string(r.s).c_str());
       return std::fabs(a - b) < 1e-9;
     }
     if (l.k == Value::K::Bool || r.k == Value::K::Bool) return l.truthy() == r.truthy();
-    // KiCad compares strings case-insensitively with wildcard support on either side.
-    auto low = [](std::string s) {
-      for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-      return s;
-    };
-    const std::string a = low(l.s), b = low(r.s);
-    return model::wildcard_match(b, a) || model::wildcard_match(a, b);
+    // KiCad compares strings case-insensitively with wildcard support on either side. Equal strings match each
+    // other as patterns, and without a wildcard a match is equality: most comparisons end at the length check.
+    if (iequal(l.s, r.s)) return true;
+    if (!has_wildcard(l) && !has_wildcard(r)) return false;
+    return model::wildcard_match_nocase(r.s, l.s) || model::wildcard_match_nocase(l.s, r.s);
+  }
+
+  // 0 false, 1 true, 2 unknown.
+  static int tri(const Node& n, std::string_view cls) {
+    switch (n.op) {
+      case Node::Op::Or: {
+        const int l = tri(*n.kids[0], cls), r = tri(*n.kids[1], cls);
+        return l == 1 || r == 1 ? 1 : l == 0 && r == 0 ? 0 : 2;
+      }
+      case Node::Op::And: {
+        const int l = tri(*n.kids[0], cls), r = tri(*n.kids[1], cls);
+        return l == 0 || r == 0 ? 0 : l == 1 && r == 1 ? 1 : 2;
+      }
+      case Node::Op::Not: {
+        const int v = tri(*n.kids[0], cls);
+        return v == 2 ? 2 : 1 - v;
+      }
+      case Node::Op::Eq:
+      case Node::Op::Ne: {
+        auto is_class = [](const Node& k) { return k.op == Node::Op::Prop && k.fn == Fn::NetClass && k.who == 'A'; };
+        const Node &l = *n.kids[0], &r = *n.kids[1];
+        Value c;
+        c.k = Value::K::Str;
+        c.s = cls;
+        bool eq;
+        if (is_class(l) && r.op == Node::Op::Lit) eq = str_eq(c, r.lit);
+        else if (l.op == Node::Op::Lit && is_class(r)) eq = str_eq(l.lit, c);
+        else return 2;
+        return eq == (n.op == Node::Op::Eq) ? 1 : 0;
+      }
+      case Node::Op::Lit: return n.lit.truthy() ? 1 : 0;
+      default: return 2;
+    }
   }
 
   Value prop(const Node& n, EvalCtx& ctx) const {
@@ -200,21 +302,33 @@ class Condition {
     if (!it) return v;  // B absent (single-item constraint): undefined → false
     const auto& b = ctx.eng->b_;
     v.k = Value::K::Str;
-    if (n.name == "NetClass") v.s = ctx.eng->netclass(*it).name;
-    else if (n.name == "NetName") v.s = b.nets[static_cast<std::size_t>(it->net)].name;
-    else if (n.name == "Type") v.s = it->kind == ItemKind::Arc ? "Track" : kind_name(it->kind);
-    else if (n.name == "Layer") v.s = ctx.layer >= 0 ? b.copper_name(ctx.layer) : "";
-    else if (n.name == "Reference" || n.name == "Parent.Reference")
-      v.s = it->footprint >= 0 ? b.footprints[static_cast<std::size_t>(it->footprint)].reference : "";
-    else if (n.name == "Pad_Type" && it->kind == ItemKind::Pad) {
-      static const char* names[] = {"SMD", "Through-hole", "NPTH, mechanical", "Edge connector"};
-      v.s = names[static_cast<int>(b.pads[static_cast<std::size_t>(it->index)].type)];
-    } else if (n.name == "Width") {
-      v.k = Value::K::Num;
-      v.n = static_cast<double>(it->width) / 1e6;
-    } else {
-      ctx.unknown = true;
-      v.k = Value::K::Undef;
+    switch (n.fn) {
+      case Fn::NetClass: v.s = ctx.eng->netclass(*it).name; break;
+      case Fn::NetName: v.s = b.nets[static_cast<std::size_t>(it->net)].name; break;
+      case Fn::Type:
+        v.s = it->kind == ItemKind::Arc ? "Track" : kind_name(it->kind);
+        v.wild = 0;
+        break;
+      case Fn::Layer: v.s = ctx.layer >= 0 ? std::string_view(b.copper_name(ctx.layer)) : std::string_view(); break;
+      case Fn::Reference:
+        if (it->footprint >= 0) v.s = b.footprints[static_cast<std::size_t>(it->footprint)].reference;
+        break;
+      case Fn::PadType:
+        if (it->kind == ItemKind::Pad) {
+          static const char* names[] = {"SMD", "Through-hole", "NPTH, mechanical", "Edge connector"};
+          v.s = names[static_cast<int>(b.pads[static_cast<std::size_t>(it->index)].type)];
+          v.wild = 0;
+          break;
+        }
+        ctx.unknown = true;
+        return Value{};
+      case Fn::Width:
+        v.k = Value::K::Num;
+        v.n = static_cast<double>(it->width) / 1e6;
+        break;
+      default:
+        ctx.unknown = true;
+        return Value{};
     }
     return v;
   }
@@ -225,12 +339,11 @@ class Condition {
     v.k = Value::K::Bool;
     if (!it) return v;
     const auto& b = ctx.eng->b_;
-    if (n.name == "isPlated") {
+    if (n.fn == Fn::IsPlated) {
       v.b = it->kind == ItemKind::Via || (it->kind == ItemKind::Pad && b.pads[static_cast<std::size_t>(it->index)].type == model::PadType::ThruHole);
-    } else if (n.name == "existsOnLayer" && !n.args.empty()) {
-      const int l = b.copper_index(n.args[0]);
-      v.b = l >= 0 && (it->layers & model::layer_bit(l));
-    } else if ((n.name == "insideArea" || n.name == "intersectsArea" || n.name == "enclosedByArea") && !n.args.empty()) {
+    } else if (n.fn == Fn::ExistsOnLayer) {
+      v.b = n.arg >= 0 && (it->layers & model::layer_bit(n.arg));
+    } else if (n.fn == Fn::InsideArea || n.fn == Fn::IntersectsArea || n.fn == Fn::EnclosedByArea) {
       const bool fill = it->kind == ItemKind::Zone;
       const std::tuple<const void*, int, int> key{&n, it->index, it->sub};
       if (fill) {
@@ -251,27 +364,26 @@ class Condition {
           for (const auto& s : it->shapes)
             if (geom::closer_than(s, area, 1)) { any = true; break; }
         }
-        if (n.name == "intersectsArea" ? any : all_in) { v.b = true; break; }
+        if (n.fn == Fn::IntersectsArea ? any : all_in) { v.b = true; break; }
       }
       if (fill) {
         const std::lock_guard lock(ctx.eng->area_mutex_);
         ctx.eng->area_cache_[key] = v.b;
       }
-    } else if (n.name == "inDiffPair" && !n.args.empty()) {
+    } else if (n.fn == Fn::InDiffPair) {
       // KiCad: true when the item's net is one half of a differential pair whose base name (without the final
       // P/N or +/-) matches the pattern.
       const auto net = static_cast<std::size_t>(it->net);
       if (it->net != 0 && net < ctx.eng->dp_partner_.size() && ctx.eng->dp_partner_[net] != 0) {
-        const std::string& name = b.nets[net].name;
+        const std::string_view name = b.nets[net].name;
         v.b = model::wildcard_match(n.args[0], name.substr(0, name.size() - 1)) || model::wildcard_match(n.args[0], name);
       }
-    } else if ((n.name == "insideCourtyard" || n.name == "intersectsCourtyard" || n.name == "intersectsFrontCourtyard" ||
-                n.name == "intersectsBackCourtyard") && !n.args.empty()) {
+    } else if (n.fn == Fn::Courtyard || n.fn == Fn::FrontCourtyard || n.fn == Fn::BackCourtyard) {
       // KiCad: true when any part of the item lies within the named footprint's courtyard, the one on its own
       // side unless Front/Back says which (insideCourtyard is the older name of intersectsCourtyard).
       auto test = [&](std::size_t fi) {
         const auto& fp = b.footprints[fi];
-        const int side = n.name == "intersectsFrontCourtyard" ? 0 : n.name == "intersectsBackCourtyard" ? 1 : fp.back ? 1 : 0;
+        const int side = n.fn == Fn::FrontCourtyard ? 0 : n.fn == Fn::BackCourtyard ? 1 : fp.back ? 1 : 0;
         for (const auto& cy : ctx.eng->courtyard_[fi][static_cast<std::size_t>(side)]) {
           if (!cy.box.inflated(1).intersects(it->box)) continue;
           if (geom::point_in_polygon(it->pos, cy.pts)) return true;
@@ -280,15 +392,13 @@ class Condition {
         }
         return false;
       };
-      const std::string& pat = n.args[0];
-      if (pat.find_first_of("*?") == std::string::npos) {
-        const auto f = ctx.eng->fp_by_ref_.find(pat);
-        v.b = f != ctx.eng->fp_by_ref_.end() && test(static_cast<std::size_t>(f->second));
+      if (n.arg != -2) {
+        v.b = n.arg >= 0 && test(static_cast<std::size_t>(n.arg));
       } else {
         for (std::size_t fi = 0; fi < b.footprints.size() && !v.b; ++fi)
-          v.b = model::wildcard_match(pat, b.footprints[fi].reference) && test(fi);
+          v.b = model::wildcard_match(n.args[0], b.footprints[fi].reference) && test(fi);
       }
-    } else if (n.name == "memberOfFootprint" && !n.args.empty()) {
+    } else if (n.fn == Fn::MemberOfFootprint) {
       v.b = it->footprint >= 0 && model::wildcard_match(n.args[0], b.footprints[static_cast<std::size_t>(it->footprint)].reference);
     } else {
       ctx.unknown = true;
@@ -313,6 +423,7 @@ class Condition {
     return v;
   }
 
+  const RuleEngine* eng_ = nullptr;  // while parsing
   std::string src_;
   std::size_t pos_ = 0;
   std::unique_ptr<Node> root_;
@@ -359,7 +470,7 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r, const
     Compiled c{&rule, nullptr, true};
     if (!rule.condition.empty()) {
       std::string err;
-      c.cond = Condition::parse(rule.condition, err);
+      c.cond = Condition::parse(rule.condition, *this, err);
       if (!c.cond) {
         c.valid = false;
         warnings_.push_back("rule '" + rule.name + "': cannot parse condition (" + err + "); rule ignored");
@@ -368,6 +479,25 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r, const
     rules_.push_back(std::move(c));
     for (const auto& k : rule.constraints)
       if (k.type == "clearance" && k.min) max_clearance_ = std::max(max_clearance_, *k.min);
+  }
+  static constexpr const char* kMinTypes[] = {"clearance",   "hole_clearance", "hole_to_hole",  "edge_clearance",
+                                              "track_width", "via_diameter",   "annular_width", "hole_size"};
+  static_assert(std::size(kMinTypes) == MinCount);
+  for (const auto& c : rules_) {
+    if (!c.valid) continue;
+    model::LayerMask layers = 0;
+    for (int l = 0; l < 64; ++l)
+      if (layer_matches(c.rule->layer, l)) layers |= model::layer_bit(l);
+    std::vector<char> by_class;
+    if (c.cond)
+      for (const auto& cls : r_.classes) by_class.push_back(c.cond->may_hold(cls.name));
+    if (std::all_of(by_class.begin(), by_class.end(), [](char x) { return x; })) by_class.clear();
+    for (std::size_t t = 0; t < MinCount; ++t) {
+      const model::Constraint* k = nullptr;
+      for (const auto& x : c.rule->constraints)
+        if (x.type == kMinTypes[t] && x.min) k = &x;
+      if (k) min_rules_[t].push_back({c.cond.get(), *k->min, layers, by_class});
+    }
   }
   for (const auto& c : r_.classes) max_clearance_ = std::max(max_clearance_, c.clearance);
   // Per-net caches: net class and diff-pair partner (string matching is far too slow for inner loops).
@@ -417,26 +547,25 @@ bool RuleEngine::layer_matches(const std::string& sel, int layer) const {
   return b_.copper_index(sel) == layer;
 }
 
-std::optional<Coord> RuleEngine::custom_min(const char* type, const CopperItem* a, const CopperItem* b, int layer) const {
-  std::optional<Coord> out;
-  for (const auto& c : rules_) {
-    if (!c.valid || !layer_matches(c.rule->layer, layer)) continue;
-    const model::Constraint* k = nullptr;
-    for (const auto& x : c.rule->constraints)
-      if (x.type == type && x.min) k = &x;
-    if (!k) continue;
-    bool match = true;
-    if (c.cond) {
+std::optional<Coord> RuleEngine::custom_min(Min type, const CopperItem* a, const CopperItem* b, int layer) const {
+  // Later rules take precedence: the last match decides, so look from the back.
+  auto may_hold = [&](const MinRule& m, const CopperItem* x) {
+    return !x || m.by_class.empty() || m.by_class[static_cast<std::size_t>(&netclass(*x) - r_.classes.data())];
+  };
+  const auto& rules = min_rules_[type];
+  for (auto m = rules.rbegin(); m != rules.rend(); ++m) {
+    if (layer >= 0 && !(m->layers & model::layer_bit(layer))) continue;
+    if (!m->cond) return m->min;
+    if (may_hold(*m, a)) {
       EvalCtx ctx{this, a, b, layer};
-      match = c.cond->eval(ctx);
-      if (!match && b) {
-        EvalCtx ctx2{this, b, a, layer};
-        match = c.cond->eval(ctx2);
-      }
+      if (m->cond->eval(ctx)) return m->min;
     }
-    if (match) out = *k->min;  // later rules take precedence
+    if (b && may_hold(*m, b)) {
+      EvalCtx ctx2{this, b, a, layer};
+      if (m->cond->eval(ctx2)) return m->min;
+    }
   }
-  return out;
+  return std::nullopt;
 }
 
 std::pair<std::optional<Coord>, std::optional<Coord>> RuleEngine::length_constraint(model::NetId net) const {
@@ -542,7 +671,7 @@ Coord RuleEngine::clearance(const CopperItem& a, const CopperItem& b, int layer)
   if (la < 0 && lb < 0 && coupled_diff_pair(a.net, b.net)) req = std::min(req, netclass(a).diff_pair_gap);
   bool custom = false;
   if (any_custom_clearance_)
-    if (auto c = custom_min("clearance", &a, &b, layer)) req = *c, custom = true;
+    if (auto c = custom_min(Clearance, &a, &b, layer)) req = *c, custom = true;
   // A copper zone's own clearance is a local clearance: without a pad override or a custom rule, the larger of
   // it and the net-class value applies (DRC_ENGINE::EvalRules; KiCad names it "zone clearance").
   if (zone_overrides_ && la < 0 && lb < 0 && !custom)
@@ -554,43 +683,43 @@ Coord RuleEngine::clearance(const CopperItem& a, const CopperItem& b, int layer)
 
 Coord RuleEngine::hole_clearance(const CopperItem* owner, const CopperItem& other, int layer) const {
   Coord req = r_.minimums.hole_clearance;
-  if (auto c = custom_min("hole_clearance", owner, &other, layer)) req = std::max(req, *c);
+  if (auto c = custom_min(HoleClearance, owner, &other, layer)) req = std::max(req, *c);
   return req;
 }
 
 Coord RuleEngine::hole_to_hole(const CopperItem* a, const CopperItem* b) const {
   Coord req = r_.minimums.hole_to_hole;
-  if (auto c = custom_min("hole_to_hole", a, b, -1)) req = std::max(req, *c);
+  if (auto c = custom_min(HoleToHole, a, b, -1)) req = std::max(req, *c);
   return req;
 }
 
 Coord RuleEngine::edge_clearance(const CopperItem& a, int layer) const {
   Coord req = r_.minimums.copper_edge_clearance;
-  if (auto c = custom_min("edge_clearance", &a, nullptr, layer)) req = *c;
+  if (auto c = custom_min(EdgeClearance, &a, nullptr, layer)) req = *c;
   return req;
 }
 
 std::pair<Coord, Coord> RuleEngine::track_width(const CopperItem& t, int layer) const {
   Coord mn = r_.minimums.track_width, mx = 0;
-  if (auto c = custom_min("track_width", &t, nullptr, layer)) mn = *c;
+  if (auto c = custom_min(TrackWidth, &t, nullptr, layer)) mn = *c;
   return {mn, mx};
 }
 
 Coord RuleEngine::via_diameter_min(const CopperItem& v) const {
   Coord req = r_.minimums.via_diameter;
-  if (auto c = custom_min("via_diameter", &v, nullptr, -1)) req = *c;
+  if (auto c = custom_min(ViaDiameter, &v, nullptr, -1)) req = *c;
   return req;
 }
 
 Coord RuleEngine::annular_width_min(const CopperItem& v) const {
   Coord req = r_.minimums.via_annular_width;
-  if (auto c = custom_min("annular_width", &v, nullptr, -1)) req = *c;
+  if (auto c = custom_min(AnnularWidth, &v, nullptr, -1)) req = *c;
   return req;
 }
 
 Coord RuleEngine::hole_size_min(const CopperItem* owner) const {
   Coord req = r_.minimums.through_hole_diameter;
-  if (auto c = custom_min("hole_size", owner, nullptr, -1)) req = *c;
+  if (auto c = custom_min(HoleSize, owner, nullptr, -1)) req = *c;
   return req;
 }
 
