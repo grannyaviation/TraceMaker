@@ -141,7 +141,9 @@ struct Router::Impl {
     emit(buf);
   }
 
-  const model::NetClass& netclass(NetId net) const { return rules.class_for(b.nets[static_cast<std::size_t>(net)].name); }
+  // By net id from the rule engine: class_for matches every net-class pattern (regexes too) and runs per lattice
+  // cell through cache_for (sensor_ts: 137 patterns).
+  const model::NetClass& netclass(NetId net) const { return obs->rules().netclass(net); }
   // Via drill and diameter for a net: net-class values raised to the board minimums (drill, diameter and
   // annular ring: d >= drill + 2 * min_annular).
   Coord class_via_drill(NetId net) const { return std::max(netclass(net).via_drill, rules.minimums.through_hole_diameter); }

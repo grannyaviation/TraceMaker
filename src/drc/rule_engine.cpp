@@ -403,8 +403,8 @@ void RuleEngine::use_zone_clearance_overrides() {
     if (!z.rule_area) max_clearance_ = std::max(max_clearance_, z.clearance);
 }
 
-const model::NetClass& RuleEngine::netclass(const CopperItem& it) const {
-  const auto i = static_cast<std::size_t>(it.net);
+const model::NetClass& RuleEngine::netclass(model::NetId net) const {
+  const auto i = static_cast<std::size_t>(net);
   if (i < net_class_.size()) return *net_class_[i];
   return r_.class_for(b_.nets[i].name);
 }

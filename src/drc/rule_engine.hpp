@@ -43,7 +43,8 @@ class RuleEngine {
   // yet (D51: changing it needs a routing benchmark run).
   void use_zone_clearance_overrides();
 
-  const model::NetClass& netclass(const CopperItem& it) const;
+  const model::NetClass& netclass(const CopperItem& it) const { return netclass(it.net); }
+  const model::NetClass& netclass(model::NetId net) const;
   // True if the two nets are the P/N (or +/-) halves of one differential pair.
   bool coupled_diff_pair(model::NetId a, model::NetId b) const;
   // Length constraint (min, max) of the last custom rule whose condition matches a track of `net`, if any.
