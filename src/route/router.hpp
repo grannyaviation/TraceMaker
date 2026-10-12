@@ -91,6 +91,9 @@ struct RouterOptions {
   bool cut_report = false;
   bool escape_report = false;   // fill RouteResult::escape_rings (pins of deep arrays per ring, and how many connected)
   int max_restarts = 6;         // full restarts (hardest first, history kept) when negotiation stalls
+  bool lns_complete = false;    // after the strict pass: region rip-up and re-route per unrouted connection, no negotiation
+  double lns_soft = 1.0;        // completion LNS: crossing cost factor of the probe searches (higher: fewer connections lifted)
+  int lns_cap = 16;             // completion LNS: connections lifted per transaction at most
   double soft_cost_mm = 1.0;    // base cost of crossing another net's routed copper (before history)
   std::uint64_t seed = 1;
   int order = 0;                // connection order: 0 shortest first, 1 longest first, 2 shortest first with seeded jitter

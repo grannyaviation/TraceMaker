@@ -456,6 +456,11 @@ int main(int argc, char** argv) {
   route->add_flag("--global-confine", ropt.global_confine, "With --global: confine each connection's first search to its corridor (experimental)")->group("");
   route->add_flag("--global-corridor-only", ropt.global_strict_corridor_only, "With --global-confine: a corridor failure goes straight to negotiation (experimental)")->group("");
   route->add_option("--max-expansions", ropt.max_expansions, "Search expansions per attempt")->group("");
+  route->add_option("--max-passes", ropt.max_passes, "Passes over still-unrouted connections before a restart")->group("");
+  route->add_option("--max-restarts", ropt.max_restarts, "Planned full restarts (hardest first, history kept)")->group("");
+  route->add_flag("--lns-complete", ropt.lns_complete, "After the strict pass, complete by region rip-up and re-route (kept only when nothing is lost) instead of negotiation")->group("");
+  route->add_option("--lns-soft", ropt.lns_soft, "Completion LNS: crossing cost factor of its probe searches (default 1)")->group("");
+  route->add_option("--lns-cap", ropt.lns_cap, "Completion LNS: connections lifted per transaction at most (default 16)")->group("");
   route->add_flag("!--no-optimize", ropt.optimize, "Skip the post-routing clean-up pass (fewer vias, shorter tracks)");
   route->add_flag("--plan-gap,!--no-plan-gap", ropt.plan_gap, "Plan connections by copper-to-copper distance between pads rather than centre to centre (default on)");
   route->add_flag("--global-congestion", ropt.global_congestion, "Global plan as a congestion map: through traffic pays in tiles the plan fills (experimental)")->group("");

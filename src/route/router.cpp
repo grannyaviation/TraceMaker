@@ -531,7 +531,7 @@ struct Router::Impl {
           std::max(std::abs(tx - cong_end[0]), std::abs(ty - cong_end[1])) > 1 && std::max(std::abs(tx - cong_end[2]), std::abs(ty - cong_end[3])) > 1)
         hc += (global.util[ti] - opt.global_congestion_from) * cong_pen;
     }
-    if (st == 1) return static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) + hc * 4;
+    if (st == 1) return static_cast<std::int64_t>(opt.soft_cost_mm * soft_mult * 1e6) + hc * 4;
     if (st == 3) return 3 * pitch + hc;
     return hc;
   }
@@ -566,7 +566,7 @@ struct Router::Impl {
       if (rc < 0) return -1;
       extra = std::max(extra, rc);
     }
-    return extra + (via_state[idx] == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
+    return extra + (via_state[idx] == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * soft_mult * 1e6) : 0);
   }
 
   // Lattice cells of the window inside a pad's copper on each of its layers (falls back to cells next to the
@@ -914,7 +914,7 @@ struct Router::Impl {
           if (vs == 2 && blind_ok) vs = obs->via_state_span(vp, vd, vdrill, net, vm, soft, nullptr, std::min(l, l2), std::max(l, l2));
           if (vs == 2) continue;
           const std::size_t ns = sidx(l2, ci, kNoDir);
-          const std::int64_t ng = gs + via_cost * 3 / 2 + (vs == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
+          const std::int64_t ng = gs + via_cost * 3 / 2 + (vs == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * soft_mult * 1e6) : 0);
           if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= ng) continue;
           const std::int64_t hn = h(l2, w.x0 + cx, w.y0 + cy);
           if (hn >= kUnreachable) continue;
@@ -1082,6 +1082,14 @@ struct Router::Impl {
     }
     std::sort(victims.begin(), victims.end());
     victims.erase(std::unique(victims.begin(), victims.end()), victims.end());
+    if (probing) {  // completion LNS: the caller lifts the victims itself and commits this path afterwards
+      probe_hit = true;
+      probe_victims = victims;
+      probe_path = path;
+      probe_conn = c;
+      commit_why = "probe";
+      return false;
+    }
     for (int v : victims)
       if (cs[static_cast<std::size_t>(v)].rips >= rip_cap) {
         commit_why = "would rip a connection already ripped too often";
@@ -1205,6 +1213,12 @@ struct Router::Impl {
       }
   }
 
+  // Probe mode (completion LNS): a soft commit only records the path and the connections it would rip.
+  bool probing = false, probe_hit = false;
+  double soft_mult = 1.0;  // crossing cost factor (completion LNS probes: fewer connections crossed)
+  std::vector<int> probe_victims;
+  std::vector<PathNode> probe_path;
+  Connection probe_conn;
   long exp_ok = 0, exp_fail = 0, n_ok = 0, n_fail = 0;
   long xf_soft_conf = 0, xf_soft_wide = 0, xf_strict_conf = 0, xf_strict_wide = 0;  // failed-search expansions by kind
   std::string why, commit_why;
@@ -1346,12 +1360,14 @@ struct Router::Impl {
             return false;
           }
           if (found && commit(r, rp)) return true;
+          if (probe_hit) return false;
           last_miss = Miss::Window;
         }
         continue;
       }
       if (commit(c, path)) return true;
       why = commit_why;
+      if (probe_hit) return false;
     }
     return false;
   }
@@ -2412,6 +2428,159 @@ struct Router::Impl {
     return improved;
   }
 
+  // Completion by region rip-up and re-route (large-neighbourhood search), in place of negotiation: for each
+  // unrouted connection, lift the routed connections with copper near its pads and between them (at most 8, 16, 24
+  // as the radius grows), route the unrouted one first and then every lifted one, shortest first. Kept only if all of
+  // them route (one connection more, none lost); otherwise the old copper is restored exactly. The routed count never
+  // drops, so it runs from the strict pass's state until a sweep gains nothing or the budget ends.
+  // One transaction of the completion LNS: route connection u along its soft path (the cheapest path that may cross
+  // other connections' copper), lift the connections it crosses, then route each lifted one strictly, or along its own
+  // soft path lifting what that crosses in turn, at most `cap` lifted in all. Kept only when every one is routed;
+  // otherwise all copper of the transaction goes and the lifted connections get their old copper back.
+  long chain_ok = 0, chain_nopath = 0, chain_cap = 0, chain_victim = 0;
+  bool lns_chain(int u, std::size_t cap, double probe_soft) {
+    std::vector<int> queue{u};
+    std::map<int, std::vector<OldItem>> orig;  // lifted connections' copper before the transaction
+    bool ok = true;
+    for (std::size_t qi = 0; ok && qi < queue.size(); ++qi) {
+      const int c = queue[qi];
+      const auto& cc = cs[static_cast<std::size_t>(c)].c;
+      if (c != u) {  // the unrouted connection failed strictly already
+        current = c;
+        soft = false;
+        if (search_and_commit(cc, false)) continue;
+      }
+      probing = true;
+      probe_hit = false;
+      current = c;
+      soft = true;
+      strict_pass = false;  // soft searches get their wider windows
+      soft_mult = probe_soft;
+      search_and_commit(cc, true);
+      soft_mult = 1.0;
+      strict_pass = true;
+      probing = false;
+      soft = false;
+      if (!probe_hit) {
+        ok = false;
+        ++(c == u ? chain_nopath : chain_victim);
+        break;
+      }
+      for (int v : probe_victims) {
+        // u itself is never lifted: its copper has no state to go back to, and it keeps its priority.
+        if (v == u || cs[static_cast<std::size_t>(v)].coupled || orig.size() >= cap || queue.size() >= 2 * cap) {
+          ok = false;
+          ++chain_cap;
+          break;
+        }
+        if (orig.count(v)) lift_items(v);  // routed earlier in this transaction: that copper goes
+        else orig[v] = lift_items(v);
+        queue.push_back(v);
+      }
+      if (!ok) break;
+      current = c;
+      if (!commit(probe_conn, probe_path)) {
+        ok = false;
+        ++chain_victim;
+      }
+    }
+    if (ok) {
+      ++chain_ok;
+      return true;
+    }
+    lift_items(u);
+    for (auto& [v, items] : orig) {
+      lift_items(v);
+      restore_items(v, items);
+    }
+    return false;
+  }
+
+  int lns_complete() {
+    const double probe_soft = opt.lns_soft;
+    const std::size_t lns_cap = static_cast<std::size_t>(std::max(1, opt.lns_cap));
+    bypass_nogoods = true;
+    strict_pass = true;  // two windows per search: the many failing searches stay cheap
+    static const Coord radii[] = {1'000'000, 2'500'000, 5'000'000};
+    static const std::size_t caps[] = {8, 16, 24};
+    int gained = 0, attempts = 0;
+    for (int sweep = 0; !out_of_budget(); ++sweep) {
+      const int gained_before = gained;
+      for (std::size_t ui = 0; ui < cs.size() && !out_of_budget(); ++ui) {
+        auto& u = cs[ui];
+        if (u.routed || u.dead) continue;
+        const int uc = static_cast<int>(ui);
+        if (joined(uc)) {
+          u.routed = u.implicit = true;
+          ++res.routed;
+          ++gained;
+          continue;
+        }
+        ++attempts;
+        if (lns_chain(uc, lns_cap, probe_soft)) {
+          u.routed = true;
+          ++res.routed;
+          ++gained;
+          release_escapes(uc);
+          continue;
+        }
+        const Point pa = b.pads[static_cast<std::size_t>(u.c.pad_a)].pos;
+        const Point pb = u.c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(u.c.pad_b)].pos : pa;
+        for (std::size_t r = 0; r < std::size(radii) && !u.routed && !out_of_budget(); ++r) {
+          std::vector<int> group;
+          auto take = [&](const geom::Box& box) {
+            std::vector<int> ids;
+            obs->routed_items_in(box, ids);
+            for (int id : ids) {
+              const int o = obs->copper().items[static_cast<std::size_t>(id)].owner;
+              if (o < 0 || group.size() >= caps[r] || std::find(group.begin(), group.end(), o) != group.end()) continue;
+              const auto& so = cs[static_cast<std::size_t>(o)];
+              if (so.routed && !so.implicit && !so.coupled) group.push_back(o);
+            }
+          };
+          take(geom::Shape::point(pa, radii[r]).box);
+          take(geom::Shape::point(pb, radii[r]).box);
+          geom::Box line;
+          line.add(pa);
+          line.add(pb);
+          take(line.inflated(radii[r]));
+          if (group.empty()) continue;
+          ++attempts;
+          std::stable_sort(group.begin(), group.end(), [&](int x, int y) { return cs[static_cast<std::size_t>(x)].c.length < cs[static_cast<std::size_t>(y)].c.length; });
+          std::vector<std::vector<OldItem>> saved;
+          for (int g : group) saved.push_back(lift_items(g));
+          soft = false;
+          current = uc;
+          bool ok = search_and_commit(u.c, false);
+          for (std::size_t k = 0; ok && k < group.size(); ++k) {
+            current = group[k];
+            ok = search_and_commit(cs[static_cast<std::size_t>(group[k])].c, false);
+          }
+          if (ok) {
+            u.routed = true;
+            ++res.routed;
+            ++gained;
+            release_escapes(uc);
+            break;
+          }
+          lift_items(uc);  // rejected: the unrouted connection's new copper goes, the group's old copper comes back
+          for (std::size_t k = 0; k < group.size(); ++k) {
+            lift_items(group[k]);
+            restore_items(group[k], saved[k]);
+          }
+        }
+      }
+      if (gained == gained_before) break;
+    }
+    std::fprintf(stderr, "completion LNS: %d connections gained in %d attempts (chains: %ld kept, %ld no soft path, %ld over cap, %ld lifted one failed)\n",
+                 gained, attempts, chain_ok, chain_nopath, chain_cap, chain_victim);
+    int stray = 0;  // invariant: an unrouted connection owns no copper
+    for (const auto& st : cs) stray += !st.routed && !st.items.empty();
+    if (stray) std::fprintf(stderr, "completion LNS: BUG: %d unrouted connections own copper\n", stray);
+    bypass_nogoods = false;
+    return gained;
+  }
+
   // Length tuning (design doc 05 §9 phase 3): nets with a custom `length` constraint that are routed too short get
   // trombone meanders on their longest straight segments. Each candidate meander is checked exactly; the net never
   // exceeds its maximum. Returns the number of nets brought into range.
@@ -2907,9 +3076,10 @@ struct Router::Impl {
     // After the planned restarts, keep restarting while budget remains (up to 40 more), diversified: nogoods
     // cleared, rip cap raised, history halved, ties in the hardest-first order shuffled (avr_ledprojector stopped
     // at 43 of 120 s with every remaining attempt a nogood).
+    bool lns_done = false;  // completion LNS ran: its state is final (no negotiation, no restarts)
     for (int restart = 0; restart <= opt.max_restarts + 40; ++restart) {
     if (restart > 0) {
-      if (out_of_budget() || best_routed == res.connections) break;
+      if (lns_done || out_of_budget() || best_routed == res.connections) break;
       for (std::size_t i = 0; i < cs.size(); ++i) {
         auto& st = cs[i];
         for (int item : st.items) {
@@ -3055,6 +3225,12 @@ struct Router::Impl {
       // Next pass: hardest (most failed) first.
       std::stable_sort(failed.begin(), failed.end(), [&](int x, int y) { return cs[static_cast<std::size_t>(x)].fails > cs[static_cast<std::size_t>(y)].fails; });
       for (int f : failed) pending.push_back(f);
+      if (pass == 0 && opt.lns_complete) {
+        lns_complete();
+        pending.clear();
+        lns_done = true;
+        break;
+      }
       if (pass > 0 && res.routed <= routed_before && res.rips == 0) break;
     }
     if (res.routed > best_routed) {
