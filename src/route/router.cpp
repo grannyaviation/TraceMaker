@@ -193,11 +193,15 @@ struct Router::Impl {
   }
   Coord pad_neck(NetId net, int pad) const {
     const auto& p = b.pads[static_cast<std::size_t>(pad)];
-    return std::clamp(std::min(p.size_x, p.size_y), neck_width(net), class_width(net));
+    // On a 0.05 mm grid: every width gets its own full-board obstacle caches.
+    return std::clamp(std::min(p.size_x, p.size_y) / 50'000 * 50'000, neck_width(net), class_width(net));
   }
   // The neck-down rung on and off. Net classes wider than 0.3 mm (power) neck locally at pad width, with
   // class-size vias; narrower ones along the whole path to the neck width, with the neck via.
+  std::set<std::pair<const model::NetClass*, Coord>> cache_keys;  // caches before neck_on: neck_off frees the others
   void neck_on(const Connection& c) {
+    cache_keys.clear();
+    for (const auto& kv : caches) cache_keys.insert(kv.first);
     if (opt.neck_reach > 0 && class_width(c.net) > 300'000) {
       neck_reach = opt.neck_reach;
       neck_pa = b.pads[static_cast<std::size_t>(c.pad_a)].pos;
@@ -214,6 +218,9 @@ struct Router::Impl {
     width_override = 0;
     via_override = false;
     neck_reach = 0;
+    // The neck widths' caches (~80 MB each on a 82 mm board) would pile up over a run: a sensor board run was
+    // killed for memory with six routes per node.
+    for (auto it = caches.begin(); it != caches.end();) it = cache_keys.count(it->first) ? std::next(it) : caches.erase(it);
   }
 
   // Lattice <-> board coordinates.
