@@ -543,7 +543,9 @@ void Obstacles::remove_item(int item) {
 void Obstacles::aperture_codes(const Shape& s, int layer, bool via_probe, const std::function<void(model::NetId)>& hit) const {
   const int side = layer == 0 ? 0 : layer == b_.copper_count() - 1 ? 1 : -1;
   if (side >= 0) {
-    const Coord extra = 1'000 + (via_probe ? via_mask_ : 0);
+    // KiCad's solder-mask bridge test: copper of another net within the board's solder-mask-to-copper clearance
+    // of an aperture (pad plus its mask expansion) bridges it (drc_test_provider_solder_mask.cpp).
+    const Coord extra = 1'000 + std::max<Coord>(r_.minimums.solder_mask_to_copper_clearance, 0) + (via_probe ? via_mask_ : 0);
     agrid_[side]->query(s.box.inflated(extra + 1), [&](int id) {
       const auto& a = apertures_[side][static_cast<std::size_t>(id)];
       for (const auto& u : a.shapes)

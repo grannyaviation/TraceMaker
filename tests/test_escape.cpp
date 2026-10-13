@@ -487,3 +487,25 @@ TEST_CASE("neck-down of a wide net class stays next to the fine-pitch pad", "[ro
   CHECK(wide);
   CHECK(r.necked == 1);
 }
+
+TEST_CASE("solder-mask bridges: other copper keeps the board's mask-to-copper clearance from a pad's aperture", "[route]") {
+  constexpr Coord MM = 1'000'000;
+  auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (1 \"F.Mask\" user)) "
+      "(setup (pad_to_mask_clearance 0.1)) (net 0 \"\") (net 1 \"A\") (net 2 \"B\") "
+      "(footprint \"t:U\" (layer \"F.Cu\") (transform (translate 10 10) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"U1\" (at 0 0 0) (layer \"F.SilkS\")) "
+      "(pad \"1\" smd rect (at 0 0) (size 0.4 0.4) (layers \"F.Cu\" \"F.Mask\") (net 1 \"A\"))))"));
+  auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  rules.minimums.clearance = 100'000;
+  for (auto& c : rules.classes) c.clearance = 100'000;
+  rules.minimums.solder_mask_to_copper_clearance = 100'000;
+  route::Obstacles obs(b, rules);
+  // A 0.1 mm net B track whose edge is 0.15 mm from the pad: outside the aperture (0.1) but within its 0.1 mm
+  // mask-to-copper clearance (KiCad: "solder mask aperture bridges items with different nets").
+  const Coord y = 10 * MM + 200'000 + 150'000 + 50'000;
+  CHECK(obs.segment_state({9 * MM, y}, {11 * MM, y}, 0, 100'000, 2, false, nullptr) == 2);
+  const Coord y2 = 10 * MM + 200'000 + 210'000 + 50'000;  // 0.21 mm: clear
+  CHECK(obs.segment_state({9 * MM, y2}, {11 * MM, y2}, 0, 100'000, 2, false, nullptr) == 0);
+  CHECK(obs.segment_state({9 * MM, y}, {11 * MM, y}, 0, 100'000, 1, false, nullptr) == 0);  // its own net may
+}
