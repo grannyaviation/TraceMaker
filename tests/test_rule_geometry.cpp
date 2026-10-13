@@ -305,3 +305,31 @@ TEST_CASE("Courtyard selectors resolved once give the results of matching every 
   }
   CHECK(hits > 50);  // the comparison is not vacuous
 }
+
+TEST_CASE("Courtyard rings far from an item do not change its even/odd answer", "[rules][drc][rule_geometry]") {
+  // The CM4 connector's courtyard: the connector outline plus mounting-hole circles far away. The router tests
+  // only the rings whose box meets the item; a hole ring still cuts its area out.
+  auto b = court_board();
+  auto rect = [](Point a, Point c) {
+    model::Graphic g;
+    g.kind = model::Graphic::Kind::Rect;
+    g.layer = "F.CrtYd";
+    g.a = a;
+    g.b = c;
+    return g;
+  };
+  add_graphic(b, rect({0, 0}, {10 * M, 10 * M}));
+  add_graphic(b, rect({3 * M, 3 * M}, {7 * M, 7 * M}));
+  model::Graphic circle;
+  circle.kind = model::Graphic::Kind::Circle;
+  circle.layer = "F.CrtYd";
+  circle.a = {40 * M, 5 * M};
+  circle.b = {43 * M, 5 * M};
+  add_graphic(b, circle);
+  const auto cache = drc::build_courtyards(b);
+  auto hit = [&](Point p) { return drc::courtyard_matches(copper(Shape::point(p, M / 10)), cache, "R*", "intersectsCourtyard"); };
+  CHECK(hit({M, M}));
+  CHECK_FALSE(hit({5 * M, 5 * M}));
+  CHECK(hit({40 * M, 5 * M}));
+  CHECK_FALSE(hit({25 * M, 5 * M}));
+}

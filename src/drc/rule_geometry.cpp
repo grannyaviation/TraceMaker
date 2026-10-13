@@ -233,6 +233,14 @@ CourtyardRegion prepare_courtyard(const model::Board& board, const model::Footpr
     for (auto& ring : rings) region.parts.push_back({std::move(ring)});
   else
     region.parts.push_back(std::move(rings));
+  for (const auto& part : region.parts) {
+    auto& boxes = region.ring_boxes.emplace_back();
+    for (const auto& ring : part) {
+      geom::Box b;
+      for (Point p : ring) b.add(p);
+      boxes.push_back(b);
+    }
+  }
   return region;
 }
 }  // namespace
@@ -288,8 +296,24 @@ bool courtyard_hit(const CopperItem& item, const CourtyardEntry& entry, int whic
     const auto& region = entry.sides[static_cast<std::size_t>(side)];
     for (const auto& shape : item.shapes) {
       if (region.parts.empty() || !shape.box.intersects(region.box)) continue;
-      for (const auto& part : region.parts)
-        if (collides(shape, part)) return true;
+      for (std::size_t k = 0; k < region.parts.size(); ++k) {
+        // A ring whose box misses the shape neither crosses nor contains it, and leaving it out keeps the
+        // even/odd parity of every point of the shape: test the others only. A courtyard with far-off rings
+        // (the CM4 connector's mounting-hole circles) otherwise costs every lattice point all their edges.
+        const auto& part = region.parts[k];
+        const auto& boxes = region.ring_boxes[k];
+        std::size_t near = 0;
+        for (const auto& b : boxes) near += shape.box.intersects(b);
+        if (near == 0) continue;
+        if (near == part.size()) {
+          if (collides(shape, part)) return true;
+          continue;
+        }
+        Rings subset;
+        for (std::size_t i = 0; i < part.size(); ++i)
+          if (shape.box.intersects(boxes[i])) subset.push_back(part[i]);
+        if (collides(shape, subset)) return true;
+      }
     }
   }
   return false;

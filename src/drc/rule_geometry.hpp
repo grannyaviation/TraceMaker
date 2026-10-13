@@ -17,6 +17,7 @@ struct CourtyardRegion {
   // The courtyard is the union of the parts. The rings of one part use even/odd filling (a ring inside another
   // is a hole); outlines that overlap or touch are parts of their own, as KiCad merges them.
   std::vector<std::vector<std::vector<geom::Point>>> parts;
+  std::vector<std::vector<geom::Box>> ring_boxes;  // per part, per ring: the router asks for every lattice point
   geom::Box box;
   // The side has courtyard graphics, but they are not closed, simple outlines (or use a Bezier curve): no
   // parts, and the rule engine warns that courtyard conditions cannot match this footprint.
