@@ -35,7 +35,7 @@ namespace {
 class Checker {
  public:
   Checker(const model::Board& b, const model::DesignRules& r, const DrcOptions& o)
-      : b_(b), r_(r), o_(o), cm_(build_copper(b)), re_(b, r, cm_) {
+      : b_(b), r_(r), o_(o), cm_(build_copper(b)), re_(b, r) {
     re_.use_zone_clearance_overrides();
   }
 
@@ -76,20 +76,26 @@ class Checker {
         h.shape = geom::Shape::point(h.pos, d / 2);
       }
     tick("net propagation");
-    check_pairs();
-    tick("check_pairs");
-    check_items();
-    tick("check_items");
-    check_pad_rings();
-    tick("check_pad_rings");
-    check_holes();
-    tick("check_holes");
-    check_via_hole_pairs();
-    tick("check_via_hole_pairs");
-    check_edges();
-    tick("check_edges");
-    check_keepouts();
-    tick("check_keepouts");
+    if (!o_.connectivity_only) {
+      check_pairs();
+      tick("check_pairs");
+      check_items();
+      tick("check_items");
+      check_pad_rings();
+      tick("check_pad_rings");
+      check_holes();
+      tick("check_holes");
+      check_via_hole_pairs();
+      tick("check_via_hole_pairs");
+      check_edges();
+      tick("check_edges");
+      check_keepouts();
+      tick("check_keepouts");
+      check_disallow();
+      tick("check_disallow");
+      check_physical_holes();
+      tick("check_physical_holes");
+    }
     check_connectivity();
     tick("check_connectivity");
     // Project severities: drop ignored types, apply warning/error levels.
@@ -530,10 +536,53 @@ class Checker {
     }
   }
 
+  // KiCad reports one items_not_allowed per item, including multi-layer zones.
+  void check_disallow() {
+    if (std::none_of(r_.custom.begin(), r_.custom.end(), [](const model::CustomRule& c) {
+          return std::any_of(c.constraints.begin(), c.constraints.end(), [](const model::Constraint& k) { return k.type == "disallow"; });
+        }))
+      return;
+    std::set<int> zones_done;
+    for (const auto& it : cm_.items) {
+      if (it.kind == ItemKind::Zone && zones_done.count(it.index)) continue;
+      for (model::LayerMask m = it.layers; m; m &= m - 1) {
+        const int l = std::countr_zero(m);
+        if (!re_.disallowed(it, l)) continue;
+        add("items_not_allowed", &it, nullptr, -1, -1, l);
+        if (it.kind == ItemKind::Zone) zones_done.insert(it.index);
+        break;
+      }
+    }
+  }
+
+  // Physical hole clearance applies to any net; KiCad reports one hole_clearance per hole and copper item.
+  void check_physical_holes() {
+    if (!re_.any_physical_hole_clearance()) return;
+    for (const auto& h : cm_.holes) {
+      if (h.item < 0) continue;  // NPTH without copper: no item for the rule's condition
+      const CopperItem& owner = cm_.items[static_cast<std::size_t>(h.item)];
+      const geom::Shape hole = cshape(h);
+      grid_->query(hole.box.inflated(re_.max_physical_hole_clearance() + 1), [&](int jj) {
+        if (jj == h.item) return;
+        const CopperItem& c = cm_.items[static_cast<std::size_t>(jj)];
+        Coord req = -1;
+        int at = -1;
+        for (model::LayerMask m = c.layers; m; m &= m - 1)
+          if (const Coord r = re_.physical_hole_clearance(&owner, c, std::countr_zero(m)); r > req) req = r, at = std::countr_zero(m);
+        if (req <= 0) return;
+        for (const auto& s : c.shapes)
+          if (geom::closer_than(hole, s, req - o_.epsilon)) {
+            add("hole_clearance", &owner, &c, -1, req, at);
+            return;
+          }
+      });
+    }
+  }
+
   // Connectivity (see drc/connectivity.cpp) and the checks that depend on it.
   void check_connectivity() {
     const auto n = cm_.items.size();
-    const Connectivity con = compute_connectivity(b_, cm_, *grid_, true);
+    const Connectivity con = compute_connectivity(b_, cm_, *grid_, true, o_.linear_zone_tests ? nullptr : zones_.get());
     struct Roots {
       const std::vector<int>& r;
       int find(int i) const { return r[static_cast<std::size_t>(i)]; }

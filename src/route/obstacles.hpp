@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "drc/connectivity.hpp"
 #include "drc/copper.hpp"
 #include "drc/rule_engine.hpp"
 #include "index/uniform_grid.hpp"
@@ -26,9 +27,9 @@ class Obstacles {
                  std::vector<int>* owners = nullptr) const;
   int segment_state(geom::Point a, geom::Point b, int layer, Coord width, model::NetId net, bool ignore_routed,
                     std::vector<int>* owners = nullptr) const;
-  // A via on copper layers [l0, l1] only (blind or buried via); via_state covers all layers.
+  // A via on copper layers [l0, l1] only (blind or buried via, or a micro via with `type`); via_state covers all layers.
   int via_state_span(geom::Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed, std::vector<int>* owners, int l0,
-                     int l1) const;
+                     int l1, model::ViaType type = model::ViaType::Blind) const;
   int via_state(geom::Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed,
                 std::vector<int>* owners = nullptr) const;
   bool disk_ok(geom::Point p, int layer, Coord hw, model::NetId net, Coord margin) const {
@@ -40,6 +41,12 @@ class Obstacles {
   bool via_ok(geom::Point p, Coord d, Coord drill, model::NetId net, Coord margin) const {
     return via_state(p, d, drill, net, margin, false) == 0;
   }
+  // Custom disallow rules that depend on position, size or footprint (doc 05 §34), for new copper of `net`: a
+  // track whose copper is `s` with `width` on `layer`, or a via of diameter `d` spanning [l0, l1]. The state
+  // checks above include them (blocked, 2); a disk's rules are judged on its copper, without the margin.
+  bool positional_rules() const { return re_->positional_disallow(); }
+  bool track_disallowed(const geom::Shape& s, int layer, Coord width, model::NetId net) const;
+  bool via_disallowed(geom::Point p, Coord d, model::NetId net, int l0, int l1, model::ViaType type) const;
 
   // Registers committed copper (the board copy must already contain the track/via at `index`). Returns the
   // copper item index.
@@ -54,13 +61,21 @@ class Obstacles {
   static constexpr std::int32_t kFree = -1, kBlocked = -2;
   std::int32_t fixed_code(geom::Point p, int layer, Coord hw, Coord margin, model::NetId probe_net, bool via_probe = false) const;
   std::int32_t fixed_via_code(geom::Point p, Coord d, Coord drill, Coord margin, model::NetId probe_net) const;
+  // Per-layer reference for fixed_via_code.
+  std::int32_t fixed_via_code_reference(geom::Point p, Coord d, Coord drill, Coord margin, model::NetId probe_net) const;
   // Routed (rippable) copper only: 0 free, 1 conflicts (owners appended), 2 blocked when !soft.
   int routed_state(const geom::Shape& s, int layer, model::NetId net, drc::ItemKind kind, bool soft, std::vector<int>* owners,
                    bool via_hole = false, Coord hole_r = 0) const;
+  // Maximum routed_state over `layers` for a via and its hole; layer-independent hole checks run once.
+  int routed_via_state(const geom::Shape& s, model::LayerMask layers, model::NetId net, bool soft, Coord hole_r) const;
+  // Rules outside the per-class cache require exact per-point checks.
+  bool needs_exact_routing() const { return re_->needs_exact_routing(); }
   // Ids of live routed items whose box meets `box`.
   void routed_items_in(const geom::Box& box, std::vector<int>& out) const;
 
   const drc::CopperModel& copper() const { return cm_; }
+  // Copper text as the model holds it: one estimated rectangle per line (copper index, rectangle).
+  const std::vector<std::pair<int, geom::Shape>>& copper_texts() const { return texts_; }
   const drc::RuleEngine& rules() const { return *re_; }
   index::UniformGrid& grid() { return *grid_; }
   geom::Box bounds() const { return bounds_; }
@@ -71,18 +86,44 @@ class Obstacles {
   // to 0 to ask "would a via fit here if vias were tented?"; routing never changes it.
   Coord via_mask() const { return via_mask_; }
   void set_via_mask(Coord m) { via_mask_ = m; }
+  // Zone fills are ignored as obstacles (they are refilled after routing); they remain connection targets.
+  void set_soft_zones(bool on) { soft_zones_ = on; }
+  bool soft_zones() const { return soft_zones_; }
+  // Vias keep clear of SMD pads narrower than `max_pad` (any net, net-class clearance), as if they were another
+  // net's copper; larger pads (exposed thermal pads) still take vias. set_pad_via_exempt(true) lifts this around the
+  // checks of one deliberate via in pad (the router's --via-in-pad).
+  void set_vias_off_pads(bool on, Coord max_pad) { vias_off_pads_ = on; vias_off_pads_max_ = max_pad; }
+  void set_pad_via_exempt(bool on) const { pad_via_exempt_ = on; }
+  // Reference path: test probes against every edge of a zone fill instead of the fill's edge index (the answers
+  // are the same; tests/test_design_rules.cpp).
+  void set_linear_zone_tests(bool on) { linear_zone_tests_ = on; }
   // Rejection counters (diagnostics): outside board, copper, holes/edges/keepouts.
   mutable long rej_outside = 0, rej_copper = 0, rej_other = 0, checks = 0;
 
  private:
   int copper_state(const geom::Shape& s, const drc::CopperItem& probe, int layer, bool ignore_routed, std::vector<int>* owners) const;
+  // True if `s` is closer than `req` to the copper of `it`. A zone fill answers from its edge index
+  // (geom::PolygonIndex, exact), so a probe costs the fill's nearby edges instead of all of them.
+  bool item_closer(const geom::Shape& s, const drc::CopperItem& it, Coord req) const;
   int holes_edges_state(const geom::Shape& s, model::NetId net, int layer, bool is_via_hole, Coord hole_r, bool ignore_routed,
                         std::vector<int>* owners) const;
+  // Custom physical_hole_clearance rules, any net: new copper against existing holes, and a new via's hole
+  // against existing copper, on `layer`. 0 free, 1 conflict with routed copper (when soft), 2 blocked.
+  int physical_copper_state(const geom::Shape& s, drc::ItemKind kind, model::NetId net, int layer, bool fixed, bool routed, bool soft,
+                            std::vector<int>* owners) const;
+  int physical_hole_state(const geom::Shape& hole, model::NetId net, int layer, bool fixed, bool routed, bool soft, std::vector<int>* owners) const;
+  int routed_copper_part(const geom::Shape& s, int layer, model::NetId net, drc::ItemKind kind, bool soft, std::vector<int>* owners) const;
+  int routed_via_holes_part(const geom::Shape& s, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
+  int routed_hole_copper_part(const geom::Shape& h, int layer, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
+  int routed_hole_to_hole_part(const geom::Shape& hole, bool soft, std::vector<int>* owners) const;
+  std::int32_t via_hole_code(geom::Point p, Coord drill, Coord margin, model::NetId probe_net, std::int32_t code) const;
 
   model::Board& b_;
   const model::DesignRules& r_;
   drc::CopperModel cm_;
   std::unique_ptr<drc::RuleEngine> re_;
+  std::unique_ptr<drc::ZoneFills> fills_;     // edge index of every zone fill present at construction
+  bool linear_zone_tests_ = false;
   std::unique_ptr<index::UniformGrid> grid_;   // copper items (fixed and routed)
   std::unique_ptr<index::UniformGrid> rgrid_;  // routed copper items only
   std::unique_ptr<index::UniformGrid> hgrid_;  // holes
@@ -97,6 +138,11 @@ class Obstacles {
   int ir_w_ = 0, ir_h_ = 0;
   Coord ir_cell_ = 250'000;
   bool inside_exact(geom::Point p) const;
+  bool soft_zones_ = false;
+  bool vias_off_pads_ = false;
+  Coord vias_off_pads_max_ = 2'000'000;
+  mutable bool pad_via_exempt_ = false;
+  bool via_keeps_off(const drc::CopperItem& it) const;
   std::vector<std::pair<geom::Shape, const model::Zone*>> keepouts_;
   std::vector<geom::Shape> mask_open_[2];  // solder-mask openings drawn as graphics (front, back)
   struct Aperture {
@@ -113,5 +159,11 @@ class Obstacles {
   // Mask-opening and copper-text conflicts for new copper on `layer` (fixed obstacles only).
   void aperture_codes(const geom::Shape& s, int layer, bool via_probe, const std::function<void(model::NetId)>& hit) const;
 };
+
+// Filled area of zone fill items (nm^2), shoelace over each item's outline.
+long double zone_fill_area(const drc::CopperModel& cm, const std::vector<int>& items);
+// With soft zones a fill of at least this area that no pad touches is its net's plane: a connection target of its
+// own (doc 05 §26). Smaller ones are slivers of a stale fill, which a refill may drop or reshape.
+inline constexpr long double kPlaneTargetArea = 1e12L;  // 1 mm^2
 
 }  // namespace tmk::route

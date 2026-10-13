@@ -2,8 +2,8 @@ find_package(Catch2 3 REQUIRED)
 include(Catch)
 
 find_package(nlohmann_json 3 REQUIRED)
-add_executable(tm_tests test_units.cpp test_rng.cpp test_gpu.cpp test_sexpr.cpp test_kicad_io.cpp test_rules.cpp test_netlist.cpp test_geom.cpp test_escape.cpp test_diff_pair.cpp)
-target_link_libraries(tm_tests PRIVATE tm::core tm::gpu tm::sexpr tm::model tm::io tm::geom tm::route nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
+add_executable(tm_tests test_units.cpp test_rng.cpp test_gpu.cpp test_sexpr.cpp test_kicad_io.cpp test_rules.cpp test_netlist.cpp test_geom.cpp test_escape.cpp test_diff_pair.cpp test_plane_smd.cpp test_design_rules.cpp test_rule_geometry.cpp test_rule_layer_context.cpp test_layer_limits.cpp test_soft_zones.cpp test_refill.cpp test_work_profile.cpp test_bus.cpp test_passes.cpp test_srj.cpp test_tui.cpp)
+target_link_libraries(tm_tests PRIVATE tm::core tm::gpu tm::sexpr tm::model tm::io tm::geom tm::drc tm::route tm::passes tm::app_tui nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
 target_compile_definitions(tm_tests PRIVATE TM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 tm_set_warnings(tm_tests)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test-results)
@@ -12,9 +12,9 @@ catch_discover_tests(tm_tests REPORTER junit OUTPUT_DIR ${CMAKE_BINARY_DIR}/test
 # Integration: edited boards must read identically in KiCad (Docker) and TraceMaker.
 add_test(NAME kicad_edit_roundtrip COMMAND ${PROJECT_SOURCE_DIR}/tests/integration/edit_roundtrip.sh $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration)
 set_tests_properties(kicad_edit_roundtrip PROPERTIES SKIP_RETURN_CODE 77 LABELS "kicad;integration" TIMEOUT 600)
-add_test(NAME kicad_drc_parity COMMAND ${PROJECT_SOURCE_DIR}/tests/integration/drc_parity.sh)
+add_test(NAME kicad_drc_parity COMMAND ${PROJECT_SOURCE_DIR}/tests/integration/drc_parity.sh $<TARGET_FILE:tracemaker>)
 set_tests_properties(kicad_drc_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "kicad;integration" TIMEOUT 1200)
-add_test(NAME kicad_drc_broken_parity COMMAND ${PROJECT_SOURCE_DIR}/tests/integration/drc_broken_parity.sh)
+add_test(NAME kicad_drc_broken_parity COMMAND ${PROJECT_SOURCE_DIR}/tests/integration/drc_broken_parity.sh $<TARGET_FILE:tracemaker>)
 set_tests_properties(kicad_drc_broken_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "kicad;integration" TIMEOUT 1800)
 add_test(NAME drc_zone_index COMMAND ${PROJECT_SOURCE_DIR}/tests/integration/drc_zone_index.sh $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/drc_zone_index)
 set_tests_properties(drc_zone_index PROPERTIES SKIP_RETURN_CODE 77 LABELS "integration" TIMEOUT 1800)  # 9 minutes under asan
@@ -55,3 +55,29 @@ set_tests_properties(thread_determinism PROPERTIES SKIP_RETURN_CODE 77 LABELS "r
 # Coupled differential pairs (M12, D50): a USB hub's five pairs routed coupled, deterministic, KiCad-clean.
 add_test(NAME diff_pair COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/diff_pair.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/diff_pair)
 set_tests_properties(diff_pair PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 3600)
+# Plane-aware routing of an all-SMD board (doc 05 §26): defaults vs. --soft-zones --via-in-pad --keep-vias-off-pads
+# --first-nets on the synthetic tests/boards/plane_smd; KiCad's DRC when kicad-cli is on the PATH.
+add_test(NAME plane_smd COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/plane_smd.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/plane_smd)
+set_tests_properties(plane_smd PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;integration" TIMEOUT 600)
+# Custom rules the router cannot apply are named in the route log (doc 05 §27).
+add_test(NAME route_rule_warnings COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/route_rule_warnings.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/route_rule_warnings)
+set_tests_properties(route_rule_warnings PROPERTIES LABELS "route;integration" TIMEOUT 120)
+# The options screen and `route --config` (D89): scripted keys, a pseudo-terminal session, file against typed options.
+add_test(NAME tui_options COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/tui_options.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/tui_options)
+set_tests_properties(tui_options PROPERTIES LABELS "integration" TIMEOUT 300)
+# Frozen KiCad 10 custom-rule item/pair multisets (expected.json names the judging version); normal runs do not require KiCad.
+add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/rule_parity/run.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/rule_parity)
+set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)
+# Buses (doc 05 §38, D91): generated boards routed lane by lane, judged by `tracemaker buses` on the written files
+# (members routed, equal vias, skew within the limit from an option or a .kicad_dru rule), and a bus run at 1, 2 and
+# 4 threads giving identical bytes. Needs no fixtures and no KiCad.
+add_test(NAME bus_route COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/bus_route.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/bus_route)
+set_tests_properties(bus_route PROPERTIES LABELS "route;integration" TIMEOUT 3600 PROCESSORS 4)  # 1.3 minutes in release; over 30 under asan
+# After-route passes (doc 05 §39): style metric, power widening and stitching vias through the command line, on
+# generated boards; KiCad's DRC judges the stitched board when kicad-cli is on the PATH.
+add_test(NAME after_route_passes COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/after_route_passes.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/after_route_passes)
+set_tests_properties(after_route_passes PROPERTIES LABELS "route;integration" TIMEOUT 900)
+# Simple Route JSON (doc 08 §9): import a hand-made problem, route it, export the traces; every trace point on routed
+# copper, every connection routed or reported; byte-identical conversion; KiCad's ratsnest when kicad-cli is there.
+add_test(NAME srj_roundtrip COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/srj_roundtrip.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/srj_roundtrip)
+set_tests_properties(srj_roundtrip PROPERTIES LABELS "route;integration" TIMEOUT 600)

@@ -4,6 +4,7 @@
 //
 // Octilinear A* on a fine lattice (optimal under its cost model), with legality decided lazily by exact
 // clearance tests against the DRC's rule engine, then exact verification of every committed segment and via.
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -38,16 +39,34 @@ struct RouterOptions {
   int reach_check = 1;              // flood-fill reachability check before strict searches (exact): 0 off, 1 likely failures, 2 all
   bool bend_states = true;          // direction in the A* state (exact bend costs) vs. parent-direction approximation
   double heuristic_weight = 1.0;
+  // Plane-aware routing of all-SMD boards (doc 05 §26), all opt-in:
+  bool soft_zones = false;          // zone fills do not block other nets (refilled afterwards); unused fills become plane targets
+  bool via_in_pad = false;          // inner balls / enclosed SMD pads may take a minimum-size via in the pad
+  bool vias_off_pads = false;       // vias keep clear of SMD pads narrower than vias_off_pads_below_mm (except via-in-pad)
+  double vias_off_pads_below_mm = 2.0;
   bool field_heuristic = true;      // GPU cost-to-go field as the A* heuristic on large windows
   int field_min_cells = 60'000;     // window size (lattice points x layers) from which the field is used
-  int gpu_device = 0;               // CUDA device for fields (-1 = none)    // weighted A* (1.0 = optimal under the cost model; >1 trades optimality for speed)
+  int gpu_device = 0;              // GPU backend device for fields (-1 = CPU reference)
   int max_attempts = 4;         // per connection (window growth and learned blocks between attempts)
   int soft_attempts = 3;        // window sizes tried by negotiated searches
   double via_cost_mm = 3.0;     // equivalent track length of one via
   bool allow_vias = true;
+  double polish_fraction = 0;   // share of the budget reserved for rebuilding the open connections of the best state (doc 16)
+  int polish_trials = 20;       // seeded orders tried per open connection in the polish
+  int lns_open_trials = 0;      // regional rebuild of open connections: seeded orders tried per open connection (0 = off, doc 16 F4)
+  double lns_open_radius_mm = 2.5;  // copper within this distance of the open connection's first pad is lifted
+  double layer_dir_pen = -1;    // negative = automatic (-1: 0.3; otherwise the strength is the absolute value) on breakout boards only, else 0; extra cost (pitches per orthogonal step) against a layer's preferred direction: even layers horizontal, odd vertical (doc 16)
+  bool layer_dir_swap = false;  // preferred directions the other way round: even layers vertical, odd horizontal
+  double package_pen = -1;      // -1 = automatic (3 on a two-layer board with a ball-grid package, else 0); pitches per lattice step for tracks on the pad layer inside a ball-grid package (doc 16 F3; 0 = off)
+  bool layer_assign_angle = false;  // layer preference by chord direction instead of by crossings (uses layer_assign_pen)
+  bool layer_assign = false;    // doc 16 F2: prefer, per connection, the layer that leaves the fewest crossings (two-layer boards)
+  double layer_assign_pen = 0.4;  // pitches per lattice step on the other layer
+  bool strict_first = true;     // the first pass is strict (no crossing of routed copper); off: negotiate from the first pass
   bool rip_up = true;           // negotiated rip-up and reroute (design doc 05 §6 rung R2, doc 06 §3)
-  int max_rips_per_connection = 8;
-  int max_passes = 12;          // passes over still-unrouted connections
+  double history_weight = 2.0;  // PathFinder history: pitches of cost per recorded conflict on a cell
+  int max_victims = 0;          // a negotiated route may rip at most this many connections at once (0 = no limit)
+  int max_rips_per_connection = 40;  // was 8: at 50 M work on dense breakouts 33 % -> 54 % clean (doc 16 §4)
+  int max_passes = 40;          // passes over still-unrouted connections (was 12)
   // Micro vias (outer layer to the next one, the net class's microvia size) where a through via is blocked, on
   // boards whose rules allow them (doc 05 §21).
   bool micro_vias = false;
@@ -96,13 +115,45 @@ struct RouterOptions {
   int lns_cap = 16;             // completion LNS: connections lifted per transaction at most
   int lns_u_lifts = 2;          // completion LNS: times the unrouted connection gives way to one it lifted
   Coord neck_reach = 2'000'000;  // neck-down of net classes wider than 0.3 mm: only this close to an end pad (0 = whole path)
+  double soft_growth = 0.0;     // crossing cost grows by this fraction of soft_cost_mm per negotiation pass (PathFinder, doc 16)
   double soft_cost_mm = 1.0;    // base cost of crossing another net's routed copper (before history)
   std::uint64_t seed = 1;
   int order = 0;                // connection order: 0 shortest first, 1 longest first, 2 shortest first with seeded jitter
   // Connections to route first ("REF.NUM" pairs, either orientation): learned from earlier failures (doc 06 T3).
   std::vector<std::pair<std::string, std::string>> priority;
+  std::vector<std::string> first_nets;  // routed first, also after restarts; other nets do not rip them (crystal lines)
+  // Buses (doc 05 §38): groups of nets routed lane by lane. The connections of a group between two components are
+  // routed one after the other in the order of their pins, each steered along the neighbour routed before it, on
+  // the same layers; nets outside the groups do not rip them. `skew` > 0: meanders in the clean-up bring the
+  // members' lengths (tracks and via height, as KiCad's skew check) within it. Empty = off.
+  struct Bus {
+    std::string name;
+    std::vector<model::NetId> nets;  // in bus order
+    Coord skew = 0;
+  };
+  std::vector<Bus> buses;
+  bool bus_first = false;  // the groups' connections before all others (after first_nets), also after restarts
+  // Path guidance (doc 16 F1): a preferred path for a connection, found by matching its two pad centres. Cells off
+  // the guide cost `guide_pen` pitches per lattice step in every search of that connection (a preference, never a
+  // block), so a guide that does not pass the exact checks only costs search effort. `--guide FILE` fills it
+  // from JSON (experiments); the breakout planner fills it itself.
+  struct GuidePath {
+    geom::Point a{}, b{};                       // pad centres of the two ends
+    std::vector<std::array<geom::Point, 2>> segs;  // track segments
+    std::vector<int> seg_layer;                 // copper layer index of each segment
+    std::vector<geom::Point> vias;              // through vias (all layers)
+  };
+  std::vector<GuidePath> guides;
+  double guide_pen = 0.1;       // pitches per lattice step off the guide
+  double guide_radius = 1.5;    // pitches around the guide that count as on it
   std::string only_net;         // debugging: route only this net
   std::vector<std::string> skip_nets;  // experiments: leave these nets unrouted (e.g. nets a designer would pour)
+  // Layer limits (doc 05 §29; route/layer_limits.hpp turns layer names into these). Layers in no_track_layers get
+  // no new tracks: vias still pass through them and still connect into zone fills there, and pads that exist only
+  // on such layers stay unrouted. layer_cost_pm[l] is the cost of a track on copper layer l per mille of its
+  // length (1000 = normal, never less; missing entries are 1000).
+  model::LayerMask no_track_layers = 0;
+  std::vector<std::int32_t> layer_cost_pm;
   events::Sink* sink = nullptr;
   // Shared by portfolio variants (wall-clock mode only): when one variant has routed everything at time T, the
   // others may continue until 2T + 5 s; a variant that is complete always finishes its clean-up.
@@ -119,19 +170,47 @@ struct Connection {
   Coord length = 0;             // straight-line distance
 };
 
+// Work profile (doc 10 §2, D88): how many of each costly operation a run did, per phase. The counts depend only on
+// the board, the options and the work budget, so the same job gives the same profile on any machine and at any
+// thread count. The --work budget charges expansions and flood cells; the other counts are what it does not charge.
+struct WorkCounts {
+  long expansions = 0;     // A* states expanded (strict, negotiated and coupled-pair searches)
+  long flood_cells = 0;    // cells visited by the reachability pre-check
+  long searches = 0;       // A* searches and pre-checks started
+  long cell_checks = 0;    // lattice points whose legality a search evaluated (per-search cache misses)
+  long fixed_checks = 0;   // fixed-copper legality computations (per-class cache misses, tracks and vias)
+  long field_cells = 0;    // cost-to-go field cells computed (window x layers per field)
+  long fields = 0;
+  long commits = 0;        // found paths checked exactly before committing
+  long rips = 0;           // routed connections ripped up by negotiation
+  WorkCounts& operator+=(const WorkCounts& o);
+};
+enum class WorkPhase { Setup, FirstPass, Negotiation, Cleanup };  // setup: plan, escape reservations, coupled pairs
+inline constexpr int kWorkPhases = 4;
+const char* work_phase_name(WorkPhase p);
+struct WorkProfile {
+  std::array<WorkCounts, kWorkPhases> phase{};
+  WorkCounts total() const;
+};
+
 struct RouteResult {
   std::vector<model::Track> tracks;  // new copper, in commit order
   std::vector<model::Via> vias;
   int connections = 0, routed = 0;
   long expansions = 0;
+  long pair_work = 0;           // the part of `expansions` spent in coupled pair searches (closed states and leg checks)
   int rips = 0, passes = 0;
   int enclosed = 0;             // searches that proved the source boxed in (no larger window tried)
   long nogood_skips = 0;        // attempts skipped because an identical attempt already failed
   int necked = 0;               // connections routed at the neck-down width
   int restarts = 0;
+  int lns_fixed = 0;            // open connections closed by the regional rebuild (doc 16 F4)
   int optimized = 0;
   int pairs = 0;
   int length_tuned = 0;
+  // Buses: connections routed as a lane of their group (leaders and the members that followed one), and connections
+  // of a group routed otherwise ("left the bus"), in the state returned.
+  int bus_lanes = 0, bus_left = 0;
   int micro_vias = 0;           // micro vias placed
   int blind_vias = 0;           // blind/buried vias placed
   int escape_corridors = 0;     // escape corridors reserved (M9)          // nets brought into their custom length range by meanders                // differential pairs routed coupled            // connections improved by the clean-up pass
@@ -142,6 +221,7 @@ struct RouteResult {
   std::vector<CutLine> over_cuts;
   CutLine tightest_cut;
   double seconds = 0;
+  WorkProfile work;
   Coord pitch = 0;
   std::vector<std::string> failures;  // one line per unrouted connection
   struct Unrouted {
@@ -162,6 +242,8 @@ struct PortfolioResult {
   std::vector<int> indices;            // portfolio variant index per position
   std::vector<std::string> variants;   // description per variant
   std::vector<int> routed;             // routed count per variant
+  std::vector<double> seconds;         // wall time per variant (its own clock)
+  std::vector<WorkProfile> work;       // work profile per variant
 };
 // `variants`: how many variants to run (the first `variants` of the portfolio); `pick`: which variant indices to
 // run instead (non-empty: overrides `variants`). `threads`: concurrency only (0 = one thread per variant).
