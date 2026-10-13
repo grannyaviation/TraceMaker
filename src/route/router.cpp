@@ -97,6 +97,9 @@ struct Router::Impl {
   // unrouted connection pays to cross (history units), cleared once that connection is done.
   std::unordered_map<std::int64_t, std::uint16_t> avoid;
   std::vector<int> init_root;        // copper item -> initial cluster root (fixed copper)
+  // Initial cluster root -> its fixed tracks, arcs and vias (hand-routed or generated fan-outs): a connection may
+  // start or end anywhere on them (add_copper_cells), not only on its pads.
+  std::unordered_map<int, std::vector<int>> root_copper;
   // With soft zones: routed copper item -> initial clusters of the same-net plane fills it touches, so a via that
   // passes through several planes of its net joins all of them (`joined`). Teardrops are no planes.
   std::vector<std::vector<int>> plane_contacts;
@@ -577,6 +580,7 @@ struct Router::Impl {
     std::vector<Point> stub;                           // per cell: off-lattice escape point (or the pad centre)
     std::vector<std::int64_t> cost;                    // per cell: cost from the pad centre
     std::size_t in_pad_from = SIZE_MAX;                // cells from here on are via-in-pad endpoints (add_in_pad)
+    std::size_t on_copper = 0;                         // cells on the cluster's existing tracks and vias
   };
   // Off-lattice escapes: straight exits from the pad centre in 8 directions, exactly checked, joining the
   // lattice at the first legal point (fine-pitch pins are often unreachable from lattice points alone).
@@ -880,10 +884,40 @@ struct Router::Impl {
     }
     const std::size_t n_own = e.cells.size();
     if (!any_free || force_escapes) add_escapes(w, pad, e);
+    add_copper_cells(w, pad, e);
     // Round pads (BGA/WLP balls) are offered a via in pad at a high cost: an inner ball can look free locally (a
     // diagonal gap) yet have no way out of the array.
     if (opt.via_in_pad && ((!any_free && e.cells.size() == n_own) || (p.shape == model::PadShape::Circle && inner_ball(pad)))) add_in_pad(w, pad, e);
     return e;
+  }
+
+  // Cells on the fixed tracks, arcs and vias of the pad's cluster, on their layers: the search may start or end
+  // there at no cost and without a leg to the pad (commit() starts at such a cell: its stub is the cell itself).
+  // ponytail: rasterises each item's box in the window per search; an index if clusters of thousands of
+  // hand-routed segments make that slow.
+  void add_copper_cells(const Window& w, int pad, Endpoint& e) {
+    const int item = pad_item[static_cast<std::size_t>(pad)];
+    if (root_copper.empty() || item < 0) return;
+    const auto found = root_copper.find(init_root[static_cast<std::size_t>(item)]);
+    if (found == root_copper.end()) return;
+    for (const int id : found->second) {
+      const auto& it = obs->copper().items[static_cast<std::size_t>(id)];
+      const int x0 = std::max(0, to_ix(it.box.x0) - w.x0), x1 = std::min(w.w - 1, to_ix(it.box.x1) - w.x0);
+      const int y0 = std::max(0, to_iy(it.box.y0) - w.y0), y1 = std::min(w.h - 1, to_iy(it.box.y1) - w.y0);
+      for (int l = 0; l < nl; ++l) {
+        if (!(it.layers & model::layer_bit(l)) || !layer_ok(it.net, l)) continue;
+        for (int cy = y0; cy <= y1; ++cy)
+          for (int cx = x0; cx <= x1; ++cx) {
+            const Point C = at(w.x0 + cx, w.y0 + cy);
+            const geom::Shape pt = geom::Shape::point(C, 0);
+            if (std::none_of(it.shapes.begin(), it.shapes.end(), [&](const geom::Shape& s) { return geom::closer_than(pt, s, 1); })) continue;
+            e.cells.emplace_back(l, static_cast<std::int64_t>(cy) * w.w + cx);
+            e.stub.push_back(C);
+            e.cost.push_back(0);
+            ++e.on_copper;
+          }
+      }
+    }
   }
 
   // Via in pad (--via-in-pad): the minimum via the rules allow, centred in a single-layer pad -- an inner ball of an
@@ -1110,6 +1144,12 @@ struct Router::Impl {
     };
     const Point tp = c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(c.pad_b)].pos : b.pads[static_cast<std::size_t>(c.pad_a)].pos;
     const bool zone_target = c.zone_b >= 0;
+    // Targets on existing copper may lie far from the pad: the octile bound then measures to their box.
+    geom::Box tbox;
+    if (dst.on_copper > 0) {
+      tbox.add(tp);
+      for (const auto& [l, ci] : dst.cells) tbox.add(at(w.x0 + static_cast<int>(ci % w.w), w.y0 + static_cast<int>(ci / w.w)));
+    }
     // Reachability pre-check (doc 05 §13): a flood fill over the same legality tests as the A* below, but with no
     // bend states, turn limits or costs, so it admits every path the A* could find. "Unreachable" is therefore
     // exact, found with one visit per lattice point instead of up to nine heap-ordered expansions, and the cell
@@ -1202,7 +1242,8 @@ struct Router::Impl {
       }
       const Point p = at(gx, gy);
       if (zone_target) return std::int64_t{0};  // plane anywhere nearby: no useful lower bound
-      const std::int64_t dx = std::llabs(p.x - tp.x), dy = std::llabs(p.y - tp.y);
+      const std::int64_t dx = tbox.empty() ? std::llabs(p.x - tp.x) : std::max<std::int64_t>({0, tbox.x0 - p.x, p.x - tbox.x1});
+      const std::int64_t dy = tbox.empty() ? std::llabs(p.y - tp.y) : std::max<std::int64_t>({0, tbox.y0 - p.y, p.y - tbox.y1});
       const std::int64_t mn = std::min(dx, dy), mx = std::max(dx, dy);
       return static_cast<std::int64_t>(static_cast<double>((mx - mn) + mn * diag / step) * opt.heuristic_weight);  // octile distance
     };
@@ -1383,8 +1424,13 @@ struct Router::Impl {
     std::vector<Seg> segs;
     std::vector<Point> vias;
     std::vector<std::pair<int, int>> via_span;  // layers joined by each via
-    const Point pa = b.pads[static_cast<std::size_t>(c.pad_a)].pos;
-    const Point pb = c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(c.pad_b)].pos : at(path.back().gx, path.back().gy);
+    // An end on the cluster's existing copper (its stub is the lattice point itself) needs no leg to the pad.
+    auto on_copper = [&](const std::unordered_map<std::int64_t, Point>& stubs, const PathNode& n) {
+      const auto it = stubs.find(cell_key(n.layer, n.gx, n.gy));
+      return it != stubs.end() && it->second == at(n.gx, n.gy);
+    };
+    const Point pa = on_copper(start_stub, path.front()) ? at(path.front().gx, path.front().gy) : b.pads[static_cast<std::size_t>(c.pad_a)].pos;
+    const Point pb = c.pad_b < 0 || on_copper(target_stub, path.back()) ? at(path.back().gx, path.back().gy) : b.pads[static_cast<std::size_t>(c.pad_b)].pos;
     // Corner points: pad centre, direction changes and layer changes, pad centre.
     Point cur = pa;
     int layer = path.front().layer;
@@ -4231,6 +4277,13 @@ struct Router::Impl {
     auto con = drc::compute_connectivity(b, obs->copper(), obs->grid());
     if (tdbg) std::fprintf(stderr, "[%.2f s] connectivity done\n", elapsed());
     init_root = con.root;
+    root_copper.clear();
+    for (std::size_t i = 0; i < con.root.size(); ++i) {
+      const auto& it = obs->copper().items[i];
+      if (it.net != 0 && it.owner < 0 && !it.removed &&
+          (it.kind == drc::ItemKind::Track || it.kind == drc::ItemKind::Arc || it.kind == drc::ItemKind::Via))
+        root_copper[con.root[i]].push_back(static_cast<int>(i));
+    }
     drc::UnionFind uf(obs->copper().items.size());
     for (std::size_t i = 0; i < con.root.size(); ++i) uf.unite(static_cast<int>(i), con.root[i]);
     const auto conns = plan(uf);
