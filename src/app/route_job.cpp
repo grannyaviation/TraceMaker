@@ -115,6 +115,10 @@ RouteJobResult run_route_job(RouteJob job) {
     log(fmt("reroute: %d unlocked tracks and vias removed", removed));
   }
   auto rules = io::read_design_rules(job.in);  // component rules may add net classes (in memory only)
+  if (job.class_clearance_cap > 0)
+    for (auto& c : rules.classes) c.clearance = std::min(c.clearance, job.class_clearance_cap);
+  if (job.class_via_cap > 0)
+    for (auto& c : rules.classes) c.via_diameter = std::min(c.via_diameter, job.class_via_cap);
   const std::string name = std::filesystem::path(job.in).filename().string();
   RouteJobResult out;
   std::unique_ptr<server::ViewerServer> server;

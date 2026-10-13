@@ -462,7 +462,9 @@ int main(int argc, char** argv) {
   route->add_option("--lns-soft", ropt.lns_soft, "Completion LNS: crossing cost factor of its probe searches (default 1)")->group("");
   route->add_option("--lns-cap", ropt.lns_cap, "Completion LNS: connections lifted per transaction at most (default 16)")->group("");
   route->add_option("--lns-u-lifts", ropt.lns_u_lifts, "Completion LNS: times the unrouted connection gives way to one it lifted (default 2)")->group("");
-  double neck_reach_mm = -1;
+  double neck_reach_mm = -1, class_clearance_cap_mm = 0, class_via_cap_mm = 0;
+  route->add_option("--class-via-cap-mm", class_via_cap_mm, "Experiments: lower net-class via diameters above this to it, in memory only")->group("");
+  route->add_option("--class-clearance-cap-mm", class_clearance_cap_mm, "Experiments: lower net-class clearances above this to it, in memory only")->group("");
   route->add_option("--neck-reach-mm", neck_reach_mm, "Neck-down of net classes wider than 0.3 mm only this close to an end pad (default 2; 0 = whole path)")->group("");
   route->add_flag("!--no-optimize", ropt.optimize, "Skip the post-routing clean-up pass (fewer vias, shorter tracks)");
   route->add_flag("--plan-gap,!--no-plan-gap", ropt.plan_gap, "Plan connections by copper-to-copper distance between pads rather than centre to centre (default on)");
@@ -594,6 +596,8 @@ int main(int argc, char** argv) {
       job.kb_path = r_nokb ? std::string() : r_kb;
       job.items_out = r_items;
       job.json_out = r_json;
+      job.class_clearance_cap = static_cast<tmk::Coord>(class_clearance_cap_mm * 1e6);
+      job.class_via_cap = static_cast<tmk::Coord>(class_via_cap_mm * 1e6);
       return cmd_route(std::move(job));
     }
     if (*rt) {

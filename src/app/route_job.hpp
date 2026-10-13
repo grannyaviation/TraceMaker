@@ -35,6 +35,8 @@ struct RouteJob {
   // zones stay; rule 6).
   bool reroute = false;
   std::string rules_override;     // --rules-override: user override file (JSON, doc 15 §6.3); empty = none
+  Coord class_clearance_cap = 0;  // experiments: net-class clearances above this are lowered to it, in memory (0 = off)
+  Coord class_via_cap = 0;        // experiments: net-class via diameters above this are lowered to it, in memory (0 = off)
   // Progress lines (the CLI's stdout text, one line per call, no trailing newline). Empty = silent.
   std::function<void(const std::string&)> log;
 };
