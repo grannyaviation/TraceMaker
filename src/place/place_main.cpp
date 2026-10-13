@@ -275,7 +275,7 @@ void setup_flip(const io::LoadedBoard& lb, bool flip, const std::string& keep_si
 // The router as a placement evaluator: the input document with the placement applied, routed in memory with a
 // deterministic work budget; unrouted connections are mapped back to parts and pad positions.
 place::RouteFn make_route_fn(const std::string& in, const model::DesignRules& rules, const place::Problem& p, long work, int threads,
-                             std::uint64_t seed) {
+                             std::uint64_t seed, const std::vector<std::string>& skip_nets) {
   return [=, &rules, &p](const place::Placement& pl) {
     place::RouteEval e;
     io::LoadedBoard lb = io::read_board_file(in);
@@ -284,6 +284,7 @@ place::RouteFn make_route_fn(const std::string& in, const model::DesignRules& ru
     route::RouterOptions ro;
     ro.work_budget = work;
     ro.time_limit_s = 600;  // safety net only; the work budget decides
+    ro.skip_nets = skip_nets;
     ro.optimize = false;    // clean-up never changes the routed count, which is all the check reads
     const auto res = route::route_portfolio(b, rules, ro, threads).best;
     e.ok = true;
@@ -343,6 +344,7 @@ struct LoopCli {
   std::string keep_side;   // --keep-side (D48)
   std::string low;         // --low
   std::string groups;      // --groups
+  std::vector<std::string> skip_nets;  // --skip-net
 };
 
 // --component-rules (doc 15 §3.5, P1): detect component categories and add their proximity rules as objective-only
@@ -408,7 +410,7 @@ int run_loop_mode(const LoopCli& c) {
     std::printf("  %s\n", s.c_str());
     std::fflush(stdout);
   };
-  const place::RouteFn route = make_route_fn(c.in, rules, P, c.work, c.route_threads, c.o.seed);
+  const place::RouteFn route = make_route_fn(c.in, rules, P, c.work, c.route_threads, c.o.seed, c.skip_nets);
   auto out_of_time = [&] {
     return c.loop_time_s > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > c.loop_time_s;
   };
@@ -520,7 +522,7 @@ int run_loop_mode(const LoopCli& c) {
   // winner and the input again with a larger budget; the winner replaces the input only if it is not worse there.
   nlohmann::json verify = nullptr;
   if (const long fw = c.final_work < 0 ? 4 * c.work : c.final_work; fw > 0 && !c.scratch && !(best.pl.pos == input.pos && best.pl.rot == input.rot)) {
-    const place::RouteFn route_full = make_route_fn(c.in, rules, P, fw, c.route_threads, c.o.seed);
+    const place::RouteFn route_full = make_route_fn(c.in, rules, P, fw, c.route_threads, c.o.seed, c.skip_nets);
     if (!c.record.empty()) rec.phase("verification: input and winner routed with a 4x budget");
     const place::RouteEval vi = route_full(input), vb = route_full(best.pl);
     routes += 2;
@@ -646,6 +648,8 @@ int main(int argc, char** argv) {
                  "Route the input and the new placement with this work budget (A* expansions per variant) and keep the "
                  "placement that routes more connections (0 = off)");
   app.add_option("--route-threads", route_threads, "Router portfolio size for --route-check");
+  std::vector<std::string> skip_nets;
+  app.add_option("--skip-net", skip_nets, "Nets the --route-check router leaves out (poured or hand-routed nets; repeatable)");
   app.add_flag("--no-fallback", no_fallback, "Full mode: keep the result even if some parts could not be placed");
   app.add_option("--debug-part", debug_part, "Print the legality map of one part and exit");
   LoopCli lc;
@@ -723,6 +727,7 @@ int main(int argc, char** argv) {
     lc.crules_two_stage = crules_two_stage;
     lc.clearance_mm = clearance_mm;
     lc.work = route_check > 0 ? route_check : 3'000'000;
+    lc.skip_nets = skip_nets;
     lc.route_threads = route_threads;
     lc.no_fallback = no_fallback;
     lc.keep_side = keep_side;
@@ -741,6 +746,10 @@ int main(int argc, char** argv) {
   if (o.mode == "auto") {
     if (route_check <= 0) {
       std::fprintf(stderr, "error: --mode auto needs --route-check\n");
+      return 1;
+    }
+    if (!skip_nets.empty()) {
+      std::fprintf(stderr, "error: --skip-net is not passed on by --mode auto\n");
       return 1;
     }
     struct Cand { std::string mode, path, json; int unrouted = 1 << 30; double hpwl = 0; int moved = 0; };
@@ -861,6 +870,7 @@ int main(int argc, char** argv) {
       route::RouterOptions ro;
       ro.work_budget = route_check;
       ro.time_limit_s = 600;  // safety net only; the work budget decides
+      ro.skip_nets = skip_nets;
       auto routed_of = [&](const std::string& path) {
         const auto b = io::read_board_file(path).board;
         const auto rr = io::read_design_rules(path);
