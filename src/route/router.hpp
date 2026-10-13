@@ -94,6 +94,8 @@ struct RouterOptions {
   bool lns_complete = false;    // after the strict pass: region rip-up and re-route per unrouted connection, no negotiation
   double lns_soft = 1.0;        // completion LNS: crossing cost factor of the probe searches (higher: fewer connections lifted)
   int lns_cap = 16;             // completion LNS: connections lifted per transaction at most
+  int lns_u_lifts = 2;          // completion LNS: times the unrouted connection gives way to one it lifted
+  Coord neck_reach = 2'000'000;  // neck-down of net classes wider than 0.3 mm: only this close to an end pad (0 = whole path)
   double soft_cost_mm = 1.0;    // base cost of crossing another net's routed copper (before history)
   std::uint64_t seed = 1;
   int order = 0;                // connection order: 0 shortest first, 1 longest first, 2 shortest first with seeded jitter

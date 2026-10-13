@@ -14,6 +14,7 @@
 #include "route/escape.hpp"
 #include "route/escape_flow.hpp"
 #include "route/obstacles.hpp"
+#include "route/router.hpp"
 
 using namespace tmk;
 using geom::Point;
@@ -446,4 +447,43 @@ TEST_CASE("custom rules without net names: the class cache decides like the per-
     }
   CHECK(blocked > 0);  // the grid meets the pad's clearance and the N1 track's
   CHECK(own > 0);
+}
+
+TEST_CASE("neck-down of a wide net class stays next to the fine-pitch pad", "[route]") {
+  constexpr Coord MM = 1'000'000;
+  // P (class PWR, 1.0 mm) leaves pin 3 of a 0.5 mm pitch row between other nets' pins and ends on a 1 mm pad.
+  std::string pads;
+  for (int i = 1; i <= 5; ++i)
+    pads += "(pad \"" + std::to_string(i) + "\" smd rect (at " + std::to_string(-1.5 + 0.5 * i) + " 0) (size 0.25 0.8) (layers \"F.Cu\") (net " +
+            (i == 3 ? "1 \"P\"" : std::to_string(i + 1) + " \"S" + std::to_string(i) + "\"") + ")) ";
+  auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) "
+      "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (net 1 \"P\") (net 2 \"S1\") (net 3 \"S2\") (net 5 \"S4\") (net 6 \"S5\") "
+      "(gr_rect (start 0 0) (end 20 10) (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid)) (fill no)) "
+      "(footprint \"t:U\" (layer \"F.Cu\") (transform (translate 5 5) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"U1\" (at 0 0 0) (layer \"F.SilkS\")) " + pads + ") "
+      "(footprint \"t:R\" (layer \"F.Cu\") (transform (translate 15 5) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"R1\" (at 0 0 0) (layer \"F.SilkS\")) "
+      "(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net 1 \"P\"))))"));
+  auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  model::NetClass pwr = rules.default_class();
+  pwr.name = "PWR";
+  pwr.track_width = 1 * MM;
+  rules.classes.push_back(pwr);
+  rules.assignments["P"] = {"PWR"};
+  route::RouterOptions o;
+  o.time_limit_s = 20;
+  const auto r = route::route_portfolio(b, rules, o, 1).best;
+  REQUIRE(r.routed == r.connections);
+  const Point u{5 * MM, 5 * MM}, e{15 * MM, 5 * MM};
+  const auto d = [](Point p, Point q) { return std::hypot(static_cast<double>(p.x - q.x), static_cast<double>(p.y - q.y)); };
+  bool wide = false;
+  for (const auto& t : r.tracks) {
+    const Point m{(t.a.x + t.b.x) / 2, (t.a.y + t.b.y) / 2};
+    if (t.width < 1 * MM) CHECK(std::min(d(m, u), d(m, e)) <= 2.0 * MM);  // narrow only within the neck reach
+    if (d(m, u) <= 2.0 * MM) CHECK(t.width >= 250'000);                    // at least the pin's width there
+    wide = wide || t.width == 1 * MM;
+  }
+  CHECK(wide);
+  CHECK(r.necked == 1);
 }

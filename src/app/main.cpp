@@ -461,6 +461,9 @@ int main(int argc, char** argv) {
   route->add_flag("--lns-complete", ropt.lns_complete, "After the strict pass, complete by region rip-up and re-route (kept only when nothing is lost) instead of negotiation")->group("");
   route->add_option("--lns-soft", ropt.lns_soft, "Completion LNS: crossing cost factor of its probe searches (default 1)")->group("");
   route->add_option("--lns-cap", ropt.lns_cap, "Completion LNS: connections lifted per transaction at most (default 16)")->group("");
+  route->add_option("--lns-u-lifts", ropt.lns_u_lifts, "Completion LNS: times the unrouted connection gives way to one it lifted (default 2)")->group("");
+  double neck_reach_mm = -1;
+  route->add_option("--neck-reach-mm", neck_reach_mm, "Neck-down of net classes wider than 0.3 mm only this close to an end pad (default 2; 0 = whole path)")->group("");
   route->add_flag("!--no-optimize", ropt.optimize, "Skip the post-routing clean-up pass (fewer vias, shorter tracks)");
   route->add_flag("--plan-gap,!--no-plan-gap", ropt.plan_gap, "Plan connections by copper-to-copper distance between pads rather than centre to centre (default on)");
   route->add_flag("--global-congestion", ropt.global_congestion, "Global plan as a congestion map: through traffic pays in tiles the plan fills (experimental)")->group("");
@@ -579,6 +582,7 @@ int main(int argc, char** argv) {
     if (*route) {
       ropt.pitch = static_cast<tmk::Coord>(r_pitch_um * 1000.0);
       ropt.pair_skew = static_cast<tmk::Coord>(r_pair_skew_mm * 1e6);
+      if (neck_reach_mm >= 0) ropt.neck_reach = static_cast<tmk::Coord>(neck_reach_mm * 1e6);
       ropt.gpu_device = tmk::app::default_gpu_device(!r_nogpu);
       auto job = std::move(r_job);
       job.in = r_in;

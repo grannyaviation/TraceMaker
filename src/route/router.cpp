@@ -71,7 +71,7 @@ struct Router::Impl {
   // (net and width, layer-cell key) blocked by FIXED copper after exact-check failures (routed copper changes,
   // so conflicts with it are not learned permanently).
   std::set<std::pair<std::int64_t, std::int64_t>> learned_block;
-  std::int64_t block_owner(NetId net) const { return static_cast<std::int64_t>(net) * 10'000'000 + track_width(net) / 1000; }
+  std::int64_t block_owner(NetId net, Coord width = -1) const { return static_cast<std::int64_t>(net) * 10'000'000 + (width < 0 ? track_width(net) : width) / 1000; }
 
   // ---- negotiation state ----
   struct ConnState {
@@ -88,6 +88,9 @@ struct Router::Impl {
   };
   std::vector<ConnState> cs;
   std::unordered_map<std::int64_t, std::uint16_t> history;  // contested lattice cells (PathFinder history cost)
+  // Completion LNS swap conflicts: cells of a lifted connection's old copper that the next probe of the same
+  // unrouted connection pays to cross (history units), cleared once that connection is done.
+  std::unordered_map<std::int64_t, std::uint16_t> avoid;
   std::vector<int> init_root;        // copper item -> initial cluster root (fixed copper)
   bool soft = false;                 // current search may cross routed copper
   // Persistent fixed-obstacle caches per net class (codes from Obstacles::fixed_code), lattice-indexed.
@@ -162,6 +165,11 @@ struct Router::Impl {
   Coord via_drill(NetId net) const { return via_override ? neck_via_drill(net) : class_via_drill(net); }
   Coord via_diameter(NetId net) const { return via_override ? neck_via_diameter(net) : class_via_diameter(net); }
   Coord width_override = 0;   // > 0: neck-down width for the current attempt (escalation rung)
+  // Local neck-down (the rung for wide net classes): within neck_reach of an end pad a track may be as narrow as
+  // that pad (neck_wa, neck_wb); elsewhere it keeps the net-class width, so a power net only narrows where it
+  // enters a fine-pitch pin. 0 = off.
+  Coord neck_reach = 0, neck_wa = 0, neck_wb = 0;
+  Point neck_pa, neck_pb;
   bool force_escapes = false; // escalation rung: off-lattice escapes even when the pad has lattice exits
   Coord class_width(NetId net) const { return std::max(netclass(net).track_width, rules.minimums.track_width); }
   Coord track_width(NetId net) const { return width_override > 0 ? width_override : class_width(net); }
@@ -171,6 +179,41 @@ struct Router::Impl {
     const Coord mn = rules.minimums.track_width;
     const Coord w = mn > 0 ? std::max(mn, std::min<Coord>(class_width(net), 150'000)) : std::min<Coord>(class_width(net), 150'000);
     return w < class_width(net) ? w : 0;
+  }
+
+  Coord width_at(NetId net, Point p) const {
+    if (neck_reach <= 0) return track_width(net);
+    const auto near = [&](Point q) {
+      const double dx = static_cast<double>(p.x - q.x), dy = static_cast<double>(p.y - q.y), r = static_cast<double>(neck_reach);
+      return dx * dx + dy * dy <= r * r;
+    };
+    if (near(neck_pa)) return neck_wa;
+    if (near(neck_pb)) return neck_wb;
+    return class_width(net);
+  }
+  Coord pad_neck(NetId net, int pad) const {
+    const auto& p = b.pads[static_cast<std::size_t>(pad)];
+    return std::clamp(std::min(p.size_x, p.size_y), neck_width(net), class_width(net));
+  }
+  // The neck-down rung on and off. Net classes wider than 0.3 mm (power) neck locally at pad width, with
+  // class-size vias; narrower ones along the whole path to the neck width, with the neck via.
+  void neck_on(const Connection& c) {
+    if (opt.neck_reach > 0 && class_width(c.net) > 300'000) {
+      neck_reach = opt.neck_reach;
+      neck_pa = b.pads[static_cast<std::size_t>(c.pad_a)].pos;
+      neck_wa = pad_neck(c.net, c.pad_a);
+      neck_pb = c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(c.pad_b)].pos : neck_pa;
+      neck_wb = c.pad_b >= 0 ? pad_neck(c.net, c.pad_b) : neck_wa;
+      width_override = std::min(neck_wa, neck_wb);  // pad escapes and stubs
+      return;
+    }
+    width_override = neck_width(c.net);
+    via_override = true;
+  }
+  void neck_off() {
+    width_override = 0;
+    via_override = false;
+    neck_reach = 0;
   }
 
   // Lattice <-> board coordinates.
@@ -450,12 +493,15 @@ struct Router::Impl {
     return (static_cast<std::int64_t>(layer) << 48) | (static_cast<std::int64_t>(gy) << 24) | gx;
   }
   std::int64_t hist_cost(int layer, int gx, int gy) const {
-    if (history.empty()) return 0;
-    const auto it = history.find(cell_key(layer, gx, gy));
-    return it == history.end() ? 0 : static_cast<std::int64_t>(it->second) * pitch * 2;
+    if (history.empty() && avoid.empty()) return 0;
+    const std::int64_t key = cell_key(layer, gx, gy);
+    std::int64_t h = 0;
+    if (const auto it = history.find(key); it != history.end()) h += it->second;
+    if (const auto it = avoid.find(key); it != avoid.end()) h += it->second;
+    return h * pitch * 2;
   }
-  ClassCache& cache_for(NetId net) {
-    auto& cc = caches[{&netclass(net), track_width(net) * 2 + (via_override ? 1 : 0)}];  // via codes depend on the via size
+  ClassCache& cache_for(NetId net, Coord width = -1) {  // width < 0: the current track width
+    auto& cc = caches[{&netclass(net), (width < 0 ? track_width(net) : width) * 2 + (via_override ? 1 : 0)}];  // via codes depend on the via size
     if (cc.margin.empty()) {
       const std::size_t n = static_cast<std::size_t>(nl) * static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny);
       cc.margin.assign(n, INT32_MIN);
@@ -471,7 +517,7 @@ struct Router::Impl {
   bool fixed_point_blocked(int layer, int gx, int gy, NetId net, Coord hw) {
     const Point p = at(gx, gy);
     if (!use_cache) return obs->disk_state(p, layer, hw, net, 0, true) == 2;
-    auto& cc = cache_for(net);
+    auto& cc = cache_for(net, 2 * hw);
     const std::size_t gi = (static_cast<std::size_t>(layer) * static_cast<std::size_t>(ny) + static_cast<std::size_t>(gy)) * static_cast<std::size_t>(nx) + static_cast<std::size_t>(gx);
     if (cc.tight[gi] == INT32_MIN) cc.tight[gi] = obs->fixed_code(p, layer, hw, 0, cc.rep);
     return !code_ok(cc.tight[gi], net);
@@ -487,7 +533,7 @@ struct Router::Impl {
       if (st == 2 && obs->disk_state(p, layer, hw, net, 0, soft) != 2) st = 3;
       return st;
     }
-    auto& cc = cache_for(net);
+    auto& cc = cache_for(net, 2 * hw);
     const std::size_t gi = (static_cast<std::size_t>(layer) * static_cast<std::size_t>(ny) + static_cast<std::size_t>(gy)) * static_cast<std::size_t>(nx) + static_cast<std::size_t>(gx);
     if (cc.margin[gi] == INT32_MIN) cc.margin[gi] = obs->fixed_code(p, layer, hw, margin, cc.rep);
     int st = 0;
@@ -510,7 +556,7 @@ struct Router::Impl {
       cstamp[idx] = gen;
       const std::int64_t key = cell_key(layer, gx, gy);
       ++obs->checks;
-      cell_state[idx] = static_cast<std::uint8_t>(learned_block.count({block_owner(net), key}) ? 2 : point_state(layer, gx, gy, net, hw));
+      cell_state[idx] = static_cast<std::uint8_t>(learned_block.count({block_owner(net, 2 * hw), key}) ? 2 : point_state(layer, gx, gy, net, hw));
     }
     const int st = cell_state[idx];
     if (st == 2) return -1;
@@ -688,6 +734,8 @@ struct Router::Impl {
     const NetId net = c.net;
     const Coord width = track_width(net);
     const Coord hw = width / 2;
+    // Half width at a lattice point: the local neck-down narrows only near the end pads.
+    const auto hw_at = [&](int gx, int gy) { return neck_reach > 0 ? width_at(net, at(gx, gy)) / 2 : hw; };
     const Coord vd = via_diameter(net);
     const Coord vdrill = via_drill(net);
     const std::size_t cells = static_cast<std::size_t>(w.w) * static_cast<std::size_t>(w.h);
@@ -727,13 +775,14 @@ struct Router::Impl {
       if (t == 1) return true;
       if (t == 2 || l != zone_layer) return false;
       const int cx = static_cast<int>(ci % w.w), cy = static_cast<int>(ci / w.w);
-      const geom::Shape pt = geom::Shape::point(at(w.x0 + cx, w.y0 + cy), hw);
+      const Coord zhw = hw_at(w.x0 + cx, w.y0 + cy);
+      const geom::Shape pt = geom::Shape::point(at(w.x0 + cx, w.y0 + cy), zhw);
       // Inside the fill and the whole track end disk on copper: no fill edge within hw.
       bool inside = geom::point_in_polygon(pt.pts[0], *zone_poly);
       if (inside) {
         const auto& poly = *zone_poly;
         for (std::size_t i = 0, j = poly.size() - 1; i < poly.size() && inside; j = i++)
-          if (geom::point_seg_closer(pt.pts[0], poly[j], poly[i], hw + pitch)) inside = false;
+          if (geom::point_seg_closer(pt.pts[0], poly[j], poly[i], zhw + pitch)) inside = false;
       }
       t = inside ? 1 : 2;
       return inside;
@@ -771,7 +820,7 @@ struct Router::Impl {
           if (ncx < 0 || ncy < 0 || ncx >= w.w || ncy >= w.h) continue;
           const std::size_t ni = static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ncy) * static_cast<std::size_t>(w.w) + static_cast<std::size_t>(ncx);
           if (rstamp[ni] == gen) continue;
-          if (is_target[ni] != 1 && cell_cost(w, l, ncx, ncy, net, hw) < 0) continue;
+          if (is_target[ni] != 1 && cell_cost(w, l, ncx, ncy, net, hw_at(w.x0 + ncx, w.y0 + ncy)) < 0) continue;
           rstamp[ni] = gen;
           reach_q.push_back(ni);
         }
@@ -888,7 +937,7 @@ struct Router::Impl {
         const bool tgt = is_target[static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(nci)] == 1;
         std::int64_t extra = 0;
         if (!tgt) {
-          extra = cell_cost(w, l, ncx, ncy, net, hw);
+          extra = cell_cost(w, l, ncx, ncy, net, hw_at(w.x0 + ncx, w.y0 + ncy));
           if (extra < 0) continue;
         }
         std::int64_t cost = ((d & 1) ? diag : step) + extra;
@@ -981,7 +1030,7 @@ struct Router::Impl {
     const Coord width = track_width(net);
     const Coord vd = via_diameter(net);
     const Coord vdrill = via_drill(net);
-    struct Seg { Point a, b; int layer; };
+    struct Seg { Point a, b; int layer; Coord w = 0; };
     std::vector<Seg> segs;
     std::vector<Point> vias;
     std::vector<std::pair<int, int>> via_span;  // layers joined by each via
@@ -1034,29 +1083,55 @@ struct Router::Impl {
       }
       merged.push_back(s);
     }
+    // Widths: the track width, or with the local neck-down the pad's width within neck_reach of an end pad
+    // (segments split where they cross that circle).
+    for (auto& s : merged) s.w = width;
+    if (neck_reach > 0) {
+      std::vector<Seg> split;
+      for (const auto& s : merged) {
+        const double dx = static_cast<double>(s.b.x - s.a.x), dy = static_cast<double>(s.b.y - s.a.y), A = dx * dx + dy * dy;
+        std::vector<double> ts{0.0, 1.0};
+        for (const Point q : {neck_pa, neck_pb}) {
+          if (A == 0) break;
+          const double fx = static_cast<double>(s.a.x - q.x), fy = static_cast<double>(s.a.y - q.y), r = static_cast<double>(neck_reach);
+          const double B = 2 * (fx * dx + fy * dy), C = fx * fx + fy * fy - r * r, disc = B * B - 4 * A * C;
+          if (disc <= 0) continue;
+          for (const double t : {(-B - std::sqrt(disc)) / (2 * A), (-B + std::sqrt(disc)) / (2 * A)})
+            if (t > 1e-9 && t < 1 - 1e-9) ts.push_back(t);
+        }
+        std::sort(ts.begin(), ts.end());
+        const auto at_t = [&](double t) { return Point{s.a.x + static_cast<Coord>(std::llround(dx * t)), s.a.y + static_cast<Coord>(std::llround(dy * t))}; };
+        for (std::size_t k = 0; k + 1 < ts.size(); ++k) {
+          const Point a = k == 0 ? s.a : at_t(ts[k]), e = k + 2 == ts.size() ? s.b : at_t(ts[k + 1]);
+          if (a == e) continue;
+          split.push_back({a, e, s.layer, width_at(net, Point{(a.x + e.x) / 2, (a.y + e.y) / 2})});
+        }
+      }
+      merged.swap(split);
+    }
     // A pad leg (pad centre <-> first/last lattice point) that fails the exact check is dropped when the
     // lattice point already lies on the pad's copper: KiCad connects a track to any pad it overlaps.
     auto on_pad = [&](Point q, int pad, int lay) { return on_pad_copper(q, pad, lay); };
     if (merged.size() >= 2) {
       const auto& f = merged.front();
-      if (f.a == pa && on_pad(f.b, c.pad_a, f.layer) && obs->segment_state(f.a, f.b, f.layer, width, net, true, nullptr) == 2)
+      if (f.a == pa && on_pad(f.b, c.pad_a, f.layer) && obs->segment_state(f.a, f.b, f.layer, f.w, net, true, nullptr) == 2)
         merged.erase(merged.begin());
     }
     if (merged.size() >= 2 && c.pad_b >= 0) {
       const auto& l = merged.back();
-      if (l.b == pb && on_pad(l.a, c.pad_b, l.layer) && obs->segment_state(l.a, l.b, l.layer, width, net, true, nullptr) == 2) merged.pop_back();
+      if (l.b == pb && on_pad(l.a, c.pad_b, l.layer) && obs->segment_state(l.a, l.b, l.layer, l.w, net, true, nullptr) == 2) merged.pop_back();
     }
     // Exact verification. In soft mode, conflicts with other connections' routed copper name the victims.
     bool ok = true;
     std::vector<int> victims;
     for (const auto& s : merged) {
-      const int st = obs->segment_state(s.a, s.b, s.layer, width, net, soft, &victims);
+      const int st = obs->segment_state(s.a, s.b, s.layer, s.w, net, soft, &victims);
       if (st == 2) {
         ok = false;
         if (std::getenv("TM_DEBUG_EXACT"))
           std::fprintf(stderr, "EXACT %s conn %d soft %d: (%.4f,%.4f)-(%.4f,%.4f) L%d w %.3f\n", b.nets[static_cast<std::size_t>(net)].name.c_str(), current,
-                       soft ? 1 : 0, nm_to_mm(s.a.x), nm_to_mm(s.a.y), nm_to_mm(s.b.x), nm_to_mm(s.b.y), s.layer, nm_to_mm(width));
-        learn_block(c, s, width);
+                       soft ? 1 : 0, nm_to_mm(s.a.x), nm_to_mm(s.a.y), nm_to_mm(s.b.x), nm_to_mm(s.b.y), s.layer, nm_to_mm(s.w));
+        learn_block(c, s, s.w);
       }
     }
     // Each via is a through via where that is legal, else (boards that allow them) a blind/buried via over its span.
@@ -1106,7 +1181,7 @@ struct Router::Impl {
     // Commit.
     auto& st = cs[static_cast<std::size_t>(current)];
     for (const auto& s : merged) {
-      model::Track t{s.a, s.b, width, s.layer, net, false, sexpr::kNoNode};
+      model::Track t{s.a, s.b, s.w, s.layer, net, false, sexpr::kNoNode};
       b.tracks.push_back(t);
       const int id = static_cast<int>(b.tracks.size() - 1);
       st.items.push_back(obs->add_track(id, current));
@@ -1156,7 +1231,7 @@ struct Router::Impl {
       // can be blocked.
       if ((qb.intersects(ia) && on_pad_copper(q, c.pad_a, s.layer)) || (c.pad_b >= 0 && qb.intersects(ib) && on_pad_copper(q, c.pad_b, s.layer))) continue;
       if (obs->disk_state(q, s.layer, width / 2, c.net, 0, /*ignore_routed=*/true) == 2) {
-        learned_block.insert({block_owner(c.net), cell_key(s.layer, to_ix(q.x), to_iy(q.y))});
+        learned_block.insert({block_owner(c.net, width), cell_key(s.layer, to_ix(q.x), to_iy(q.y))});
         ++learned;
       }
     }
@@ -1167,7 +1242,7 @@ struct Router::Impl {
         const Point q{s.a.x + (s.b.x - s.a.x) * k / n, s.a.y + (s.b.y - s.a.y) * k / n};
         if (on_pad_copper(q, c.pad_a, s.layer) || (c.pad_b >= 0 && on_pad_copper(q, c.pad_b, s.layer))) continue;
         if ((k == 0 || k == n) && n > 1) continue;  // interior points suffice for longer steps
-        learned_block.insert({block_owner(c.net), cell_key(s.layer, to_ix(q.x), to_iy(q.y))});
+        learned_block.insert({block_owner(c.net, width), cell_key(s.layer, to_ix(q.x), to_iy(q.y))});
       }
     }
   }
@@ -2438,18 +2513,58 @@ struct Router::Impl {
   // other connections' copper), lift the connections it crosses, then route each lifted one strictly, or along its own
   // soft path lifting what that crosses in turn, at most `cap` lifted in all. Kept only when every one is routed;
   // otherwise all copper of the transaction goes and the lifted connections get their old copper back.
-  long chain_ok = 0, chain_nopath = 0, chain_cap = 0, chain_victim = 0;
+  long chain_ok = 0, chain_nopath = 0, chain_cap = 0, chain_victim = 0, chain_swap = 0;
+  std::vector<OldItem> swap_items;  // after a failed chain: old copper of the lifted connection whose way back crossed u
+  // Marks the lattice cells along an old copper item, with their neighbours (a lattice path crossing the track need
+  // not touch its centre line), in `avoid`.
+  void mark_avoid(const OldItem& o) {
+    auto mark = [&](int layer, Point q) {
+      const int gx = to_ix(q.x), gy = to_iy(q.y);
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          auto& h = avoid[cell_key(layer, gx + dx, gy + dy)];
+          if (h < 60000) h = static_cast<std::uint16_t>(h + 16);  // 16 units: ~1.8 mm a cell at 0.055 mm pitch
+        }
+    };
+    if (o.kind == drc::ItemKind::Via) {
+      const auto& v = b.vias[static_cast<std::size_t>(o.index)];
+      for (int l = v.layer_top; l <= v.layer_bottom; ++l) mark(l, v.pos);
+      return;
+    }
+    const auto& t = b.tracks[static_cast<std::size_t>(o.index)];
+    const int n = std::max<int>(1, static_cast<int>(std::hypot(static_cast<double>(t.b.x - t.a.x), static_cast<double>(t.b.y - t.a.y)) / static_cast<double>(pitch)));
+    for (int k = 0; k <= n; ++k) mark(t.layer, {t.a.x + (t.b.x - t.a.x) * k / n, t.a.y + (t.b.y - t.a.y) * k / n});
+  }
+  // search_and_commit, then for a boxed-in pin the neck-down rung as in the passes. `necked` tells whether the
+  // result came from the rung: a probe's path must be committed with the same widths.
+  bool search_or_neck(const Connection& cc, bool soft_mode, bool& necked) {
+    necked = false;
+    bool ok = search_and_commit(cc, soft_mode);
+    if (ok || probe_hit) return ok;
+    if (!(last_miss == Miss::Enclosed || why.starts_with("boxed in") || why.starts_with("exact check"))) return false;
+    if (!(neck_width(cc.net) > 0 || neck_via_diameter(cc.net) < class_via_diameter(cc.net))) return false;
+    force_escapes = true;
+    neck_on(cc);
+    ok = search_and_commit(cc, soft_mode);
+    necked = ok || probe_hit;
+    neck_off();
+    force_escapes = false;
+    return ok;
+  }
   bool lns_chain(int u, std::size_t cap, double probe_soft) {
     std::vector<int> queue{u};
     std::map<int, std::vector<OldItem>> orig;  // lifted connections' copper before the transaction
     bool ok = true;
+    int u_lifts = 0;  // u's own new path lifted for a connection that can only come back across it
+    swap_items.clear();
     for (std::size_t qi = 0; ok && qi < queue.size(); ++qi) {
       const int c = queue[qi];
       const auto& cc = cs[static_cast<std::size_t>(c)].c;
-      if (c != u) {  // the unrouted connection failed strictly already
+      bool necked = false;
+      if (c != u || qi > 0) {  // the unrouted connection failed strictly already (but not after a swap)
         current = c;
         soft = false;
-        if (search_and_commit(cc, false)) continue;
+        if (search_or_neck(cc, false, necked)) continue;
       }
       probing = true;
       probe_hit = false;
@@ -2457,7 +2572,7 @@ struct Router::Impl {
       soft = true;
       strict_pass = false;  // soft searches get their wider windows
       soft_mult = probe_soft;
-      search_and_commit(cc, true);
+      search_or_neck(cc, true, necked);
       soft_mult = 1.0;
       strict_pass = true;
       probing = false;
@@ -2471,10 +2586,24 @@ struct Router::Impl {
       }
       for (int v : probe_victims) {
         // u itself is never lifted: its copper has no state to go back to, and it keeps its priority.
-        if (v == u || cs[static_cast<std::size_t>(v)].coupled || orig.size() >= cap || queue.size() >= 2 * cap) {
+        if (v == u && u_lifts < opt.lns_u_lifts && queue.size() < 2 * cap) {  // a swap: u gives way and is probed again after c
+          ++u_lifts;
+          lift_items(u);
+          queue.push_back(u);
+          continue;
+        }
+        if (v == u) {  // still a swap: the caller retries u around c's old copper
+          ok = false;
+          ++chain_swap;
+          swap_items = orig[c];
+          cs[static_cast<std::size_t>(u)].why = "completion LNS: " + b.nets[static_cast<std::size_t>(cc.net)].name + ", lifted for it, finds its way back only across it";
+          break;
+        }
+        if (cs[static_cast<std::size_t>(v)].coupled || orig.size() >= cap || queue.size() >= 2 * cap) {
           ok = false;
           ++chain_cap;
-          cs[static_cast<std::size_t>(u)].why = "completion LNS: its path would lift more than " + std::to_string(cap) + " connections";
+          cs[static_cast<std::size_t>(u)].why = cs[static_cast<std::size_t>(v)].coupled ? "completion LNS: its path would lift a coupled pair"
+                                                                                         : "completion LNS: its path would lift more than " + std::to_string(cap) + " connections";
           break;
         }
         if (orig.count(v)) lift_items(v);  // routed earlier in this transaction: that copper goes
@@ -2483,7 +2612,10 @@ struct Router::Impl {
       }
       if (!ok) break;
       current = c;
-      if (!commit(probe_conn, probe_path)) {
+      if (necked) neck_on(probe_conn);
+      const bool committed = commit(probe_conn, probe_path);
+      if (necked) neck_off();
+      if (!committed) {
         ok = false;
         ++chain_victim;
         cs[static_cast<std::size_t>(u)].why = "completion LNS: exact check rejected a probe path";
@@ -2523,7 +2655,16 @@ struct Router::Impl {
           continue;
         }
         ++attempts;
-        if (lns_chain(uc, cap, probe_soft)) {
+        // A swap (a lifted connection could only come back across u) is retried with u paying to cross that
+        // connection's old copper, so u's next path leaves it room; up to three tries.
+        bool won = false;
+        for (int t = 0; t < 3 && !out_of_budget(); ++t) {
+          won = lns_chain(uc, cap, probe_soft);
+          if (won || swap_items.empty()) break;
+          for (const auto& o : swap_items) mark_avoid(o);
+        }
+        avoid.clear();
+        if (won) {
           u.routed = true;
           ++res.routed;
           ++gained;
@@ -2584,8 +2725,8 @@ struct Router::Impl {
       }
     }
     probe_wide = false;
-    std::fprintf(stderr, "completion LNS: %d connections gained in %d attempts (chains: %ld kept, %ld no soft path, %ld over cap, %ld lifted one failed; cap %zu)\n",
-                 gained, attempts, chain_ok, chain_nopath, chain_cap, chain_victim, cap);
+    std::fprintf(stderr, "completion LNS: %d connections gained in %d attempts (chains: %ld kept, %ld no soft path, %ld over cap, %ld swaps, %ld lifted one failed; cap %zu)\n",
+                 gained, attempts, chain_ok, chain_nopath, chain_cap, chain_swap, chain_victim, cap);
     int stray = 0;  // invariant: an unrouted connection owns no copper
     for (const auto& st : cs) stray += !st.routed && !st.items.empty();
     if (stray) std::fprintf(stderr, "completion LNS: BUG: %d unrouted connections own copper\n", stray);
@@ -3171,12 +3312,10 @@ struct Router::Impl {
           force_escapes = true;
           ok = search_and_commit(st.c, false);
           if (!ok && (neck_width(st.c.net) > 0 || neck_via_diameter(st.c.net) < class_via_diameter(st.c.net))) {
-            width_override = neck_width(st.c.net);
-            via_override = true;
+            neck_on(st.c);
             ok = search_and_commit(st.c, false);
             if (ok) ++res.necked;
-            width_override = 0;
-            via_override = false;
+            neck_off();
           }
           force_escapes = false;
           if (!ok) reason += "; escapes/neck-down: " + why;
@@ -3187,12 +3326,10 @@ struct Router::Impl {
           if (!ok && why.starts_with("boxed in")) {
             // Last check before giving the pin up: negotiated, with off-lattice escapes and the neck-down width.
             force_escapes = true;
-            if (neck_width(st.c.net) > 0) width_override = neck_width(st.c.net);
-            via_override = true;
+            neck_on(st.c);
             ok = search_and_commit(st.c, true);
             if (ok) ++res.necked;
-            width_override = 0;
-            via_override = false;
+            neck_off();
             force_escapes = false;
             if (!ok && why.starts_with("boxed in")) {
               st.dead = true;
