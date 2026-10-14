@@ -1005,6 +1005,9 @@ struct Router::Impl {
 
   // Cells on the fixed tracks, arcs and vias of the pad's cluster, on their layers: the search may start or end
   // there at no cost and without a leg to the pad (commit() starts at such a cell: its stub is the cell itself).
+  // Not on the pad's own copper: there the cell is the pad's (pad_cells), with its leg from the pad centre. A free
+  // copper cell would win the start over it (cost 0 against the distance to the centre) and the route would leave
+  // the pad from wherever the stub crosses it, off the centre by up to a lattice pitch.
   // ponytail: rasterises each item's box in the window per search; an index if clusters of thousands of
   // hand-routed segments make that slow.
   void add_copper_cells(const Window& w, int pad, Endpoint& e) {
@@ -1012,6 +1015,8 @@ struct Router::Impl {
     if (root_copper.empty() || item < 0) return;
     const auto found = root_copper.find(init_root[static_cast<std::size_t>(item)]);
     if (found == root_copper.end()) return;
+    const auto& pad_it = obs->copper().items[static_cast<std::size_t>(item)];
+    const model::LayerMask pad_layers = b.pads[static_cast<std::size_t>(pad)].copper;
     for (const int id : found->second) {
       const auto& it = obs->copper().items[static_cast<std::size_t>(id)];
       const int x0 = std::max(0, to_ix(it.box.x0) - w.x0), x1 = std::min(w.w - 1, to_ix(it.box.x1) - w.x0);
@@ -1022,7 +1027,9 @@ struct Router::Impl {
           for (int cx = x0; cx <= x1; ++cx) {
             const Point C = at(w.x0 + cx, w.y0 + cy);
             const geom::Shape pt = geom::Shape::point(C, 0);
-            if (std::none_of(it.shapes.begin(), it.shapes.end(), [&](const geom::Shape& s) { return geom::closer_than(pt, s, 1); })) continue;
+            auto on = [&](const geom::Shape& s) { return geom::closer_than(pt, s, 1); };
+            if (std::none_of(it.shapes.begin(), it.shapes.end(), on)) continue;
+            if ((pad_layers & model::layer_bit(l)) && std::any_of(pad_it.shapes.begin(), pad_it.shapes.end(), on)) continue;
             e.cells.emplace_back(l, static_cast<std::int64_t>(cy) * w.w + cx);
             e.stub.push_back(C);
             e.cost.push_back(0);
