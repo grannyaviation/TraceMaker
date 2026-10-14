@@ -7,6 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "analysis/footprint_check.hpp"
+#include "analysis/return_path.hpp"
 #include "route/bus.hpp"
 #include "route/router.hpp"
 
@@ -24,7 +26,32 @@ struct RouteJob {
   std::string items_out;          // --emit-items file; empty = none
   std::string json_out;           // --json summary file; empty = none
   bool view = false;              // stream to the browser viewer
-  std::string view_host = "0.0.0.0";
+  // Reference-return audit of selected nets on the routed board (issue #7, doc 05 §42): off unless a selector is given. Read-only; the
+  // report goes to the log and the summary, and each net's return path to the viewer.
+  analysis::ReturnPathOptions return_paths;
+  // Critical nets (issue #24, doc 05 §44, D117): route critical signals first, give them dearer vias, keep them over solid reference copper. Off
+  // unless asked; `si_rules` turns the three on with the settings below unless they were given.
+  std::vector<std::string> critical_nets;  // KiCad wildcards: nets that are critical whatever their role (tier 1)
+  bool critical_auto = false;              // also the nets the component rules' roles make critical, and differential pairs
+  bool critical_first = false;             // route them before all other nets, tier by tier
+  double critical_via_mult = 1;            // a via costs them this many times as much
+  bool critical_via_given = false;         // set by the command line: with si_rules, a value that was given is kept (else x3)
+  int critical_via_max = 0;                // warn when a critical net has more vias than this (0 = no limit)
+  double split_cost = 0;                   // pitches per lattice step over a void of the reference plane
+  bool split_cost_given = false;           // as critical_via_given (else +4 with si_rules)
+  bool split_hard = false;                 // such cells are closed to critical nets
+  bool si_rules = false;
+  // --footprint-refs (issue #5, doc 05 §43): every footprint is checked against the datasheet land patterns of a reference library before the first track is
+  // routed; a discrepancy is an error and stops the job unless footprint_warn_only.
+  std::string footprint_refs;     // the library: a directory or a JSON file; empty = no check
+  std::string footprint_trusted;  // trusted brand list; empty = trusted_brands.txt beside the references
+  bool footprint_trust_all = false;
+  bool footprint_warn_only = false;
+  analysis::FootprintCheckOptions footprint_opt;
+  bool view_freeze = true;        // the viewer holds the scene on a routing stall (issue #8); --no-freeze says false in the board snapshot
+  std::string view_host;          // "" = $TM_VIEW_HOST, else loopback: a viewer on any other address needs a token (issue #4, D116)
+  std::string view_token;         // the token for a non-loopback viewer (empty = a random one)
+  bool view_insecure = false;     // a non-loopback viewer without a token (--view-insecure)
   int view_port = 8766;
   bool hold = false;              // keep serving the viewer after routing; never returns (CLI only)
   std::string record;             // events file for replay (ignored while viewing)
@@ -39,6 +66,16 @@ struct RouteJob {
   std::string rules_override;     // --rules-override: user override file (JSON, doc 15 §6.3); empty = none
   Coord class_clearance_cap = 0;  // experiments: net-class clearances above this are lowered to it, in memory (0 = off)
   Coord class_via_cap = 0;        // experiments: net-class via diameters above this are lowered to it, in memory (0 = off)
+  // Advice (doc 17, issue #26). The engine never talks to a model: it reads an advice file, and an advisor (any program
+  // that turns a stuck report into an advice file) is consulted only when the deterministic route leaves connections open.
+  std::string advice;             // --advice FILE: typed hints (src/advice/advice.hpp); advised variants run next to the unadvised ones
+  int advice_variants = 0;        // --advice-variants N: advised variants (0 = the file's "variants", else 4)
+  std::string advisor;            // --advisor CMD: a shell command that reads the stuck report on stdin and writes advice on stdout
+  double advisor_timeout_s = 120; // --advisor-timeout S: the advisor's time limit (its wall time is not routing work)
+  int advisor_rounds = 1;         // --advisor-rounds N: consult again with the result of the advised run while connections are left
+  bool advisor_redact = false;    // --advisor-redact: the report names nets and parts by alias (N1, P3); the advice is mapped back
+  std::string advice_out;         // --advice-out FILE: where the advice that was used is saved (default: <out>.advice.json)
+  std::string stuck_report_out;   // --stuck-report FILE: write the stuck report (of the run the advisor saw, else the final one)
   // With soft zones: refill the zones after routing and route what the refill left unconnected (doc 05 §36).
   bool refill_repair = true;
   // --no-tracks-on / --layer-cost (doc 05 §29): copper layer names, and "LAYER=FACTOR" entries. Resolved against

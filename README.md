@@ -76,7 +76,9 @@ cd viewer && npm install && npm run build && cd ..
 build/release/src/app/tracemaker route board.kicad_pcb -o routed.kicad_pcb --view --hold
 ```
 
-Then open `http://localhost:8766/` in a browser.
+Then open `http://localhost:8766/` in a browser. The viewer listens on this machine only. To watch from another machine add `--view-host 0.0.0.0` (or set
+`TM_VIEW_HOST=0.0.0.0` once): the viewer then requires a token, and the URL it prints contains it. The token and the stream cross the network unencrypted; on an untrusted
+network use an SSH tunnel (`ssh -L 8766:localhost:8766 host`) and leave the bind alone. `--view-token T` sets the token, `--view-insecure` drops it.
 
 **4. Check the result with KiCad**
 
@@ -122,7 +124,7 @@ Every command below starts with `build/release/src/app/tracemaker` unless it say
 |---|---|
 | Route a board (120 s limit) | `route board.kicad_pcb -o out.kicad_pcb --time 120` |
 | Get the same result every time | `route board.kicad_pcb -o out.kicad_pcb --work 50000000` |
-| Watch the routing live | `route board.kicad_pcb -o out.kicad_pcb --view --hold` |
+| Watch the routing live (it freezes on the stuck net with what rejected the path; Space resumes, `--no-freeze` turns that off) | `route board.kicad_pcb -o out.kicad_pcb --view --hold` |
 | Route everything again, old tracks removed | `route board.kicad_pcb -o out.kicad_pcb --reroute` |
 | Pick the options on a screen instead of typing them | `tui board.kicad_pcb -o out.kicad_pcb` |
 | Route with a saved set of options | `route board.kicad_pcb -o out.kicad_pcb --config options.toml` |
@@ -131,6 +133,12 @@ Every command below starts with `build/release/src/app/tracemaker` unless it say
 | Find pins that cannot escape their package | `escape board.kicad_pcb` |
 | Route a tscircuit Simple Route JSON problem | `srj-import problem.json -o board.kicad_pcb`, then `route`, then `srj-export routed.kicad_pcb --problem problem.json -o solved.json` |
 | See which parts and layout rules it detects | `rules board.kicad_pcb --mode on` |
+| Let a script or a language model suggest hints when routing leaves connections open (experimental: the rule-based advisor measured no gain, [docs/17-llm-advisor.md](docs/17-llm-advisor.md) section 8) | `route board.kicad_pcb -o out.kicad_pcb --advisor "python3 advisors/heuristic_advisor.py"` |
+| Route with a hint file you wrote (nets first, layer costs, reserved regions) | `route board.kicad_pcb -o out.kicad_pcb --advice advice.json`; check it first with `advice-check board.kicad_pcb advice.json` |
+| Check whether fast nets have copper under them on their reference layer, and how far the return detours round voids (read-only; doc 05 §42) | `return-paths board.kicad_pcb --nets 'DDR*,*CLK*' --view` |
+| Route critical signals first, with dearer vias, and keep them off plane splits (JLCPCB's three rules; off by default; doc 05 §44) | `route board.kicad_pcb -o out.kicad_pcb --si-rules`, or `--critical-auto --critical-first --critical-via-cost 3 --split-cost 4` one by one; `--critical-nets 'CLK*'` names more |
+| Check every footprint against its datasheet land pattern, from references of brands you trust; errors stop a route (doc 05 §43) | `footprint-check board.kicad_pcb --refs refs/ --view`; or `route board.kicad_pcb -o out.kicad_pcb --footprint-refs refs/` (examples in `docs/footprint_refs/`) |
+| Get a report of what failed and why | `route board.kicad_pcb -o out.kicad_pcb --stuck-report stuck.json` |
 
 <details>
 <summary><b>Placing components</b></summary>
@@ -270,6 +278,8 @@ Freerouting 2.5 10%; Freerouting 1.9 20%.
 | `src/drc` | the design-rule check |
 | `src/io/kicad` | reading and writing KiCad files |
 | `src/crules` | component-aware layout rules |
+| `src/analysis` | read-only audits KiCad's DRC cannot make (the reference return of high-speed nets) |
+| `src/advice`, `advisors/` | advice files, the stuck report and advisors (a model is optional and outside the engine) |
 | `src/gpu` | CUDA and Metal code, each with a CPU twin |
 | `src/server`, `viewer/` | the live viewer |
 | `kicad_plugin/` | the KiCad plugin |

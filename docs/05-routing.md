@@ -1821,3 +1821,224 @@ A homotopy on the design rules. `--ramp-from C0 --ramp-step S` (portfolio with `
 - Vertices end off the lattice and off 45° multiples; track lengths grow by the small moves (at most 0.3 mm). Zones, keep-outs, mounting holes and custom `.kicad_dru` clearances are not constraints of the legaliser; they are caught by the exact check that follows, which drops the routes involved. A projection step is a heuristic: it can leave pairs too close (3-9 on the hard boards), never an illegal result.
 - Prototype with a linear-programming step (sequential LP with a trust region, HiGHS, minimum total movement, scratchpad only) on the six stuck boards: 071, 039, 104 legal in one or two iterations, 103/048/072 with 3/6/11 pairs left; projection: 071, 104 legal, 039/103/048/072 with 2/5/4/9 left. Both turn a 0.06 mm solution (about 800-1000 pairs too close at 0.10 mm) into one with a handful left.
 
+## 42. Reference-return audit of high-speed nets (issue #7, 2026-10-14, D114)
+
+**Problem.** KiCad's DRC does not know whether a fast trace has continuous copper under it. A dogbone escape punches antipads through the reference
+pour, a plane can be split, a layer change can come without a nearby stitch: the signal is DRC-clean and its return current still walks around the void,
+which grows the loop area and raises the inductance. The actionable question is per net: does this trace have copper under it, and if not, how far
+does the return detour?
+
+**What it is.** A read-only pass in the family of `--cut-report` and `escape` (`src/analysis/return_path.{hpp,cpp}`). It adds no copper and changes no
+file. Off unless nets are selected:
+
+```
+tracemaker return-paths BOARD --nets 'DDR*,*CLK*' [--netclass NAMES] [--diff-pairs] [--reference-layer PATTERN=LAYER]
+                              [--stitch-radius-mm 5] [--warn-detour-mm 2] [--warn-separation-mm 1] [--min-void-mm 0.1] [--sample-mm 0.05]
+                              [--refill | --no-refill] [--json FILE] [--strict] [--view [--view-port N]]
+tracemaker route BOARD -o OUT --return-paths 'DDR*' [--return-path-classes NAMES] [--return-path-pairs] [--return-path-radius-mm 5]
+```
+
+`route --return-paths` audits the board as routed, refilling the zones first (the fills in the file predate the new vias, which have antipads); the report
+goes to the log and the `--json` summary (`return_paths`) and each net's path to the viewer. `--strict` exits 4 when any net has a warning (thresholds are
+warnings, not DRC errors). Net selection: KiCad wildcards on net names, net classes, and the halves of differential pairs (`route::named_pairs`).
+
+**Model.** A geometric model, not a field solver (no Palace; no impedance, skew or length matching).
+
+1. *Reference copper.* The filled zones of each copper layer (antipads and zone holes are holes in the reference polygon; zones without fills are refilled with
+   the engine's refill, doc 05 §36, and the report says so).
+2. *Reference layer.* Of the layers adjacent to the signal layer, the one with the most copper under the net's traces (a power plane is a valid reference);
+   `--reference-layer` forces it per net pattern.
+3. *Over copper.* The trace is sampled every 0.05 mm; where copper is under it the return is its mirror image. A stretch without copper longer than `--min-void-mm`
+   is a void; its ends are found to within a micrometre by bisection.
+4. *Across a void.* The return is the shortest path from the void's entry to its exit that stays on the remaining reference copper: A* over the visibility graph
+   of the region's vertices near the void (Lee and Preparata, 1984), the window growing until a path exists. The **detour** is that path minus the trace
+   between the same two points (at least 0), the **separation** the farthest the path gets from the trace. If the copper does not connect the two ends (a split
+   plane) there is no return path on that layer: the void is reported as a split.
+5. *Layer changes.* At a signal via, the reference nets above and below are the nets of the copper around it (the via's own antipad is a void by design). If they
+   are the same net the return closes through the nearest stitching via or through-hole pad of that net inside `--stitch-radius-mm`; if they differ, through the
+   nearest capacitor that has a pad on each. Otherwise the change is counted as a missing stitch.
+6. *Ends.* At a pad the assumed return pad is the nearest pad of the reference net, not one assumed ground ball (the comment on the issue).
+
+**Report** (text, JSON, and the `return_path` viewer message, docs/13): per net the layers and their reference, length, `void_crossings`, `detour_mm`,
+`max_separation_mm`, `splits`, `missing_stitches`, length with no reference layer, and per void, layer change and trace end the numbers behind them. Warnings:
+detour or separation over the thresholds, a split, a missing stitch, a trace with no reference layer (no zone fill on either adjacent layer).
+
+**Viewer.** An overlay (`viewer/src/returnpath_draw.ts`): the signal in cyan, the return in red shifted a few pixels so the two can be told
+apart, with arrows (the return flows from the end of the trace back to its start), and for the selected net callouts for the signal pad, the assumed return pad,
+the signal via, the return via or capacitor (or a missing stitch), and the separation. `P` toggles the overlay; the side panel lists the audited nets worst first and
+a click zooms onto one. `return-paths --view` serves a board and its audit with no router running; `route --return-paths --view` shows it after the routing.
+
+**Cost.** The reference copper of a layer is indexed (`src/analysis/region.hpp`): edges and vertices in a 1 mm grid, and 0.25 mm rows for the inside test, so a query
+costs its neighbourhood and not the whole pour (the plane of a large board has hundreds of thousands of edges, mostly antipads). Every indexed query has a linear
+reference (`island_of_linear`, `crosses_linear`, `nearest_boundary_distance_linear`, `vertices_near_linear`) and `tests/test_return_path.cpp` compares them on a pour with
+antipads, a slot and an island (and on square antipads, where a pad at the centre is exactly as near to four edges: the first edge in the region's order wins in both, so
+the answer does not depend on the order the grid is walked in). Measured on this machine (one core): the Jetson AGX Thor baseboard demo, 291 nets of `*CLK*,*DQ*,*USB*`, took 105 s before the index and
+9 s after; the 12-layer vme-wren demo, 236 nets, 38 s including the refill of its 123 zones (it did not finish in 8 minutes before); RoyalBlue54L-Feather, 7 nets,
+0.5 s (`bench/records/issue7/samples/timings.txt`). Most of what is left is the shortest paths across many small voids.
+
+**Hooks left, not built.** A router cost for crossing a reference void, suggested stitch-via sites, and automatic rerouting: the issue's non-goals.
+
+**Limits.** Arc tracks are not analysed (a warning says so). The detour of a trace that starts or ends over a void is measured from the nearest reference copper, not
+from a modelled return pad. Return current also flows through the plane on both sides of the trace and through other layers; this is the shortest-path estimate on the
+adjacent one. Where a trace starts or ends over a void (a pad at the centre of an antipad) the return regains copper at the nearest boundary point; when
+several are exactly as near the first in the region's edge order is taken, and the detour of such an end can change by half a millimetre with that choice (1.6 mm
+or 2.1 mm for one SWD net of the RoyalBlue demo), so a number near a threshold there is an estimate, not a verdict. Antipad polygons come from the fills as drawn (a 32-gon circle, not a true circle), a few micrometres in a 1 mm antipad. Results on the acceptance picture
+of the issue (about 4.87 mm separation at a processor dogbone field, about 1.00 mm at the memory) were not reproduced: that board is not here.
+
+
+## 43. Footprint check against datasheet land patterns (issue #5, 2026-10-14, D115)
+
+**Problem.** A footprint can be DRC-clean and still not be the part's land pattern: a library footprint that is for the wrong package, a pad that was nudged
+to make a route fit, pins numbered the wrong way, a drill that is too small for the lead. Routing such a board is wasted effort. The issue asks for an
+option that checks components against their datasheet footprints and calls any discrepancy an error, with a trusted list of datasheet brands.
+
+**What it is, and what it is not.** TraceMaker does not read datasheets: a land pattern in a PDF is a drawing, and extracting numbers from it is a job for a
+person (or a model) whose result must itself be checked. The check works on **references**: records of a land pattern made from a datasheet, each saying where it
+came from. A footprint is compared with the reference made for it, and only with a reference whose **brand is on the trusted list**; a reference from any other
+source gives no verdict (the footprint is reported `untrusted`, never as fine). The check verifies a footprint against a record somebody vouched for, it does
+not vouch for the record. Read-only; nothing is fetched from the network.
+
+```
+tracemaker footprint-check BOARD --refs DIR_OR_FILE [--trusted-brands FILE | --trust-all] [--only 'U*,J*'] [--require 'U*,J*']
+                           [--mpn-field NAMES] [--position-tol-mm 0.05] [--size-tol-mm 0.05] [--drill-tol-mm 0.05]
+                           [--all] [--json FILE] [--strict] [--view [--view-port N]]
+tracemaker route BOARD -o OUT --footprint-refs DIR_OR_FILE [--footprint-trusted FILE | --footprint-trust-all] [--footprint-require 'U*']
+                           [--footprint-tol-mm 0.05] [--footprint-warn-only]
+```
+
+`footprint-check` exits 4 when a footprint differs from its datasheet (with `--strict` also on a warning), 1 when the library cannot be read. `route
+--footprint-refs` runs the same check **before the first track is routed**: a discrepancy is an error and stops the job (exit 1, nothing written) unless
+`--footprint-warn-only`; the findings go to the log, the `--json` summary (`footprint_check`, only the footprints with something to say) and the viewer.
+
+**References.** A directory of JSON files (read in path order) or one file; `docs/footprint_refs/example-synthetic.json` is a synthetic example of the format
+(its brand does not exist). Each entry names the brand, the part, the datasheet it was made from (`document` is required: a record that cannot be traced to a
+document is not a reference; revision, page, figure and URL are kept and shown in the report), which footprints it is for (`match`: `mpn`, `lib_id`, `value`,
+`ref`, KiCad wildcards, every list given must be satisfied; part numbers and values ignore case) and the pads: inline (`number`, `type` smd, thru_hole or
+np_thru_hole, `shape`, `at`, `size`, `angle`, `drill`; millimetres, KiCad's y-down footprint frame) or `"footprint": "file.kicad_mod"`, the manufacturer's own KiCad
+footprint, read by the engine's board reader (paste and mask apertures are not land pattern and are dropped). A reference may carry its own `tolerance_mm`.
+Unknown keys, a missing datasheet, a match that selects nothing and a through hole without a drill are refused: a misspelt tolerance that is silently the
+default would be a wrong answer from a verification tool.
+
+**Trusted brands.** `trusted_brands.txt` beside the references, or `--trusted-brands FILE`: one brand per line, `Canonical | alias | alias`, compared without case,
+punctuation or corporate suffixes ("Texas Instruments Incorporated" = "TI" if listed so). No list means nothing is trusted and the report says what to do;
+`--trust-all` uses every reference and the report says that too. `docs/footprint_refs/trusted_brands.txt` is a starting point to copy and edit, not something
+the tool applies by itself: whose datasheets to believe is the user's decision.
+
+**Finding the reference.** For each footprint with pads and a designator: the references whose `match` it satisfies, the most specific (most selector kinds) first,
+then library order; the first whose brand is trusted is used, and when several matched a note says which. The manufacturer part number is read from the
+footprint's properties named MPN, Manufacturer_Part_Number, Mfr Part Number and the like (`--mpn-field` adds names). A footprint with no reference is
+`unverified` (counted, listed with `--all`); `--require 'U*'` makes that an error for those designators. A reference only from untrusted brands gives status
+`untrusted` and a warning (an error where required).
+
+**The comparison.** The datasheet pattern is laid over the footprint: the library's choice of origin and of orientation is not part of a land pattern, so the
+alignment is a translation and a rotation by a multiple of 90 degrees, mirrored or not (8 candidates; the translation is the median of the offsets of the pads
+that share a number, which one or two wrong pads cannot move; the candidate with the most pads paired, then the smallest worst deviation, wins; a pattern that fits
+several ways because it is symmetric is taken the way that agrees with the footprint's side). A mirror is not free: a footprint on the front must match as drawn, one
+on the back mirrored (that is what flipping does); a pattern that fits only the other way is the error `mirrored`, the pin numbers run the wrong way. Then every pad:
+
+| kind | an error when |
+|---|---|
+| `pad_count`, `missing_pad`, `extra_pad` | the footprint has other pads than the datasheet (an unnumbered non-plated peg the datasheet does not show is a warning) |
+| `position` | a pad is farther than the tolerance (default 0.05 mm) from where the pattern puts it, after alignment |
+| `size` | width or height differ by more than the tolerance; a quarter turn of the pad swaps them; custom-shaped pads are not compared |
+| `drill` | a hole where the datasheet has none or the reverse, or a drill off by more than the tolerance (oval drills compared by their two sides) |
+| `pad_type` | SMD, plated through hole and non-plated hole differ |
+| `orientation` | a pad is turned to an angle that is not a quarter turn from the datasheet's (its size cannot be compared) |
+| `pattern` | no pad number of the footprint is in the datasheet pattern |
+
+Pad shape (rect, roundrect, oval) is not compared, only its extent. With two pads a displacement shows on both by half (the pair's distance is what is wrong).
+
+**Report** (text, JSON, the `footprint_check` viewer message of docs/13): per footprint its status (`ok`, `mismatch`, `unverified`, `untrusted`), the datasheet it was
+compared with (brand, part, document, revision, page), the alignment found, and each issue with its pad, a sentence, a few words for the board and where it is.
+**Viewer:** a **Footprint check** panel lists the footprints with findings (errors first) and a click selects one, zooms onto it and lists its messages; rings on the
+footprints that differ (red) or have an untrusted reference (amber), marks and short labels on the wrong pads of the selected one; `D` toggles it.
+
+**Checked on real boards** (`bench/records/issue5/real-boards/`). These runs test the alignment, the rotation and the flip, not the datasheets: the references
+are derived from the boards themselves. (1) On nine KiCad demo boards, a reference taken from the first front instance of every library footprint was compared
+with every instance on the board: 3,144 footprints, front and back, at every rotation they had, all `ok` (the back ones aligned mirrored), none called out. (An
+earlier version of the script derived references from back instances and read oval drills as round; the check rightly reported 'mirrored' and drill errors there, which is
+what those references said.) (2) On video, CM5_MINIMA_3, vme-wren and the Jetson baseboard, the library footprints that appear on both sides: 2,257 footprints,
+all `ok`. (3) A negative control: the same references with one pad moved by 0.2 mm and another widened by 0.3 mm were called out on all 32 footprints they applied
+to on CM5_MINIMA_3 (61 position and 3 size errors). The check takes about a second on the largest of these boards (1,500 footprints).
+
+**Limits.** The references are as good as whoever made them: a typo in a record is a typo in the verdict, and a reference from a trusted brand is only trusted
+because the list says so. Only copper pads and non-plated holes are compared (not courtyard, silkscreen, paste or mask, not 3D models, not the pin functions
+of the symbol). Pads of arbitrary angle are not compared by size. Footprints are matched by part number, library id, value or designator, not by reading the
+datasheet link in a footprint's properties. Nobody has used the check on a board of their own against references made from real datasheets, and no list of
+references ships with the tool: the example is synthetic.
+
+## 44. Critical nets: JLCPCB's three routing rules (issue #24, 2026-10-14, D117)
+
+**Problem.** JLCPCB's advice on routing is three rules: *route the critical signals first, keep vias few, keep a solid reference plane and never cross a split*. TraceMaker had the pieces
+(`--first-nets`, `--via-cost-mm` and the via clean-up, `return-paths` after the route in §42, the component rules' roles in doc 15) but nothing joined them: the user had to name the
+critical nets, vias cost the same for every net, and the router neither avoided nor reported a track over a plane void. This adds the three rules as options, off by default.
+
+```
+tracemaker route BOARD -o OUT --si-rules                       # the three rules together, with the settings below
+tracemaker route BOARD -o OUT [--critical-auto] [--critical-nets 'CLK*,USB_D*'] [--critical-first]
+                              [--critical-via-cost 3] [--critical-via-max 2]
+                              [--split-cost 4 | --split-hard]
+```
+
+**Which nets are critical.** `--critical-nets` names them (KiCad wildcards, tier 1). `--critical-auto` adds the nets that the component rules' roles make critical (doc 15; the table is
+`crules::critical_roles()`, every row a role that carries an impedance, differential-pair, length-match or via-limit rule in the catalogue) and the halves of differential pairs
+(`named_pairs`, tier 2):
+
+| tier | what | roles |
+|---|---|---|
+| 1 | clocks, crystals, RF lines: the signals that radiate and that nothing may disturb | crystal xin/xout, oscillator out, rf_line line, and the clocks of PCIe (refclk), MIPI, DDR3/DDR4 (ck), SDRAM, QSPI, SD/SDIO |
+| 2 | high-speed differential links | USB 2.0 dp/dm, USB 3 sstx/ssrx, Ethernet mdi_pairs and line_pairs, HDMI/DP tmds, LVDS pairs, MIPI data, PCIe tx/rx, SATA pairs, and named pairs |
+| 3 | memory and other fast parallel buses | DDR byte lanes and address/command, SDRAM data and address, QSPI data, SD/SDIO bus, Ethernet MAC bus |
+
+The detection runs on the board whatever `--component-rules` says (it reads, it does not apply rules; a `--rules-override` file is honoured). The user's `--critical-nets` are tier 1, like clocks, and win over a role; the log names the nets per tier.
+
+**1. Order (`--critical-first`).** Critical connections are routed before all others, tier by tier, shortest first within a tier, after `--first-nets` (which stay in front), and again
+after every restart. Unlike `--first-nets` this is an order only: other nets may still rip a critical net during negotiation.
+
+**2. Vias (`--critical-via-cost F`, `--critical-via-max N`).** A via costs a critical net F times as much as `--via-cost-mm` in every search, the clean-up stages included (their own
+multiplier compounds), so it takes a longer way on one layer where there is one. `--critical-via-max` is a report threshold: a critical net with more vias than N is listed with a
+warning. The vias of each critical net are counted in the report whether or not the option is given.
+
+**3. Plane splits (`--split-cost P`, `--split-hard`).** `route/ref_map.hpp` answers, for every cell of the router's lattice on a layer that has a plane next to it, whether the cell's
+centre is over the plane's copper. The reference of a layer is the adjacent layer whose zone fills cover at least 30 % of the board's bounding box (the larger if both; the fills in the file,
+refilled by the engine where there are none); a plane layer with no plane beside it (the outer plane of a two-layer board) counts its own gaps, so a net cannot hop onto the plane to cross its
+slot on the cheap. The fill is rasterised by scanline; `tests/test_critical.cpp` compares it with a point-in-region scan of the same region, cell by cell. A critical net pays P pitches
+per lattice step (`--split-cost`) over a void, or may not enter one (`--split-hard`: a net with no way round a split stays unrouted, and the report lists it as not routed). It is a cost in the search, not a
+change to the exact check of a commit. Cells within a critical net's own pad's radius plus 1 mm are never counted (the plane's antipad round a through-hole pad would otherwise close the pad in under `--split-hard`).
+Three things make it effective: the smoothing pass (`smooth_paths`) may not shortcut a critical net over more void than the path it replaces; a critical net whose first path ran over a void, or hopped layers where a dearer
+via was asked for, is searched again in a 20 mm window (`refine_critical`; A* is optimal in its window, which contains the first, and the first path is committed as it was if the refined one fails the exact check); and
+a net with no void on its first path costs nothing extra. Connections that fail never get the wider search: a window that size on a connection that cannot be routed would spend the work budget.
+
+**Report.** After the route, for the critical nets: the log (`critical nets after the route: N nets, V vias, C plane void crossings` and one line per warning), the `--json` summary
+(`critical_nets`: options, per net tier, why, vias and length added, and where the board has a plane the voids it runs over, the detour and the splits from the audit of §42 on the refilled
+board), a `critical_nets` event and each net's `return_path` event for the viewer (doc 09, doc 13). Warnings: a split crossed (no return path on that layer), a void run over, more vias than
+`--critical-via-max`. The tiers and the options are on the `tui` screen with their help text like every `route` option.
+
+**Off by default.** Without these options the route is the run it was: `tests/test_critical.cpp` and `bench/records/issue24/` show byte-identical boards on the `quick`, `planes` and
+`planes --soft-zones` tiers. `--critical-nets` alone, with no cost or order, is a report only and also changes nothing about the copper.
+
+**Measured** (`bench/records/issue24/`). Planes tier with `--soft-zones`, 4 boards with 28 critical nets (by role or pair), 3M work units, one seed; the baseline is `--critical-auto` alone (the audit on the unchanged copper). Compared on the nets
+that both runs routed, so that a net one run could not route does not count as having no crossings:
+
+| options | critical nets routed | connections routed (of 882) | common nets | vias | void crossings | splits |
+|---|---|---|---|---|---|---|
+| baseline | 25 / 28 | 807 | | | | |
+| `--critical-first` | 26 | 806 | 23 | 18 -> 20 | 62 -> 72 | 22 -> 23 |
+| `--split-cost 4` | 21 | 805 | 21 | 18 -> 16 | 57 -> 52 | 20 -> 11 |
+| `--critical-via-cost 3` | 21 | 805 | 21 | 18 -> 12 | 57 -> 47 | 20 -> 11 |
+| `--split-cost 4 --critical-via-cost 3` | 21 | 805 | 21 | 18 -> 14 | 57 -> 48 | 20 -> 11 |
+| `--critical-first --split-cost 4` | 25 | 801 | 22 | 17 -> 17 | 63 -> 68 | 21 -> 18 |
+| `--si-rules` (all three) | 27 | 799 | 24 | 19 -> 15 | 70 -> 68 | 26 -> 25 |
+
+Read as: the split cost and the via cost, without the order, roughly halve the splits crossed (20 -> 11) and cut vias; `--critical-first` by itself adds crossings, and with it the benefit of the split cost mostly goes (21 -> 18 with the split cost,
+26 -> 25 with all three), so `--si-rules`, which is all three as the issue lists them, is not the best measured combination: `--critical-auto --split-cost 4 --critical-via-cost 3` is. Variation between runs is as large as some of these
+differences: the critical nets that two of the runs fail to route (four USB pairs on StickHub) are also unrouted in a single-variant run of the baseline, so which portfolio variant wins moves the routed counts by a few nets and a few
+connections, and the clean-pass count (2 of 8) did not move at all. Without `--soft-zones` (plane fills block routing) the baseline routes 3 of the 28 critical nets and `--si-rules` 4, with the same 396 of 879 connections. Crossings count voids
+under the net including via antipads. A first version that searched a 20 mm window from the start made `--si-rules` route 3 of 147 on RoyalBlue (failing critical connections spent the work budget); the wider window is now searched
+only after a critical net's first path crossed a void or hopped layers. With all options off the quick, mid, planes and planes `--soft-zones` tiers are byte-identical to `main`.
+
+**Limits.** The tweet the issue quotes gives no numbers, and none were copied: 3 for the via multiplier and 4 pitches per step for the split cost are the values of `--si-rules`, chosen on the
+benchmark runs recorded, not derived. The cost map knows the zone fills of the file, not the antipads of vias the route adds (the audit after the route does, on a refilled board). Only the
+smoothing pass is made split-aware; the other post-passes (length tuning, pair coupling) are not. A rule's own `plane_net` parameter (doc 15 USB2-09, ETH-13) is not read: the reference of a layer
+is the adjacent layer with most copper. A plane that covers under 30 % of the board is not a reference plane. Net classes, via budgets per role and a hard cap on vias were not built (the
+report threshold is the cap).

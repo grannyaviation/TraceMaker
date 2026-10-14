@@ -4,15 +4,19 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <thread>
 
 #include "app/defects.hpp"
 #include "app/inspect.hpp"
+#include "advice/advice.hpp"
+#include "analysis/return_path.hpp"
 #include "app/route_job.hpp"
 #include "app/tui.hpp"
 #include "core/rng.hpp"
@@ -22,6 +26,8 @@
 #include "io/kicad/project_reader.hpp"
 #include "io/srj/srj.hpp"
 #include "route/router.hpp"
+#include "server/messages.hpp"
+#include "server/viewer_server.hpp"
 #include "learn/knowledge_base.hpp"
 #include "passes/style.hpp"
 #include "route/diff_pair.hpp"
@@ -320,6 +326,90 @@ int cmd_buses(const std::string& path, const std::vector<std::string>& specs, bo
   if (groups.empty()) std::printf("no buses\n");
   if (!json_path.empty()) std::ofstream(json_path) << nlohmann::json{{"board", path}, {"buses", j}}.dump(1) << "\n";
   return ok ? 0 : 4;  // 4: a group with a skew limit is over it or not completely routed
+}
+
+// The viewer's address and who may use it (issue #4, D116): this machine only unless asked, a token when it is not.
+tmk::server::ServerOptions viewer_options(const std::string& host, int port, const std::string& token, bool insecure) {
+  tmk::server::ServerOptions so;
+  so.host = host.empty() ? tmk::server::default_host() : host;
+  so.port = static_cast<std::uint16_t>(port);
+  so.token = token;
+  so.allow_open = insecure;
+  return so;
+}
+void print_viewer_notice(const tmk::server::ViewerServer& server) {
+  if (const auto notice = server.notice(); !notice.empty()) std::printf("warning: %s\n", notice.c_str());
+}
+
+// `return-paths`: the reference-return audit of selected nets on a board as it is (issue #7, doc 05 §42). Read-only. Exit 4 with --strict when
+// any net has a warning. With --view the board and each net's return path are served to the live viewer until interrupted.
+int cmd_return_paths(const std::string& path, tmk::analysis::ReturnPathOptions opt, bool refill_flag, bool strict, const std::string& json_path, bool view, int view_port,
+                     const std::string& view_host, const std::string& view_token, bool view_insecure) {
+  const auto lb = tmk::io::read_board_file(path);
+  const auto rules = tmk::io::read_design_rules(path);
+  if (opt.diff_pairs) {
+    const tmk::drc::RuleEngine re(lb.board, rules);
+    opt.pair_nets = tmk::route::named_pairs(lb.board, re);
+  }
+  opt.refill_always = refill_flag;
+  if (opt.name_patterns.empty() && opt.net_classes.empty() && !opt.diff_pairs) {
+    std::fprintf(stderr, "error: no nets selected: give --nets PATTERNS, --netclass NAMES or --diff-pairs\n");
+    return 1;
+  }
+  const auto rep = tmk::analysis::analyse_return_paths(lb.board, rules, opt);
+  for (const auto& l : tmk::analysis::return_path_lines(lb.board, rep)) std::printf("%s\n", l.c_str());
+  if (rep.nets.empty()) std::printf("no nets matched\n");
+  if (!json_path.empty()) std::ofstream(json_path) << tmk::analysis::return_path_json(lb.board, rep).dump(1) << "\n";
+  bool warned = false;
+  for (const auto& n : rep.nets) warned = warned || !n.warnings.empty();
+  if (view) {
+    tmk::server::ViewerServer server(viewer_options(view_host, view_port, view_token, view_insecure));
+    server.publish(tmk::server::board_snapshot_json(lb.board, std::filesystem::path(path).filename().string()));
+    for (const auto& n : rep.nets) server.publish(tmk::analysis::return_path_message(lb.board, n));
+    std::printf("live view: %s (Ctrl-C to quit)\n", server.url().c_str());
+    print_viewer_notice(server);
+    std::fflush(stdout);
+    for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+  return strict && warned ? 4 : 0;
+}
+
+// `footprint-check`: every footprint of a board against datasheet land patterns from a reference library of trusted brands (issue #5, doc 05 §43).
+// Read-only. Exit 4 when a footprint differs from its datasheet (and, with --strict, on any warning). With --view the board and the findings are
+// served to the live viewer until interrupted.
+int cmd_footprint_check(const std::string& path, const std::string& refs, const std::string& trusted_file, bool trust_all, const tmk::analysis::FootprintCheckOptions& opt, bool all,
+                        bool strict, const std::string& json_path, bool view, int view_port, const std::string& view_host, const std::string& view_token,
+                        bool view_insecure) {
+  const auto lb = tmk::io::read_board_file(path);
+  auto lib = tmk::analysis::load_references(refs, trusted_file);
+  lib.trusted.trust_all = trust_all;
+  const auto rep = tmk::analysis::check_footprints(lb.board, lib, opt);
+  for (const auto& l : tmk::analysis::footprint_check_lines(rep, all)) std::printf("%s\n", l.c_str());
+  if (!json_path.empty()) std::ofstream(json_path) << tmk::analysis::footprint_check_json(lb.board, rep).dump(1) << "\n";
+  if (view) {
+    tmk::server::ViewerServer server(viewer_options(view_host, view_port, view_token, view_insecure));
+    server.publish(tmk::server::board_snapshot_json(lb.board, std::filesystem::path(path).filename().string()));
+    server.publish(tmk::analysis::footprint_check_message(rep));
+    std::printf("live view: %s (Ctrl-C to quit)\n", server.url().c_str());
+    print_viewer_notice(server);
+    std::fflush(stdout);
+    for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+  return rep.errors > 0 || (strict && rep.warnings > 0) ? 4 : 0;
+}
+
+// `advice-check`: read an advice file and check it against a board without routing (the refusals `route --advice` would give).
+int cmd_advice_check(const std::string& board_path, const std::string& advice_path, const std::string& json_path) {
+  const auto lb = tmk::io::read_board_file(board_path);
+  const auto adv = tmk::advice::load_advice_file(advice_path);
+  const auto ap = tmk::advice::apply_advice(adv, lb.board);
+  std::printf("%s: %zu hint%s, %d advised variant%s\n", advice_path.c_str(), ap.report["hints"].size(), ap.report["hints"].size() == 1 ? "" : "s", ap.set.variants,
+              ap.set.variants == 1 ? "" : "s");
+  if (!adv.note.empty()) std::printf("  note: %s\n", adv.note.c_str());
+  for (const auto& h : ap.report["hints"]) std::printf("  %-10s %s\n", h["kind"].get<std::string>().c_str(), h["text"].get<std::string>().c_str());
+  for (const auto& w : ap.warnings) std::printf("  warning: %s\n", w.c_str());
+  if (!json_path.empty()) std::ofstream(json_path) << ap.report.dump(1) << "\n";
+  return 0;
 }
 
 int cmd_escape(const std::string& path, const std::string& json_path, bool flow, bool soft_zones, double vias_off_pads_below_mm) {
@@ -884,8 +974,44 @@ int main(int argc, char** argv) {
       ->delimiter(',');
   route->add_option("--layer-cost", r_job.layer_costs, "Track cost per layer as LAYER=FACTOR, e.g. In1.Cu=4,In2.Cu=4 (1 = normal, at most 1000)")->delimiter(',');
   route->add_flag("--view", r_job.view, "Stream the routing live to the browser viewer");
+  bool r_nofreeze = false;
+  double r_fp_tol = -1;
+  route->add_option("--return-paths", r_job.return_paths.name_patterns,
+                    "After routing, audit the reference return of nets matching these KiCad wildcards (comma separated, e.g. 'DDR*'): copper under each trace on its reference layer, the "
+                    "detour round voids, layer changes without a stitching via. Read-only; the report is in the log and the summary, the paths in the viewer (doc 05 §42)")
+      ->delimiter(',');
+  route->add_option("--return-path-classes", r_job.return_paths.net_classes, "With --return-paths: also the nets of these net classes")->delimiter(',');
+  route->add_flag("--return-path-pairs", r_job.return_paths.diff_pairs, "Audit the nets that are halves of a differential pair too");
+  route->add_option("--return-path-radius-mm", r_job.return_paths.stitch_radius_mm, "How far a stitching via or capacitor may be from a layer change (default 5)")->check(CLI::PositiveNumber);
+  route->add_option("--footprint-refs", r_job.footprint_refs,
+                    "Before routing, check every footprint against datasheet land patterns from this reference library (a directory or a JSON file; doc 05 §43). A footprint that differs from "
+                    "its datasheet is an error and stops the job");
+  route->add_option("--footprint-trusted", r_job.footprint_trusted, "With --footprint-refs: the trusted brand list (default: trusted_brands.txt beside the references); references of other brands give no verdict")
+      ->check(CLI::ExistingFile);
+  route->add_flag("--footprint-trust-all", r_job.footprint_trust_all, "With --footprint-refs: use the references of every brand (nobody vouched for them)");
+  route->add_option("--footprint-require", r_job.footprint_opt.require, "With --footprint-refs: designators (KiCad wildcards, comma separated) that must have a trusted reference, else it is an error")->delimiter(',');
+  route->add_flag("--footprint-warn-only", r_job.footprint_warn_only, "With --footprint-refs: report the discrepancies and route anyway");
+  route->add_option("--footprint-tol-mm", r_fp_tol, "With --footprint-refs: tolerance of pad positions, sizes and drills in millimetres (default 0.05; a reference may set its own)")->check(CLI::NonNegativeNumber);
+  route->add_flag("--si-rules", r_job.si_rules,
+                  "JLCPCB's three routing rules at once (doc 05 §44): critical nets (from the component rules' roles and differential pairs) routed first, dearer vias for them (x3), and a cost "
+                  "for their tracks over a void of the adjacent reference plane (+4 pitches per lattice step); each can be set with the options below instead");
+  route->add_option("--critical-nets", r_job.critical_nets, "Nets that are critical whatever their role, KiCad wildcards comma separated (e.g. 'CLK*,USB_D*'); they are tier 1, like clocks, and the nets found by --critical-auto follow in their own tiers")
+      ->delimiter(',');
+  route->add_flag("--critical-auto", r_job.critical_auto, "Critical nets from the component rules' roles (clock, crystal, USB, Ethernet, PCIe, DDR ...) and from differential pairs");
+  route->add_flag("--critical-first", r_job.critical_first, "Route the critical nets before all others, tier by tier (clocks and crystals, differential links, memory buses); --first-nets stay in front");
+  auto* r_crit_via = route->add_option("--critical-via-cost", r_job.critical_via_mult, "A via costs a critical net this many times --via-cost-mm (default 1; 3 with --si-rules)")
+                         ->check(CLI::Range(1.0, 100.0));
+  route->add_option("--critical-via-max", r_job.critical_via_max, "Warn in the report when a critical net has more vias than this (0 = no limit)")->check(CLI::NonNegativeNumber);
+  auto* r_split = route->add_option("--split-cost", r_job.split_cost,
+                    "Cost, in pitches per lattice step, of a critical net's track over a void of the adjacent reference plane: a split, a slot or an antipad field (default 0; 4 with --si-rules)")
+                      ->check(CLI::NonNegativeNumber);
+  route->add_flag("--split-hard", r_job.split_hard, "Close plane voids to critical nets instead of charging for them: a critical net with no way round a split stays unrouted");
+  route->add_flag("--no-freeze", r_nofreeze, "With --view: the viewer does not hold the scene on a routing stall (it normally freezes on the stuck net, with the rejected paths and what rejected them; Space resumes)");
   route->add_option("--record", r_job.record, "Write the routing events (JSON lines, time-stamped) to a file for replay; zstd-compressed if FILE ends in .zst");
-  route->add_option("--view-host", r_job.view_host, "Viewer bind address (default 0.0.0.0)");
+  route->add_option("--view-host", r_job.view_host,
+                    "Viewer bind address (default $TM_VIEW_HOST, else 127.0.0.1: this machine only). 0.0.0.0 or a LAN address lets other machines connect, and then a token is required");
+  route->add_option("--view-token", r_job.view_token, "Token for a viewer that other machines can reach (16+ characters; default: a random one, printed in the URL)");
+  route->add_flag("--view-insecure", r_job.view_insecure, "Serve a viewer that other machines can reach WITHOUT a token (anyone who can reach the port can watch the board)");
   route->add_option("--view-port", r_job.view_port, "Viewer port (default 8766)");
   route->add_flag("--hold", r_job.hold, "Keep serving the viewer after routing finishes");
   route->add_option("--json", r_json, "Write a result summary as JSON");
@@ -896,6 +1022,19 @@ int main(int argc, char** argv) {
   route->add_option("--rules-override", r_job.rules_override,
                     "User override file for --component-rules (JSON, doc 15 §6.3): disable rules, assert/deny categories, set parameters")
       ->check(CLI::ExistingFile);
+  route->add_option("--advice", r_job.advice,
+                    "Advice file (JSON, doc 17): typed hints (nets first, connection priority, layer costs, regions that reserve space for some nets). "
+                    "They run as extra portfolio variants next to the unadvised ones, so the result is never worse")
+      ->check(CLI::ExistingFile);
+  route->add_option("--advice-variants", r_job.advice_variants, "Advised variants to add (default: the file's \"variants\", else 4)")->check(CLI::Range(1, 8));
+  route->add_option("--advisor", r_job.advisor,
+                    "A command (run with sh -c) that reads the stuck report (JSON) on stdin and writes an advice file on stdout; consulted only if the "
+                    "route leaves connections open, then the board is routed again with its advice (advisors/ has a reference one)");
+  route->add_option("--advisor-timeout", r_job.advisor_timeout_s, "Seconds the advisor may take (default 120; not counted as routing work)")->check(CLI::PositiveNumber);
+  route->add_option("--advisor-rounds", r_job.advisor_rounds, "Consult the advisor again with the advised run's result while connections are open (default 1)")->check(CLI::Range(1, 8));
+  route->add_flag("--advisor-redact", r_job.advisor_redact, "Send net and part names to the advisor as aliases (N1, P3), without part values or library ids; the advice is mapped back");
+  route->add_option("--advice-out", r_job.advice_out, "Where the advisor's advice is saved (default <output>.advice.json); route again with --advice FILE to repeat the run");
+  route->add_option("--stuck-report", r_job.stuck_report_out, "Write the stuck report (what failed and why, JSON) of the run the advisor sees, or the final one");
   std::string r_items;
   route->add_option("--emit-items", r_items, "Write the new tracks and vias as JSON (for the KiCad plugin)");
   route->add_flag("--widen-power", r_job.widen_power,
@@ -938,6 +1077,59 @@ int main(int argc, char** argv) {
   buses_cmd->add_flag("--buses", bu_detect, "Also find buses in the net names, as in route");
   buses_cmd->add_option("--bus-skew-mm", bu_skew, "Skew limit of the --bus groups (0 = only the board's custom skew rules)");
   buses_cmd->add_option("--json", bu_json, "Write the measurements as JSON");
+  auto* rp_cmd = app.add_subcommand("return-paths", "Reference-return audit of high-speed nets: copper under each trace on its reference layer, the detour round voids, layer changes without a stitch (read-only; doc 05 §42)");
+  std::string rp_board, rp_json, rp_host, rp_token;
+  tmk::analysis::ReturnPathOptions rp_opt;
+  std::vector<std::string> rp_refs;
+  bool rp_strict = false, rp_view = false, rp_refill = false, rp_norefill = false, rp_insecure = false;
+  int rp_port = 8766;
+  rp_cmd->add_option("board", rp_board)->required()->check(CLI::ExistingFile);
+  rp_cmd->add_option("--nets", rp_opt.name_patterns, "Nets to analyse, KiCad wildcards, comma separated (e.g. 'DDR*,*CLK*')")->delimiter(',');
+  rp_cmd->add_option("--netclass", rp_opt.net_classes, "Also the nets of these net classes")->delimiter(',');
+  rp_cmd->add_flag("--diff-pairs", rp_opt.diff_pairs, "Also the nets that are halves of a differential pair (names ending in P/N or +/-)");
+  rp_cmd->add_option("--reference-layer", rp_refs, "PATTERN=LAYER: the reference layer of the nets that match, instead of the adjacent layer with the most copper under the trace (repeatable)");
+  rp_cmd->add_option("--stitch-radius-mm", rp_opt.stitch_radius_mm, "How far a stitching via or a capacitor may be from a layer change (default 5)")->check(CLI::PositiveNumber);
+  rp_cmd->add_option("--warn-detour-mm", rp_opt.warn_detour_mm, "Warn when a net's return detours more than this (default 2)");
+  rp_cmd->add_option("--warn-separation-mm", rp_opt.warn_separation_mm, "Warn when the return gets farther than this from the trace (default 1)");
+  rp_cmd->add_option("--min-void-mm", rp_opt.min_void_mm, "Stretches without copper shorter than this are ignored (default 0.1)");
+  rp_cmd->add_option("--sample-mm", rp_opt.sample_mm, "Spacing of the samples along a trace (default 0.05)")->check(CLI::PositiveNumber);
+  rp_cmd->add_flag("--refill", rp_refill, "Refill every zone with the engine's refill instead of using the fills in the file");
+  rp_cmd->add_flag("--no-refill", rp_norefill, "Do not refill zones that have no fill (they are then not reference copper)");
+  rp_cmd->add_option("--json", rp_json, "Write the report as JSON");
+  rp_cmd->add_flag("--strict", rp_strict, "Exit 4 when any net has a warning (a threshold or a missing stitch)");
+  rp_cmd->add_flag("--view", rp_view, "Serve the board and the return paths to the live viewer (until interrupted)");
+  rp_cmd->add_option("--view-port", rp_port, "Viewer port (default 8766)");
+  rp_cmd->add_option("--view-host", rp_host, "Viewer bind address (default $TM_VIEW_HOST, else 127.0.0.1; another address needs a token)");
+  rp_cmd->add_option("--view-token", rp_token, "Token for a viewer other machines can reach (16+ characters; default a random one)");
+  rp_cmd->add_flag("--view-insecure", rp_insecure, "A viewer other machines can reach, without a token");
+  auto* fc_cmd = app.add_subcommand("footprint-check", "Check every footprint against datasheet land patterns from a reference library of trusted brands: pad count, positions, sizes, drills, mirroring (read-only; doc 05 §43)");
+  std::string fc_board, fc_refs, fc_trusted, fc_json, fc_host, fc_token;
+  tmk::analysis::FootprintCheckOptions fc_opt;
+  bool fc_trust_all = false, fc_strict = false, fc_all = false, fc_view = false, fc_insecure = false;
+  int fc_port = 8766;
+  fc_cmd->add_option("board", fc_board)->required()->check(CLI::ExistingFile);
+  fc_cmd->add_option("--refs", fc_refs, "The reference library: a directory of JSON files (and a trusted_brands.txt) or one JSON file")->required();
+  fc_cmd->add_option("--trusted-brands", fc_trusted, "The trusted brand list, one `Brand | alias` per line (default: trusted_brands.txt beside the references)")->check(CLI::ExistingFile);
+  fc_cmd->add_flag("--trust-all", fc_trust_all, "Use the references of every brand (nobody vouched for them; the report says so)");
+  fc_cmd->add_option("--only", fc_opt.only, "Check only these designators (KiCad wildcards, comma separated)")->delimiter(',');
+  fc_cmd->add_option("--require", fc_opt.require, "Designators that must have a trusted reference; without one it is an error (e.g. 'U*,J*')")->delimiter(',');
+  fc_cmd->add_option("--mpn-field", fc_opt.mpn_fields, "Footprint properties that hold the manufacturer part number, besides MPN, Manufacturer_Part_Number and the like")->delimiter(',');
+  fc_cmd->add_option("--position-tol-mm", fc_opt.position_tol_mm, "Pad position tolerance (default 0.05; a reference may set its own)")->check(CLI::NonNegativeNumber);
+  fc_cmd->add_option("--size-tol-mm", fc_opt.size_tol_mm, "Pad size tolerance (default 0.05)")->check(CLI::NonNegativeNumber);
+  fc_cmd->add_option("--drill-tol-mm", fc_opt.drill_tol_mm, "Drill size tolerance (default 0.05)")->check(CLI::NonNegativeNumber);
+  fc_cmd->add_flag("--all", fc_all, "Also list the footprints that are fine and those without a reference");
+  fc_cmd->add_option("--json", fc_json, "Write the report as JSON");
+  fc_cmd->add_flag("--strict", fc_strict, "Exit 4 on warnings too (a reference from an untrusted brand, a peg the datasheet does not show)");
+  fc_cmd->add_flag("--view", fc_view, "Serve the board and the findings to the live viewer (until interrupted)");
+  fc_cmd->add_option("--view-port", fc_port, "Viewer port (default 8766)");
+  fc_cmd->add_option("--view-host", fc_host, "Viewer bind address (default $TM_VIEW_HOST, else 127.0.0.1; another address needs a token)");
+  fc_cmd->add_option("--view-token", fc_token, "Token for a viewer other machines can reach (16+ characters; default a random one)");
+  fc_cmd->add_flag("--view-insecure", fc_insecure, "A viewer other machines can reach, without a token");
+  auto* advice_cmd = app.add_subcommand("advice-check", "Check an advice file (doc 17) against a board: the refusals `route --advice` would give, and what each hint does");
+  std::string ac_board, ac_advice, ac_json;
+  advice_cmd->add_option("board", ac_board)->required()->check(CLI::ExistingFile);
+  advice_cmd->add_option("advice", ac_advice, "Advice file (JSON)")->required()->check(CLI::ExistingFile);
+  advice_cmd->add_option("--json", ac_json, "Write what each hint became as JSON");
   auto* style_cmd = app.add_subcommand("style", "Style metric of a routed board: bends, acute angles, stair-steps, detours (doc 05 §39)");
   std::string sty_board, sty_json;
   bool sty_conn = false;
@@ -1054,6 +1246,17 @@ int main(int argc, char** argv) {
     if (*esc) return cmd_escape(esc_board, esc_json, esc_flow, esc_soft, esc_vop ? esc_vop_below : 0.0);
     if (*pairs_cmd) return cmd_pairs(pr_board, pr_extra, pr_json);
     if (*buses_cmd) return cmd_buses(bu_board, bu_specs, bu_detect, bu_skew, bu_json);
+    if (*advice_cmd) return cmd_advice_check(ac_board, ac_advice, ac_json);
+    if (*rp_cmd) {
+      for (const auto& r : rp_refs) {
+        const auto eq = r.rfind('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 == r.size()) throw std::invalid_argument("--reference-layer: expected PATTERN=LAYER, got '" + r + "'");
+        rp_opt.reference_layers.emplace_back(r.substr(0, eq), r.substr(eq + 1));
+      }
+      rp_opt.refill = !rp_norefill;
+      return cmd_return_paths(rp_board, rp_opt, rp_refill, rp_strict, rp_json, rp_view, rp_port, rp_host, rp_token, rp_insecure);
+    }
+    if (*fc_cmd) return cmd_footprint_check(fc_board, fc_refs, fc_trusted, fc_trust_all, fc_opt, fc_all, fc_strict, fc_json, fc_view, fc_port, fc_host, fc_token, fc_insecure);
     if (*style_cmd) return cmd_style(sty_board, sty_json, sty_conn);
     if (*dbg) return cmd_debug_pad(d_board, d_ref, d_num, d_pitch, d_radius, d_width, d_via);
     if (*drc) return cmd_drc(drc_path, drc_json, static_cast<tmk::Coord>(drc_eps_um * 1000.0), drc_linear_zones, drc_refill);
@@ -1089,6 +1292,10 @@ int main(int argc, char** argv) {
       job.reroute = r_reroute;
       job.warm_pcb = r_warm_pcb;
       job.refill_repair = !r_no_repair;
+      job.view_freeze = !r_nofreeze;
+      job.critical_via_given = r_crit_via->count() > 0;
+      job.split_cost_given = r_split->count() > 0;
+      if (r_fp_tol >= 0) job.footprint_opt.position_tol_mm = job.footprint_opt.size_tol_mm = job.footprint_opt.drill_tol_mm = r_fp_tol;
       job.out = r_out;
       job.opt = ropt;
       job.threads = r_threads;

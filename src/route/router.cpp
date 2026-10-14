@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "route/router.hpp"
+
+#include "drc/refill.hpp"
 #include "route/bus.hpp"
 #include "route/diff_pair.hpp"
 #include "route/escape.hpp"
@@ -29,6 +31,7 @@
 #include "gpu/device.hpp"
 #include "gpu/field.hpp"
 #include "route/legalize.hpp"
+#include "route/ref_map.hpp"
 #include "route/obstacles.hpp"
 
 namespace tmk::route {
@@ -45,7 +48,31 @@ constexpr int kNoDir = 8;
 
 std::string jnum(Coord v) { return std::to_string(v); }
 
+// "[3,5]" for the failure event's blocker nets (net ids, as the other events name nets).
+std::string blocker_nets_json(const std::vector<NetId>& nets) {
+  std::string s = "[";
+  for (std::size_t i = 0; i < nets.size(); ++i) s += (i ? "," : "") + std::to_string(nets[i]);
+  return s + "]";
+}
+
 }  // namespace
+
+std::string failure_reason_code(const std::string& why) {
+  // The explanations nest ("exact check ...; negotiated: would rip too many connections at once"), the pin's own state first:
+  // a boxed-in pin is boxed in whatever the later attempts said, and a rip limit says more than the exact check before it.
+  const auto has = [&](const char* needle) { return why.find(needle) != std::string::npos; };
+  if (why.empty()) return "not_attempted";  // the budget ended before the connection was tried again
+  if (has("fixed copper encloses") || has("boxed in")) return "boxed_in";
+  if (has("track on a layer that takes no tracks")) return "layer_limit";
+  if (has("would rip a --first-nets") || has("would rip a bus") || has("would rip too many") || has("already ripped too often") ||
+      has("would rip a connection of the running"))
+    return "rip_limit";
+  if (has("exact check")) return "exact_check";
+  if (has("ripped up by")) return "ripped_not_rerouted";
+  if (has("out of budget") || has("search budget")) return "out_of_budget";
+  if (has("transaction rolled back")) return "rolled_back";
+  return "no_legal_path";
+}
 
 struct Router::Impl {
   const model::DesignRules& rules;
@@ -88,6 +115,7 @@ struct Router::Impl {
     std::vector<int> items;          // copper item indices owned by this connection
     int rips = 0, fails = 0;
     std::string why;                 // last failure explanation
+    std::vector<NetId> blockers;     // nets of the connections the last rejected route would have had to rip (stuck report, doc 17)
     bool coupled = false;            // routed as half of a differential pair: clean-up leaves it alone
     bool bus_lane = false;           // routed as a lane of its bus (leads its bundle or followed a lane): via clean-up leaves it alone
     // Boxed in even by a negotiated search, which may cross every other net's routed copper: only fixed copper
@@ -96,6 +124,21 @@ struct Router::Impl {
   };
   std::vector<ConnState> cs;
   std::set<NetId> first_net_ids;  // --first-nets
+  // Critical nets (issue #24, doc 05 §44): the order rank of each net (0 = not critical, else its tier), the via price factor and whether the
+  // split-crossing cost applies to it; the reference map is built in setup() when that cost is on.
+  std::vector<std::int32_t> crit_rank;
+  std::vector<double> net_via_mult;
+  std::vector<std::uint8_t> crit_split;
+  ReferenceMap refmap;
+  std::int64_t split_pen = 0;
+  bool split_on = false;
+  bool crit_order_on = false;
+  // Order of routing: --first-nets, then critical tiers, then the rest.
+  int order_key(NetId n) const {
+    if (first_net_ids.count(n)) return 0;
+    return n >= 0 && static_cast<std::size_t>(n) < crit_rank.size() && crit_rank[static_cast<std::size_t>(n)] > 0 ? crit_rank[static_cast<std::size_t>(n)] : 1000;
+  }
+  double via_mult_of(NetId n) const { return n >= 0 && static_cast<std::size_t>(n) < net_via_mult.size() ? net_via_mult[static_cast<std::size_t>(n)] : 1.0; }
   std::unordered_map<std::int64_t, std::uint16_t> history;  // contested lattice cells (PathFinder history cost)
   // Completion LNS swap conflicts: cells of a lifted connection's old copper that the next probe of the same
   // unrouted connection pays to cross (history units), cleared once that connection is done.
@@ -140,6 +183,8 @@ struct Router::Impl {
   }
 
   Impl(const model::Board& in, const model::DesignRules& r, const RouterOptions& o) : rules(r), opt(o), b(in) {
+    // Advice regions and other in-memory rule areas: part of the working copy only, so every obstacle test sees them.
+    b.zones.insert(b.zones.end(), opt.extra_zones.begin(), opt.extra_zones.end());
     // Name-pattern matching is too costly for per-cell lookups.
     net_class.reserve(b.nets.size());
     for (const auto& n : b.nets) net_class.push_back(&rules.class_for(n.name));
@@ -291,6 +336,25 @@ struct Router::Impl {
     if (opt.soft_zones) soft_fills = std::make_unique<drc::ZoneFills>(obs->copper());
     for (std::size_t n = 0; n < b.nets.size(); ++n)
       if (std::find(opt.first_nets.begin(), opt.first_nets.end(), b.nets[n].name) != opt.first_nets.end()) first_net_ids.insert(static_cast<NetId>(n));
+    if (!opt.critical.empty()) {
+      crit_rank.assign(b.nets.size(), 0);
+      net_via_mult.assign(b.nets.size(), 1.0);
+      crit_split.assign(b.nets.size(), 0);
+      std::unordered_map<std::string, int> tiers;  // a board can have thousands of critical nets: look names up, do not scan the list per net
+      for (const auto& [name, tier] : opt.critical) {
+        const auto it = tiers.find(name);
+        if (it == tiers.end() || tier < it->second) tiers[name] = tier;
+      }
+      for (std::size_t n = 0; n < b.nets.size(); ++n) {
+        if (b.nets[n].name.empty()) continue;
+        const auto it = tiers.find(b.nets[n].name);
+        if (it == tiers.end()) continue;
+        crit_rank[n] = std::max(1, it->second);
+        net_via_mult[n] = std::max(1.0, opt.critical_via_mult);
+        crit_split[n] = 1;
+      }
+      crit_order_on = opt.critical_first;
+    }
     obs->set_vias_off_pads(opt.vias_off_pads, static_cast<Coord>(opt.vias_off_pads_below_mm * 1e6));
     if (opt.via_in_pad) find_inner_balls();
     use_cache = !obs->needs_exact_routing();
@@ -346,6 +410,43 @@ struct Router::Impl {
     const Coord vm = b.vias_tented ? 0 : std::max<Coord>(b.pad_to_mask_clearance, 0);
     near_infl = probe + pitch * 71 / 100 + 1 + std::max({obs->rules().max_clearance(), hc, 2 * vm + 1'000}) + 2 * pitch + 2;
     near_r.assign(static_cast<std::size_t>(nl) * static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny), 0);
+    if (!opt.critical.empty() && (opt.split_cost > 0 || opt.split_hard) && nl > 1) build_split_map();
+  }
+  // The cells of each layer over a void of the adjacent reference plane, from the zone fills (refilled by the engine where the file has none).
+  void build_split_map() {
+    bool unfilled = false, any = false;
+    for (const auto& z : b.zones)
+      if (!z.rule_area && z.net > 0) {
+        any = true;
+        unfilled = unfilled || z.fills.empty();
+      }
+    if (!any) return;
+    if (opt.reference_fills) {
+      refmap = build_reference_map(*opt.reference_fills, lat, pitch, nx, ny, opt.split_min_coverage);
+    } else if (unfilled) {
+      const auto rf = drc::refill_zones(b, rules);
+      refmap = build_reference_map(rf.board, lat, pitch, nx, ny, opt.split_min_coverage);
+    } else {
+      refmap = build_reference_map(b, lat, pitch, nx, ny, opt.split_min_coverage);
+    }
+    split_on = refmap.any();
+    split_pen = static_cast<std::int64_t>(opt.split_cost * static_cast<double>(pitch));
+    if (!split_on) return;
+    // The plane has an antipad round every through-hole pad (and its clearance is several lattice cells), so the cells next to a critical net's own pad are
+    // voids by construction. A net must be able to leave its pad: within the pad's radius plus 1 mm nothing counts (on every layer). Without this
+    // --split-hard closed a through-hole pad in.
+    const std::size_t layer_cells = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny);
+    for (const auto& p : b.pads) {
+      if (p.net <= 0 || static_cast<std::size_t>(p.net) >= crit_split.size() || !crit_split[static_cast<std::size_t>(p.net)]) continue;
+      const double r = static_cast<double>(std::max(p.size_x, p.size_y)) / 2.0 + 1'000'000.0;
+      const int cx = to_ix(p.pos.x), cy = to_iy(p.pos.y), span = static_cast<int>(r / static_cast<double>(pitch)) + 1;
+      for (int y = std::max(0, cy - span); y <= std::min(ny - 1, cy + span); ++y)
+        for (int x = std::max(0, cx - span); x <= std::min(nx - 1, cx + span); ++x) {
+          const double dx = static_cast<double>(x - cx) * static_cast<double>(pitch), dy = static_cast<double>(y - cy) * static_cast<double>(pitch);
+          if (dx * dx + dy * dy > r * r) continue;
+          for (int l = 0; l < nl; ++l) refmap.over_void[static_cast<std::size_t>(l) * layer_cells + static_cast<std::size_t>(y) * static_cast<std::size_t>(nx) + static_cast<std::size_t>(x)] = 0;
+        }
+    }
   }
   std::vector<std::uint16_t> near_r;
   Coord near_infl = 0;
@@ -571,7 +672,9 @@ struct Router::Impl {
       };
       std::stable_partition(out.begin(), out.end(), [&](const Connection& c) { return pri.count({label(c.pad_a), label(c.pad_b)}) > 0; });
     }
-    if (!first_net_ids.empty())
+    if (crit_order_on)
+      std::stable_sort(out.begin(), out.end(), [&](const Connection& a, const Connection& c) { return order_key(a.net) < order_key(c.net); });
+    else if (!first_net_ids.empty())
       std::stable_partition(out.begin(), out.end(), [&](const Connection& c) { return first_net_ids.count(c.net) > 0; });
     if (!opt.buses.empty()) order_buses(out);
     return out;
@@ -778,6 +881,10 @@ struct Router::Impl {
         }
     }
     if (lp_on && layer != lp_layer) hc += lp_pen;  // layer assignment: tracks off the preferred layer (doc 16 F2)
+    if (split_on && crit_split[static_cast<std::size_t>(net)] && refmap.over_void[lat_index(layer, gx, gy)]) {  // a critical net over a void of its reference plane (issue #24)
+      if (opt.split_hard) return -1;
+      hc += split_pen;
+    }
     if (gd_on && !gd_mask[lat_index(layer, gx, gy)]) {  // preferred path of the connection (doc 16 F1)
       if (gd_hard) return -1;
       hc += gd_pen;
@@ -996,7 +1103,7 @@ struct Router::Impl {
     if (e.in_pad_from == SIZE_MAX) e.in_pad_from = e.cells.size();
     // Four vias' worth at the current via price (the clean-up stages raise via_cost_mult; a fixed price would make
     // the in-pad via the cheap option there).
-    const std::int64_t cost = static_cast<std::int64_t>(4 * opt.via_cost_mm * via_cost_mult * 1e6) +
+    const std::int64_t cost = static_cast<std::int64_t>(4 * opt.via_cost_mm * via_cost_mult * via_mult_of(p.net) * 1e6) +
                               static_cast<std::int64_t>(std::hypot(static_cast<double>(C.x - p.pos.x), static_cast<double>(C.y - p.pos.y)));
     for (int l = 0; l < nl; ++l) {
       if ((p.copper & model::layer_bit(l)) || !layer_ok(p.net, l)) continue;
@@ -1157,6 +1264,20 @@ struct Router::Impl {
   long expansion_cap = 0;  // > 0: per-search expansion limit overriding opt.max_expansions (reverse probes)
   Miss last_miss = Miss::None;
 
+  // ---- stall diagnostics (issue #8, doc 09 section 8) ----
+  // With a sink attached, a failed forward search at the connection's own width keeps where it got closest to the target and the path
+  // that led there; the `failure` event is built from it (stall_fields). Read-only: nothing here feeds back into a search, so a run
+  // with a viewer routes exactly as one without.
+  struct StallProbe {
+    bool valid = false;
+    int conn = -1;                    // the connection whose attempt this is
+    bool soft = false;                // the search could cross routed copper
+    bool edge = false;                // the reachable region touched the window's edge: a larger window might still find a way
+    int layer = 0;
+    Point closest{};                  // the expanded lattice point nearest the target
+    std::vector<std::array<std::int64_t, 3>> path;  // x, y, layer from the source to `closest`, corners only
+  } stall_probe;
+
   bool search(const Connection& c, const Window& w, std::vector<PathNode>& path) {
     last_miss = Miss::None;
     reach_said_no = false;
@@ -1235,6 +1356,23 @@ struct Router::Impl {
       tbox.add(tp);
       for (const auto& [l, ci] : dst.cells) tbox.add(at(w.x0 + static_cast<int>(ci % w.w), w.y0 + static_cast<int>(ci / w.w)));
     }
+    // Keep the closest approach of this search for the failure event: forward, at the net's own width, for the connection being routed.
+    const bool probing = opt.sink != nullptr && c.pad_b >= 0 && width_override == 0 && !force_escapes && !via_override && current >= 0 &&
+                         static_cast<std::size_t>(current) < cs.size() && cs[static_cast<std::size_t>(current)].c.pad_a == c.pad_a &&
+                         cs[static_cast<std::size_t>(current)].c.pad_b == c.pad_b;
+    // A strict probe (routed copper blocks) is worth more than a negotiated one (it can cross routed copper): keep it.
+    const bool probe_wanted = probing && !(stall_probe.valid && stall_probe.conn == current && !stall_probe.soft && soft);
+    auto store_probe = [&](int l, Point closest, std::vector<std::array<std::int64_t, 3>> pth) {
+      stall_probe.valid = true;
+      stall_probe.conn = current;
+      stall_probe.soft = soft;
+      stall_probe.edge = touched_edge;
+      stall_probe.layer = l;
+      stall_probe.closest = closest;
+      stall_probe.path = std::move(pth);
+    };
+    std::size_t probe_s = SIZE_MAX;
+    std::int64_t probe_d2 = INT64_MAX;
     // Reachability pre-check (doc 05 §13): a flood fill over the same legality tests as the A* below, but with no
     // bend states, turn limits or costs, so it admits every path the A* could find. "Unreachable" is therefore
     // exact, found with one visit per lattice point instead of up to nine heap-ordered expansions, and the cell
@@ -1298,19 +1436,33 @@ struct Router::Impl {
           exp_fail += visited;
           ++n_fail;
           last_miss = edge ? Miss::Window : Miss::Enclosed;
+          if (probe_wanted && !edge) {  // the flood has no parents: the nearest cell it reached, without a path
+            for (const std::size_t i : reach_q) {
+              const std::size_t ci = i % cells;
+              const Point pp = at(w.x0 + static_cast<int>(ci % static_cast<std::size_t>(w.w)), w.y0 + static_cast<int>(ci / static_cast<std::size_t>(w.w)));
+              const std::int64_t dx = pp.x - tp.x, dy = pp.y - tp.y, d2 = dx * dx + dy * dy;
+              if (d2 < probe_d2) probe_d2 = d2, probe_s = i;
+            }
+            if (probe_s != SIZE_MAX) {
+              const int l = static_cast<int>(probe_s / cells);
+              const std::size_t ci = probe_s % cells;
+              store_probe(l, at(w.x0 + static_cast<int>(ci % static_cast<std::size_t>(w.w)), w.y0 + static_cast<int>(ci / static_cast<std::size_t>(w.w))), {});
+            }
+          }
           return false;
         }
       }
     }
     const std::int64_t step = pitch, diag = static_cast<std::int64_t>(std::llround(static_cast<double>(pitch) * std::numbers::sqrt2));
-    const std::int64_t via_cost = static_cast<std::int64_t>(opt.via_cost_mm * via_cost_mult * 1e6);
+    const double via_price = opt.via_cost_mm * via_cost_mult * via_mult_of(net);  // critical nets pay more for a via (issue #24)
+    const std::int64_t via_cost = static_cast<std::int64_t>(via_price * 1e6);
     const std::int64_t dir_pen = static_cast<std::int64_t>(auto_dir_pen * static_cast<double>(pitch));
     // Cost-to-go field (GPU) for large windows: exact distances to the targets through cells not known to be
     // blocked by fixed copper; a lower bound on the true cost, so A* stays optimal while expanding far less.
     const bool use_field = !zone_target && opt.field_heuristic && use_cache && !fields_off &&
                            cells * static_cast<std::size_t>(nl) >= static_cast<std::size_t>(opt.field_min_cells);
     if (use_field) {
-      build_field(w, net, hw, dst, step, diag, static_cast<std::int64_t>(opt.via_cost_mm * via_cost_mult * 1e6));
+      build_field(w, net, hw, dst, step, diag, via_cost);
       // Wall-clock mode only (keeps --work runs deterministic): when shared GPUs make fields cost more than
       // 30% of the run, this variant continues with the octile heuristic.
       const double el = elapsed();
@@ -1374,6 +1526,11 @@ struct Router::Impl {
         break;
       }
       if (++expanded > exp_cap) break;
+      if (probe_wanted) {  // the expanded state nearest the target (ties: the first)
+        const Point pp = at(w.x0 + cx, w.y0 + cy);
+        const std::int64_t dx = pp.x - tp.x, dy = pp.y - tp.y, d2 = dx * dx + dy * dy;
+        if (d2 < probe_d2) probe_d2 = d2, probe_s = s;
+      }
       if (live && (expanded & 63) == 0) {
         recent[recent_n++ % recent.size()] = {at(w.x0 + cx, w.y0 + cy), l};
         heat_exp.add(at(w.x0 + cx, w.y0 + cy), 64);  // one sample stands for the 64 expansions since the last
@@ -1467,6 +1624,32 @@ struct Router::Impl {
       // Open list exhausted without reaching the window edge: the source is boxed in, so a larger window
       // cannot help (Contour's boxed-in terminal test).
       last_miss = expanded > exp_cap ? Miss::Budget : touched_edge ? Miss::Window : Miss::Enclosed;
+      if (probe_wanted && probe_s != SIZE_MAX && last_miss != Miss::Budget) {
+        // The way to the closest approach, corners only: back along the parents, then the collinear points dropped.
+        std::vector<std::array<std::int64_t, 3>> raw;
+        for (std::int64_t t = static_cast<std::int64_t>(probe_s); t >= 0 && raw.size() < 100'000; t = sn[static_cast<std::size_t>(t)].parent) {
+          const std::size_t lc = static_cast<std::size_t>(t) / D;
+          const int l = static_cast<int>(lc / cells);
+          const std::int64_t ci = static_cast<std::int64_t>(lc % cells);
+          const Point pp = at(w.x0 + static_cast<int>(ci % w.w), w.y0 + static_cast<int>(ci / w.w));
+          raw.push_back({pp.x, pp.y, l});
+          if (sn[static_cast<std::size_t>(t)].parent < 0) break;
+        }
+        std::reverse(raw.begin(), raw.end());
+        std::vector<std::array<std::int64_t, 3>> corners;
+        for (std::size_t i = 0; i < raw.size(); ++i) {
+          if (i == 0 || i + 1 == raw.size()) {
+            corners.push_back(raw[i]);
+            continue;
+          }
+          const auto &a0 = raw[i - 1], &a1 = raw[i], &a2 = raw[i + 1];
+          const bool straight = a0[2] == a1[2] && a1[2] == a2[2] && (a1[0] - a0[0]) * (a2[1] - a1[1]) == (a1[1] - a0[1]) * (a2[0] - a1[0]);
+          if (!straight) corners.push_back(a1);
+        }
+        const std::size_t lc = probe_s / D;
+        const std::int64_t ci = static_cast<std::int64_t>(lc % cells);
+        store_probe(static_cast<int>(lc / cells), at(w.x0 + static_cast<int>(ci % w.w), w.y0 + static_cast<int>(ci / w.w)), std::move(corners));
+      }
       if (std::getenv("TM_DEBUG_ENCLOSED") && last_miss == Miss::Enclosed && soft) {
         // Classify the rejected neighbours of every expanded cell (diagnostics).
         long fixed = 0, learned = 0, other = 0, startcells = static_cast<long>(src.cells.size());
@@ -1646,13 +1829,20 @@ struct Router::Impl {
       }
       ok = false;
     }
+    std::sort(victims.begin(), victims.end());
+    victims.erase(std::unique(victims.begin(), victims.end()), victims.end());
+    if (!victims.empty() && current >= 0) {  // what stood in the way of this route, for the stuck report; a later success makes it moot
+      auto& bl = cs[static_cast<std::size_t>(current)].blockers;
+      bl.clear();
+      for (int v : victims) bl.push_back(cs[static_cast<std::size_t>(v)].c.net);
+      std::sort(bl.begin(), bl.end());
+      bl.erase(std::unique(bl.begin(), bl.end()), bl.end());
+    }
     if (!ok) {
       commit_why = "exact check rejected the lattice path";
       return false;
     }
-    std::sort(victims.begin(), victims.end());
-    victims.erase(std::unique(victims.begin(), victims.end()), victims.end());
-    if (probing) {  // completion LNS: the caller lifts the victims itself and commits this path afterwards
+    if (lns_probing) {  // completion LNS: the caller lifts the victims itself and commits this path afterwards
       probe_hit = true;
       probe_victims = victims;
       probe_path = path;
@@ -1985,7 +2175,7 @@ struct Router::Impl {
   }
 
   // Probe mode (completion LNS): a soft commit only records the path and the connections it would rip.
-  bool probing = false, probe_hit = false;
+  bool lns_probing = false, probe_hit = false;
   bool probe_wide = false;  // completion LNS, later sweeps: probes try every window up to the whole board
   double soft_mult = 1.0;  // crossing cost factor (completion LNS probes: fewer connections crossed)
   std::int64_t soft_cost() const { return static_cast<std::int64_t>(static_cast<double>(soft_unit) * soft_mult); }
@@ -2169,11 +2359,259 @@ struct Router::Impl {
         }
         continue;
       }
+      std::vector<PathNode> refined;
+      if (refine_critical(c, a, e, path, refined) && commit(c, refined)) return true;  // else the first path, which was legal, is tried as it was
       if (commit(c, path)) return true;
       why = commit_why;
       if (probe_hit) return false;
     }
     return false;
+  }
+
+  // A critical net's first path may run over a void of its reference plane or hop layers where a dearer via was asked for: the way round can lie outside the
+  // small first window. Then, and only then, the connection is searched again in a 20 mm window (issue #24). A* is optimal in its window and this one contains
+  // the first, so the new path costs no more; a search that does not finish (budget) leaves the first path, and so does a refined path that fails the exact
+  // check at the commit (the caller tries the first one then). Connections that fail, or that have nothing to improve, cost no extra search: a window this
+  // size on a connection that cannot be routed would eat the work budget.
+  bool refine_critical(const Connection& c, Point a, Point e, const std::vector<PathNode>& path, std::vector<PathNode>& refined) {
+    if (c.pad_b < 0 || path.size() < 2 || crit_rank.empty() || crit_rank[static_cast<std::size_t>(c.net)] == 0) return false;
+    bool voids = false, hops = false;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+      if (split_on && crit_split[static_cast<std::size_t>(c.net)] && refmap.over_void[lat_index(path[i].layer, path[i].gx, path[i].gy)]) voids = true;
+      if (i > 0 && path[i].layer != path[i - 1].layer) hops = true;
+    }
+    if (!voids && !(hops && via_mult_of(c.net) > 1.0)) return false;
+    const Coord m = 20'000'000 + c.length / 4;
+    Window w;
+    w.x0 = std::max(0, to_ix(std::min(a.x, e.x) - m));
+    w.y0 = std::max(0, to_iy(std::min(a.y, e.y) - m));
+    w.w = std::min(nx - 1, to_ix(std::max(a.x, e.x) + m)) - w.x0 + 1;
+    w.h = std::min(ny - 1, to_iy(std::max(a.y, e.y) + m)) - w.y0 + 1;
+    const Miss saved_miss = last_miss;
+    const bool found = search(c, w, refined) && refined.size() >= 2;
+    last_miss = saved_miss;
+    return found;
+  }
+
+  // The widest track that can get from the closest approach on towards the target (issue #8): the bottleneck of the best way, a
+  // widest-path (max-min) search over a probing grid in a corridor of +-2 mm around the straight line from p0 to the target and at most
+  // 12 mm long. A node's value is the widest track that is legal there (binary search on the width against the router's own obstacle
+  // tests, so clearances, rules, pads, holes and edges are exactly the ones the lattice used); a way's value is its smallest node; layer
+  // changes need a legal via. The goal is the far end of the corridor. With `fixed_only`, routed copper does not count (it can be ripped),
+  // so the answer is what placement and the rules alone allow. Deterministic budgets: at most `max_nodes` nodes are given a value, and the
+  // calls to the obstacle tests are taken from `calls_left`; a search that runs out of either says so (`budget`). Only const Obstacles
+  // queries: no work is counted and no state changes, so a run with a viewer routes as one without.
+  struct Way {
+    Coord width = 0;      // the widest track that gets through (0: none, not even a hairline)
+    Point at{};           // where it is narrowest
+    int layer = 0;
+    bool reached = false;
+    bool budget = false;  // ran out of nodes or calls before an answer: the result is not evidence
+  };
+  Way widest_way(Point p0, int layer0, Point goal, NetId net, Coord cap, bool fixed_only, long& calls_left) const {
+    Way out;
+    const double dx = static_cast<double>(goal.x - p0.x), dy = static_cast<double>(goal.y - p0.y), dist = std::hypot(dx, dy);
+    if (dist < static_cast<double>(pitch)) {
+      out.reached = true;
+      out.width = cap;
+      out.at = p0;
+      out.layer = layer0;
+      return out;
+    }
+    const double ux = dx / dist, uy = dy / dist, vx = -uy, vy = ux;
+    const double len = std::min(dist, 12'000'000.0), half = 2'000'000.0;
+    double ds = static_cast<double>(pitch);
+    while ((len / ds + 1) * (2 * half / ds + 1) > 20'000.0) ds *= 1.5;  // a coarser grid for a long way, never above ~20k nodes per layer
+    const int ni = static_cast<int>(len / ds) + 1, nj = 2 * static_cast<int>(half / ds) + 1, jc = nj / 2;
+    std::vector<int> layers;
+    for (int l = 0; l < nl; ++l)
+      if (l == layer0 || layer_ok(net, l)) layers.push_back(l);
+    const std::size_t per = static_cast<std::size_t>(ni) * static_cast<std::size_t>(nj), total = per * layers.size();
+    auto pos = [&](int i, int j) {
+      return Point{p0.x + static_cast<Coord>(std::llround(ux * i * ds + vx * (j - jc) * ds)), p0.y + static_cast<Coord>(std::llround(uy * i * ds + vy * (j - jc) * ds))};
+    };
+    constexpr Coord kUnit = 5'000;  // node values are kept in units of 5 um
+    std::vector<std::int16_t> val(total, -1);  // -1: not valued yet
+    long valued = 0;
+    const long max_nodes = 40'000;
+    auto fits = [&](Point q, int l, Coord width) {
+      --calls_left;
+      const int st = obs->disk_state(q, l, width / 2, net, 0, fixed_only);
+      return fixed_only ? st != 2 : st == 0;
+    };
+    // Returns the node's value in units, or -2 when the budget is gone.
+    auto value = [&](std::size_t node) -> int {
+      if (val[node] >= 0) return val[node];
+      if (calls_left < 16 || valued >= max_nodes) return -2;
+      ++valued;
+      const int li = static_cast<int>(node / per);
+      const std::size_t r = node % per;
+      const Point q = pos(static_cast<int>(r % static_cast<std::size_t>(ni)), static_cast<int>(r / static_cast<std::size_t>(ni)));
+      const int l = layers[static_cast<std::size_t>(li)];
+      Coord lo = 0;
+      if (!fits(q, l, 0)) {
+        val[node] = 0;
+        return 0;
+      }
+      if (fits(q, l, cap)) {
+        lo = cap;
+      } else {
+        Coord hi = cap;  // fits(lo), !fits(hi)
+        while (hi - lo > kUnit) {
+          const Coord mid = (lo + hi) / 2;
+          (fits(q, l, mid) ? lo : hi) = mid;
+        }
+      }
+      val[node] = static_cast<std::int16_t>(lo / kUnit + 1);  // +1: 0 is "no room for a hairline" but valued
+      return val[node];
+    };
+    auto width_of = [&](int v) { return v <= 1 ? Coord{0} : static_cast<Coord>(v - 1) * kUnit; };
+    const int capu = static_cast<int>(cap / kUnit) + 1;
+    using QE = std::pair<int, std::size_t>;  // (bottleneck so far, node)
+    std::priority_queue<QE> open;
+    std::vector<std::int32_t> best(total, -1), prev(total, -1);
+    const std::size_t start = static_cast<std::size_t>(std::find(layers.begin(), layers.end(), layer0) - layers.begin()) * per + static_cast<std::size_t>(jc) * static_cast<std::size_t>(ni);
+    best[start] = capu;
+    open.emplace(capu, start);
+    std::size_t goal_node = SIZE_MAX;
+    bool exhausted_budget = false;
+    while (!open.empty()) {
+      const auto [bn, node] = open.top();
+      open.pop();
+      if (bn < best[node]) continue;  // stale
+      const std::size_t r = node % per;
+      const int i = static_cast<int>(r % static_cast<std::size_t>(ni)), j = static_cast<int>(r / static_cast<std::size_t>(ni)), li = static_cast<int>(node / per);
+      if (i == ni - 1) {
+        goal_node = node;
+        break;
+      }
+      auto relax = [&](std::size_t nb) {
+        const int v = value(nb);
+        if (v == -2) {
+          exhausted_budget = true;
+          return;
+        }
+        if (v == 0) return;  // not even a hairline is legal there
+        const int nbv = std::min(bn, v);
+        if (nbv > best[nb]) {
+          best[nb] = nbv;
+          prev[nb] = static_cast<std::int32_t>(node);
+          open.emplace(nbv, nb);
+        }
+      };
+      for (int di = -1; di <= 1; ++di)
+        for (int dj = -1; dj <= 1; ++dj) {
+          if (!di && !dj) continue;
+          const int i2 = i + di, j2 = j + dj;
+          if (i2 < 0 || j2 < 0 || i2 >= ni || j2 >= nj) continue;
+          relax(static_cast<std::size_t>(li) * per + static_cast<std::size_t>(j2) * static_cast<std::size_t>(ni) + static_cast<std::size_t>(i2));
+        }
+      // A layer change here needs a legal via (the through via of the net's class).
+      const Point q = pos(i, j);
+      for (std::size_t l2 = 0; l2 < layers.size(); ++l2) {
+        if (static_cast<int>(l2) == li) continue;
+        --calls_left;
+        const int vs = obs->via_state(q, via_diameter(net), via_drill(net), net, 0, fixed_only);
+        if (fixed_only ? vs == 2 : vs != 0) break;  // no via here, on any layer
+        relax(l2 * per + static_cast<std::size_t>(j) * static_cast<std::size_t>(ni) + static_cast<std::size_t>(i));
+      }
+    }
+    if (goal_node == SIZE_MAX) {
+      out.budget = exhausted_budget;
+      out.width = 0;
+      return out;
+    }
+    out.reached = true;
+    out.width = width_of(best[goal_node]);
+    // Where the best way is narrowest: the smallest node value along it (the last one if several are equal).
+    int minv = INT32_MAX;
+    std::size_t at_node = goal_node;
+    for (std::int64_t t = static_cast<std::int64_t>(goal_node); t >= 0; t = prev[static_cast<std::size_t>(t)]) {
+      const int v = val[static_cast<std::size_t>(t)] >= 0 ? val[static_cast<std::size_t>(t)] : capu;
+      if (v <= minv) minv = v, at_node = static_cast<std::size_t>(t);
+    }
+    const std::size_t r = at_node % per;
+    out.at = pos(static_cast<int>(r % static_cast<std::size_t>(ni)), static_cast<int>(r / static_cast<std::size_t>(ni)));
+    out.layer = layers[at_node / per];
+    return out;
+  }
+
+  // The fields a `failure` event gets for the stalled connection `ci` (issue #8, doc 13): the width and clearance of the attempt,
+  // where the search got closest and how much room there was in the passage that closed, the verdict those numbers support
+  // (placement, rule, contested, or unknown when the evidence is incomplete), the path that was tried, and the rule it came from.
+  // Everything is measured with the router's own obstacle tests; nothing here changes costs, legality or the work budget.
+  struct StallCache {
+    Point closest{};
+    int layer = -1, routed = -1, rips = -1;
+    std::string fields;  // the measured part: at, gaps, verdict, rule (the path is rebuilt from the current probe each time)
+  };
+  std::map<int, StallCache> stall_cache;  // by connection: the last measurement, valid while the probe and the routed copper are as they were
+  long stall_calls_left = 6'000'000;      // obstacle tests the diagnostics may spend in a run: deterministic, so recordings repeat
+
+  std::string stall_fields(int ci, const std::string& reason) {
+    const auto& c = cs[static_cast<std::size_t>(ci)].c;
+    const NetId net = c.net;
+    const model::NetClass& nc = netclass(net);
+    const Coord W = class_width(net);
+    // The narrowest track the rules allow: the board minimum, or where it sets none the 0.1 mm below which no fab is assumed.
+    const Coord Mw = std::min(W, rules.minimums.track_width > 0 ? rules.minimums.track_width : Coord{100'000});
+    const Coord Cmin = std::max<Coord>(rules.minimums.clearance, 0);
+    const Coord C = std::max(nc.clearance, Cmin);
+    std::string f = ",\"reason\":\"" + failure_reason_code(reason) + "\",\"width_nm\":" + jnum(W) + ",\"clearance_nm\":" + jnum(C) + ",\"min_width_nm\":" + jnum(Mw);
+    auto mm = [](Coord v) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%.3g", static_cast<double>(v) / 1e6);
+      return std::string(buf);
+    };
+    const std::string base_rule = "netclass " + nc.name + ": width " + mm(W) + " mm, clearance " + mm(C) + " mm";
+    const bool have = stall_probe.valid && stall_probe.conn == ci && !stall_probe.edge && c.pad_b >= 0;
+    if (!have) return f + ",\"verdict\":\"unknown\",\"rule\":\"" + base_rule + "\"";
+    // The path that was tried, corners only (at most 64): fresh every time. Left out when the search never left the source pad.
+    std::string path;
+    if (stall_probe.path.size() >= 2) {
+      path = ",\"rejected\":[";
+      const std::size_t n = std::min<std::size_t>(stall_probe.path.size(), 64);
+      for (std::size_t i = 0; i < n; ++i)
+        path += (i ? "," : "") + std::string("[") + jnum(stall_probe.path[i][0]) + "," + jnum(stall_probe.path[i][1]) + "," + std::to_string(stall_probe.path[i][2]) + "]";
+      path += "]";
+    }
+    auto& cache = stall_cache[ci];
+    const int fails = cs[static_cast<std::size_t>(ci)].fails;
+    const bool same = cache.layer == stall_probe.layer && cache.closest == stall_probe.closest && cache.routed == res.routed && cache.rips == res.rips;
+    // Measuring costs obstacle tests: do it at a connection's 1st, 2nd, 4th, 8th ... failure, or when nothing has been measured.
+    const bool due = cache.layer < 0 || (!same && (fails & (fails - 1)) == 0);
+    if (!due) return f + path + cache.fields;
+    const Point tp = b.pads[static_cast<std::size_t>(c.pad_b)].pos;
+    long calls = std::min<long>(stall_calls_left, 600'000);
+    const long before = calls;
+    const Way fixed = widest_way(stall_probe.closest, stall_probe.layer, tp, net, W, true, calls);
+    const Way all = widest_way(stall_probe.closest, stall_probe.layer, tp, net, W, false, calls);
+    stall_calls_left -= before - calls;
+    std::string g, verdict = "unknown", rule = base_rule;
+    if (!fixed.budget && !all.budget) {
+      const Coord gf = fixed.reached ? fixed.width : 0, ga = all.reached ? all.width : 0;
+      const Way& show = (gf >= W || ga < gf) && all.reached ? all : fixed;
+      const Point at = show.reached ? show.at : stall_probe.closest;
+      g += ",\"at\":[" + jnum(at.x) + "," + jnum(at.y) + "],\"gap_nm\":" + jnum(ga) + ",\"gap_fixed_nm\":" + jnum(gf) + ",\"gap_layer\":" + std::to_string(show.reached ? show.layer : stall_probe.layer);
+      if (gf >= W) {
+        if (ga < W) {
+          verdict = "contested";  // fixed copper leaves room; routed copper of other nets closes it (negotiation, not a placement edit)
+          rule += "; fixed copper alone leaves " + mm(gf) + " mm";
+        }  // else: the gap takes the net's own width, so something else stopped the search: unknown
+      } else if (gf >= Mw) {
+        verdict = "rule";  // a narrower legal track passes
+        rule += "; a track of " + mm(Mw) + " mm fits (" + mm(gf) + " mm free)";
+      } else if (C > Cmin && gf + 2 * (C - Cmin) >= Mw) {
+        verdict = "rule";  // the board minimum clearance would pass the narrowest track
+        rule += "; at the board minimum clearance " + mm(Cmin) + " mm a track of " + mm(Mw) + " mm fits";
+      } else {
+        verdict = "placement";
+        rule += "; narrowest legal width " + mm(Mw) + " mm, " + mm(gf) + " mm free";
+      }
+    }
+    g += ",\"verdict\":\"" + verdict + "\",\"rule\":\"" + rule + "\"";
+    cache = {stall_probe.closest, stall_probe.layer, res.routed, res.rips, g};
+    return f + path + g;
   }
 
   // Are the connection's pads already joined through fixed copper and other routed connections of its net?
@@ -3397,7 +3835,8 @@ struct Router::Impl {
     }
     if (opt.bus_first) std::stable_partition(order.begin(), order.end(), [&](std::size_t i) { return bundle_of[i] >= 0; });
     // --first-nets keep their place in front.
-    if (!first_net_ids.empty()) std::stable_partition(order.begin(), order.end(), [&](std::size_t i) { return first_net_ids.count(out[i].net) > 0; });
+    if (crit_order_on) std::stable_sort(order.begin(), order.end(), [&](std::size_t i, std::size_t j) { return order_key(out[i].net) < order_key(out[j].net); });
+    else if (!first_net_ids.empty()) std::stable_partition(order.begin(), order.end(), [&](std::size_t i) { return first_net_ids.count(out[i].net) > 0; });
     std::vector<Connection> sorted;
     conn_bundle.assign(out.size(), -1);
     conn_lane.assign(out.size(), -1);
@@ -3963,7 +4402,7 @@ struct Router::Impl {
         soft = false;
         if (search_or_neck(cc, false, necked)) continue;
       }
-      probing = true;
+      lns_probing = true;
       probe_hit = false;
       current = c;
       soft = true;
@@ -3972,7 +4411,7 @@ struct Router::Impl {
       search_or_neck(cc, true, necked);
       soft_mult = 1.0;
       strict_pass = true;
-      probing = false;
+      lns_probing = false;
       soft = false;
       if (!probe_hit) {
         ok = false;
@@ -4365,6 +4804,20 @@ struct Router::Impl {
     return tuned;
   }
 
+  // Lattice samples of the segment a-c over a void of the layer's reference plane (issue #24): how much of it a critical net would run over a split.
+  std::size_t void_samples(int layer, Point a, Point c) const {
+    if (!split_on) return 0;
+    const double len = std::hypot(static_cast<double>(c.x - a.x), static_cast<double>(c.y - a.y));
+    const int n = std::max(1, static_cast<int>(std::ceil(len / static_cast<double>(pitch))));
+    std::size_t hits = 0;
+    for (int k = 0; k <= n; ++k) {
+      const Point p{a.x + static_cast<Coord>(std::llround(static_cast<double>(c.x - a.x) * k / n)), a.y + static_cast<Coord>(std::llround(static_cast<double>(c.y - a.y) * k / n))};
+      const int gx = to_ix(p.x), gy = to_iy(p.y);
+      if (gx >= 0 && gy >= 0 && gx < nx && gy < ny && refmap.over_void[lat_index(layer, gx, gy)]) ++hits;
+    }
+    return hits;
+  }
+
   int smooth_paths() {
     int changed = 0;
     auto octi = [](Point a, Point c) {
@@ -4372,14 +4825,22 @@ struct Router::Impl {
       return dx == 0 || dy == 0 || std::llabs(dx) == std::llabs(dy);
     };
     // Up to two octilinear segments from a to c (straight if already octilinear), or empty if none is legal.
-    auto shortcut = [&](Point a, Point c, int layer, Coord width, NetId net) -> std::vector<Point> {
+    // `max_void`: a critical net's shortcut may not run over more of its reference plane's voids than the path it replaces did (the shortest way is
+    // not the one the search chose when the split cost made it dear).
+    auto shortcut = [&](Point a, Point c, int layer, Coord width, NetId net, std::size_t max_void) -> std::vector<Point> {
       auto legal = [&](Point u, Point v) { return u == v || obs->segment_state(u, v, layer, width, net, false, nullptr) == 0; };
-      if (octi(a, c)) return legal(a, c) ? std::vector<Point>{a, c} : std::vector<Point>{};
+      auto over = [&](const std::vector<Point>& v) {
+        if (!split_on || !crit_split[static_cast<std::size_t>(net)]) return false;
+        std::size_t n = 0;
+        for (std::size_t i = 0; i + 1 < v.size(); ++i) n += void_samples(layer, v[i], v[i + 1]);
+        return n > max_void;
+      };
+      if (octi(a, c)) return legal(a, c) && !over({a, c}) ? std::vector<Point>{a, c} : std::vector<Point>{};
       const Coord dx = c.x - a.x, dy = c.y - a.y, m = std::min(std::llabs(dx), std::llabs(dy));
       const Point diag{a.x + (dx > 0 ? m : -m), a.y + (dy > 0 ? m : -m)};       // diagonal first
-      if (legal(a, diag) && legal(diag, c)) return {a, diag, c};
+      if (legal(a, diag) && legal(diag, c) && !over({a, diag, c})) return {a, diag, c};
       const Point straight{c.x - (dx > 0 ? m : -m), c.y - (dy > 0 ? m : -m)};  // straight first
-      if (legal(a, straight) && legal(straight, c)) return {a, straight, c};
+      if (legal(a, straight) && legal(straight, c) && !over({a, straight, c})) return {a, straight, c};
       return {};
     };
     for (std::size_t ci = 0; ci < cs.size(); ++ci) {
@@ -4402,12 +4863,17 @@ struct Router::Impl {
         std::vector<Point> pts{tr[k].a};
         for (std::size_t q = k; q < e; ++q) pts.push_back(tr[q].b);
         std::vector<Point> npts{pts.front()};
+        // Void samples of the run up to each vertex (critical nets with the split cost only): the part a shortcut would replace is a difference.
+        std::vector<std::size_t> void_to(pts.size(), 0);
+        const bool crit_run = split_on && crit_split[static_cast<std::size_t>(tr[k].net)];
+        if (crit_run)
+          for (std::size_t q = 0; q + 1 < pts.size(); ++q) void_to[q + 1] = void_to[q] + void_samples(tr[k].layer, pts[q], pts[q + 1]);
         std::size_t i = 0;
         while (i + 1 < pts.size()) {
           std::size_t best = i + 1;
           std::vector<Point> via_pts;
           for (std::size_t j = pts.size() - 1; j >= i + 2; --j) {
-            auto sc = shortcut(pts[i], pts[j], tr[k].layer, tr[k].width, tr[k].net);
+            auto sc = shortcut(pts[i], pts[j], tr[k].layer, tr[k].width, tr[k].net, void_to[j] - void_to[i]);
             if (!sc.empty() && sc.size() - 1 < j - i) {
               best = j;
               via_pts.assign(sc.begin() + 1, sc.end());
@@ -4728,12 +5194,14 @@ struct Router::Impl {
 
     std::vector<std::uint8_t> best_unrouted;
     std::vector<std::string> best_why;  // reasons as they stood at the best state; later restarts overwrite cs[].why
+    std::vector<std::vector<NetId>> best_blockers;
     auto snapshot_unrouted = [&]() {
       best_unrouted.assign(cs.size(), 0);
       best_why.assign(cs.size(), {});
+      best_blockers.assign(cs.size(), {});
       for (std::size_t i = 0; i < cs.size(); ++i) {
         best_unrouted[i] = cs[i].routed ? 0 : 1;
-        if (!cs[i].routed) best_why[i] = cs[i].why;
+        if (!cs[i].routed) best_why[i] = cs[i].why, best_blockers[i] = cs[i].blockers;
       }
     };
     // Restarts that keep the lessons (design doc 06 §3.6): when negotiation stalls with budget left, rip
@@ -4939,7 +5407,9 @@ struct Router::Impl {
         if (opt.bus_first) std::stable_partition(order.begin(), order.end(), [&](int c) { return conn_bundle[static_cast<std::size_t>(c)] >= 0; });
       }
       // --first-nets go first again: a restart rips everything, including them.
-      if (!first_net_ids.empty())
+      if (crit_order_on)
+        std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return order_key(cs[static_cast<std::size_t>(x)].c.net) < order_key(cs[static_cast<std::size_t>(y)].c.net); });
+      else if (!first_net_ids.empty())
         std::stable_partition(order.begin(), order.end(), [&](int c) { return first_net_ids.count(cs[static_cast<std::size_t>(c)].c.net) > 0; });
       pending.assign(order.begin(), order.end());
       pending.erase(std::remove_if(pending.begin(), pending.end(), [&](int c) { return cs[static_cast<std::size_t>(c)].routed || cs[static_cast<std::size_t>(c)].dead; }),
@@ -4987,6 +5457,7 @@ struct Router::Impl {
         // A bus lane first tries to run along the neighbour lane routed before it; failing that, the usual searches
         // below run with the neighbour's guide as a preference (doc 05 §38).
         const bool lane = !conn_bundle.empty() && conn_bundle[static_cast<std::size_t>(ci)] >= 0;
+        stall_probe.valid = false;  // a probe is of this attempt only
         bool ok = lane && route_bus_lane(ci);
         if (!ok) ok = search_and_commit(st.c, false);
         std::string reason = why;
@@ -5052,7 +5523,9 @@ struct Router::Impl {
             const Point e = st.c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(st.c.pad_b)].pos : a;
             emit("{\"type\":\"failure\",\"conn\":" + std::to_string(ci) + ",\"net\":" + std::to_string(st.c.net) + ",\"rung\":" +
                  std::to_string(pass > 0 ? 2 : 1) + ",\"cause\":\"no legal path (pass " + std::to_string(pass + 1) + ")\",\"a\":[" + jnum(a.x) + "," +
-                 jnum(a.y) + "],\"b\":[" + jnum(e.x) + "," + jnum(e.y) + "],\"blockers\":[],\"region\":[0,0,0,0]}");
+                 jnum(a.y) + "],\"b\":[" + jnum(e.x) + "," + jnum(e.y) + "],\"blockers\":[],\"blocker_nets\":" + blocker_nets_json(st.blockers) +
+                 ",\"region\":[" + jnum(std::min(a.x, e.x) - 1'500'000) + "," + jnum(std::min(a.y, e.y) - 1'500'000) + "," + jnum(std::max(a.x, e.x) + 1'500'000) + "," +
+                 jnum(std::max(a.y, e.y) + 1'500'000) + "]" + stall_fields(ci, reason) + "}");
           }
         }
         emit_stats("route");
@@ -5202,7 +5675,23 @@ struct Router::Impl {
       }
       res.failures.push_back(b.nets[static_cast<std::size_t>(st.c.net)].name + ": " + b.footprints[static_cast<std::size_t>(pa.footprint)].reference + "." +
                              pa.number + " -> " + to + "  (" + best_why[ci] + ")");
-      res.unrouted.push_back({b.nets[static_cast<std::size_t>(st.c.net)].name, b.footprints[static_cast<std::size_t>(pa.footprint)].reference + "." + pa.number, to});
+      RouteResult::Unrouted u;
+      u.net = b.nets[static_cast<std::size_t>(st.c.net)].name;
+      u.a = b.footprints[static_cast<std::size_t>(pa.footprint)].reference + "." + pa.number;
+      u.b = to;
+      u.why = best_why[ci];
+      u.reason = failure_reason_code(u.why);
+      u.rips = st.rips;
+      u.fails = st.fails;
+      u.pad_a = st.c.pad_a;
+      u.pad_b = st.c.pad_b;
+      u.pos_a = pa.pos;
+      u.pos_b = st.c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(st.c.pad_b)].pos : pa.pos;
+      for (const NetId n : best_blockers[ci]) {
+        if (u.blockers.size() >= 6) break;
+        u.blockers.push_back(b.nets[static_cast<std::size_t>(n)].name);
+      }
+      res.unrouted.push_back(std::move(u));
     }
     res.seconds = elapsed();
     res.nogood_skips = nogood_skips;
@@ -5361,12 +5850,16 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
     vs.push_back({std::move(name), o});
   };
   const bool breakout_list = variants > 1 && base.breakout_portfolio && looks_like_breakout(board);
+  // With advice the list is built that much longer: the advised variants are the next ones of the list (doc 17 §4), the very variants
+  // a plain run with that many more variants would run, so what advice adds is the hints and not a different draw of seeds.
+  const int advised_n = base.advice.active() ? std::clamp(base.advice.variants, 1, 8) : 0;
+  const int list_n = std::min(variants + advised_n, 64);
   if (breakout_list) {
     // Breakout portfolio (D101): every variant has fast bends and the breakout profile (transactions etc.); variant 0 is the plain
     // profile, the others draw order (shortest first, deep pins first, jittered), via cost, crossing cost, direction strength and
     // package penalty from sets with a counter-based generator, so the list is the same on every run.
     add("breakout profile", [&](RouterOptions& o) { o.bend_states = false; });
-    for (int k = 1; static_cast<int>(vs.size()) < std::min(variants, 64); ++k) {
+    for (int k = 1; static_cast<int>(vs.size()) < list_n; ++k) {
       const RngStream rg(base.seed, 0xB0B0u, static_cast<std::uint64_t>(k));
       auto pick_of = [&](std::uint64_t slot, auto... v) {
         const std::array<double, sizeof...(v)> a{static_cast<double>(v)...};
@@ -5399,7 +5892,7 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
   // (package_pen below: tracks inside ball-grid packages cost more, doc 16 F3; +4 boards of 57 at 3 pitches on srj20)
   // Beyond the designed eight: seeded diversifications (fast bends, jittered order; via cost, crossing cost and
   // escape planning cycle with the index).
-  for (int k = 0; static_cast<int>(vs.size()) < std::min(variants, 64); ++k) {
+  for (int k = 0; static_cast<int>(vs.size()) < list_n; ++k) {
     static const double kVia[3] = {0.4, 1.0, 2.5}, kSoft[3] = {0.5, 1.0, 2.0};
     add("seeded " + std::to_string(k), [&](RouterOptions& o) {
       o.bend_states = false;
@@ -5422,6 +5915,7 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
   } else {
     for (int i = 0; i < std::clamp(variants, 1, static_cast<int>(vs.size())); ++i) chosen.push_back(i);
   }
+  std::vector<Variant> advised_src;  // the variants that carry the advice
   {
     std::vector<Variant> sel;
     for (std::size_t k = 0; k < chosen.size(); ++k) {
@@ -5429,7 +5923,37 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
       if (k > 0) sel.back().o.sink = nullptr;
       else sel.back().o.sink = base.sink;
     }
+    if (advised_n > 0) {
+      std::vector<char> taken(vs.size(), 0);
+      for (int c : chosen) taken[static_cast<std::size_t>(c)] = 1;
+      for (std::size_t i = 0; i < vs.size() && static_cast<int>(advised_src.size()) < advised_n; ++i)
+        if (!taken[i]) advised_src.push_back(vs[i]);
+      // The list had no more variants to give: advise copies of the first ones that run.
+      for (std::size_t j = 0; static_cast<int>(advised_src.size()) < advised_n && j < sel.size(); ++j) advised_src.push_back(sel[j]);
+    }
     vs = std::move(sel);
+  }
+  // Advice (doc 17): extra variants that carry the hints. They come after all the others and their indices start at kAdvisedIndex, so
+  // on a tie in the total order the unadvised variant wins: advice can only win by routing more, or the same with fewer vias or
+  // shorter copper (rule 4). Without advice nothing here runs, and the portfolio is what it was.
+  if (base.advice.active()) {
+    const auto& a = base.advice;
+    for (std::size_t j = 0; j < advised_src.size(); ++j) {
+      Variant v = advised_src[j];
+      RouterOptions& o = v.o;
+      o.sink = nullptr;
+      o.priority.insert(o.priority.end(), a.priority.begin(), a.priority.end());
+      for (const auto& f : a.first_nets)
+        if (std::find(o.first_nets.begin(), o.first_nets.end(), f) == o.first_nets.end()) o.first_nets.push_back(f);
+      o.no_track_layers |= a.no_track_layers;
+      if (o.layer_cost_pm.size() < a.layer_cost_pm.size()) o.layer_cost_pm.resize(a.layer_cost_pm.size(), 1000);
+      for (std::size_t l = 0; l < a.layer_cost_pm.size(); ++l) o.layer_cost_pm[l] = std::max(o.layer_cost_pm[l], a.layer_cost_pm[l]);
+      o.extra_zones.insert(o.extra_zones.end(), a.zones.begin(), a.zones.end());
+      o.extra_rules.insert(o.extra_rules.end(), a.rules.begin(), a.rules.end());
+      v.name += " + advice";
+      vs.push_back(std::move(v));
+      chosen.push_back(kAdvisedIndex + static_cast<int>(j));
+    }
   }
   // Spread variants over the visible GPUs (cost-to-go fields); CPU-only when none.
   if (base.gpu_device >= 0) {
@@ -5732,6 +6256,18 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
 
 int portfolio_size() { return 8; }
 
+bool route_result_better(const RouteResult& a, const RouteResult& b) {
+  if (a.routed != b.routed) return a.routed > b.routed;
+  if (a.bus_left != b.bus_left) return a.bus_left < b.bus_left;
+  if (a.vias.size() != b.vias.size()) return a.vias.size() < b.vias.size();
+  auto length = [](const RouteResult& r) {
+    double l = 0;
+    for (const auto& t : r.tracks) l += std::hypot(static_cast<double>(t.b.x - t.a.x), static_cast<double>(t.b.y - t.a.y));
+    return l;
+  };
+  return length(a) < length(b);
+}
+
 WorkCounts& WorkCounts::operator+=(const WorkCounts& o) {
   expansions += o.expansions;
   flood_cells += o.flood_cells;
@@ -5764,6 +6300,12 @@ const char* work_phase_name(WorkPhase p) {
 Router::Router(const model::Board& board, const model::DesignRules& rules, RouterOptions opt) : in_(board), rules_(rules), opt_(opt) {}
 
 RouteResult Router::run() {
+  if (!opt_.extra_rules.empty()) {  // advice regions: the rules of this router only, the caller's stay as they are
+    model::DesignRules r = rules_;
+    r.custom.insert(r.custom.end(), opt_.extra_rules.begin(), opt_.extra_rules.end());
+    Impl impl(in_, r, opt_);
+    return impl.run();
+  }
   Impl impl(in_, rules_, opt_);
   return impl.run();
 }

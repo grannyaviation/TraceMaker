@@ -4,6 +4,7 @@
 #include "geom/shape.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <stdexcept>
@@ -298,6 +299,7 @@ class Reader {
       }
     for (NodeId p : d_.find_all(f, "property")) {
       const std::string key = d_.str_at(p, 1);
+      fp.properties.emplace_back(key, d_.str_at(p, 2));
       if (key == "Reference") fp.reference = d_.str_at(p, 2);
       else if (key == "Value") fp.value = d_.str_at(p, 2);
       else if (key == "Description" && fp.description.empty()) fp.description = d_.str_at(p, 2);
@@ -651,6 +653,8 @@ class Reader {
     for (NodeId fill : d_.find_all(z, "filled_polygon")) {
       int li = -1;
       if (NodeId l = d_.find(fill, "layer"); l != kNoNode) li = b_.copper_index(d_.str_at(l, 1));
+      // KiCad 5 omits the fill layer; only a single copper layer makes it unambiguous.
+      else if (std::popcount(zone.copper) == 1) li = std::countr_zero(zone.copper);
       std::vector<Point> pts;
       if (NodeId p = d_.find(fill, "pts"); p != kNoNode) read_pts(p, pts, origin, angle);
       zone.fills.emplace_back(li, std::move(pts));
