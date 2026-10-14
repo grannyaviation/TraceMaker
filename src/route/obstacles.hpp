@@ -47,6 +47,9 @@ class Obstacles {
   bool positional_rules() const { return re_->positional_disallow(); }
   bool track_disallowed(const geom::Shape& s, int layer, Coord width, model::NetId net) const;
   bool via_disallowed(geom::Point p, Coord d, model::NetId net, int l0, int l1, model::ViaType type) const;
+  // The gap two new vias of `net` need between their holes' edges: the board's hole-to-hole minimum, or a custom
+  // hole_to_hole rule that matches them. KiCad applies it to every pair of holes, a path's own vias included.
+  Coord via_pair_hole_to_hole(geom::Point a, Coord drill_a, geom::Point b, Coord drill_b, model::NetId net) const;
 
   // Registers committed copper (the board copy must already contain the track/via at `index`). Returns the
   // copper item index.
@@ -115,7 +118,10 @@ class Obstacles {
   int routed_copper_part(const geom::Shape& s, int layer, model::NetId net, drc::ItemKind kind, bool soft, std::vector<int>* owners) const;
   int routed_via_holes_part(const geom::Shape& s, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
   int routed_hole_copper_part(const geom::Shape& h, int layer, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
-  int routed_hole_to_hole_part(const geom::Shape& hole, bool soft, std::vector<int>* owners) const;
+  int routed_hole_to_hole_part(const geom::Shape& hole, model::NetId net, bool soft, std::vector<int>* owners) const;
+  // Hole to hole between a new via's hole (centre p, radius hole_r, of `net`) and the hole of `other` (null: an
+  // NPTH without copper): the board minimum, or a custom hole_to_hole rule that matches the pair.
+  Coord via_hole_to_hole(geom::Point p, Coord hole_r, model::NetId net, const drc::CopperItem* other) const;
   std::int32_t via_hole_code(geom::Point p, Coord drill, Coord margin, model::NetId probe_net, std::int32_t code) const;
 
   model::Board& b_;

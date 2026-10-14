@@ -30,6 +30,10 @@ class RuleEngine {
   // Required clearance between a hole and a copper item.
   Coord hole_clearance(const CopperItem* hole_owner, const CopperItem& other, int layer) const;
   Coord hole_to_hole(const CopperItem* a, const CopperItem* b) const;
+  // Largest hole-to-hole any pair could need (board minimum or a custom rule), for spatial-index inflation; and
+  // whether a custom hole_to_hole rule exists (without one, hole_to_hole() is the board minimum for every pair).
+  Coord max_hole_to_hole() const;
+  bool any_custom_hole_to_hole() const { return !min_rules_[HoleToHole].empty(); }
   Coord edge_clearance(const CopperItem& a, int layer) const;
   // Minimum and maximum track width (max = 0: none).
   std::pair<Coord, Coord> track_width(const CopperItem& t, int layer) const;

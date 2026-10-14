@@ -1518,6 +1518,43 @@ struct Router::Impl {
     long expanded = 0;
     const long exp_cap = expansion_cap > 0 ? expansion_cap : opt.max_expansions;
     std::size_t goal = SIZE_MAX;
+    // A via at (cx, cy) must keep its hole hole-to-hole clear of the path's previous via, which the board checks do
+    // not know yet: a wide net hopping a narrow gap on two vias put them 0.275 mm apart with 0.3 mm drills
+    // (sensor_ts V5V). Back along the parents to the last layer change: `close` when it is nearer than the gap, `same`
+    // on the very spot, with the layers it joined (as KiCad, vias that share no layer are no pair, nor two micro vias).
+    // A second through via on the spot is the same via (commit merges it); a blind or buried one there that shares a
+    // layer is a co-located hole (KiCad: holes_co_located).
+    // ponytail: looks back only as many steps as the gap spans; a path that loops back to its own via further on is
+    // left to commit()'s exact check of the path's holes.
+    const Coord vv_gap = vdrill + obs->via_pair_hole_to_hole(sp, vdrill, sp, vdrill, net);  // centre to centre
+    const int vv_steps = static_cast<int>(vv_gap / pitch) + 2;
+    struct PrevVia {
+      bool close = false, same = false;
+      int l0 = 0, l1 = 0;
+    };
+    auto prev_via = [&](std::size_t s0, int vx, int vy) {
+      PrevVia pv;
+      std::size_t t = s0;
+      for (int k = 0; k < vv_steps;) {
+        const std::int32_t pp = sn[t].parent;
+        if (pp < 0) break;
+        const std::size_t p = static_cast<std::size_t>(pp);
+        const int lt = static_cast<int>((t / D) / cells), lp = static_cast<int>((p / D) / cells);
+        if ((t / D) % cells != (p / D) % cells) {
+          ++k;
+        } else if (lt != lp) {  // layer change: a via at t's cell
+          const std::int64_t vc = static_cast<std::int64_t>((t / D) % cells);
+          const std::int64_t dx = (static_cast<std::int64_t>(vc % w.w) - vx) * pitch, dy = (static_cast<std::int64_t>(vc / w.w) - vy) * pitch;
+          pv.same = dx == 0 && dy == 0;
+          pv.close = !pv.same && dx * dx + dy * dy < vv_gap * vv_gap;
+          pv.l0 = std::min(lt, lp);
+          pv.l1 = std::max(lt, lp);
+          break;
+        }
+        t = p;
+      }
+      return pv;
+    };
     while (!open.empty()) {
       const auto [f, s] = open.top();
       open.pop();
@@ -1582,7 +1619,8 @@ struct Router::Impl {
         }
         return false;
       };
-      const std::int64_t vextra = (opt.allow_vias && nl > 1 && (blind_for(net) || micro_for(net) || via_useful())) ? via_cost_at(w, cx, cy, net, vd, vdrill) : -1;
+      const PrevVia pv = prev_via(s, cx, cy);  // a through via here shares every layer with it
+      const std::int64_t vextra = (!pv.close && opt.allow_vias && nl > 1 && (blind_for(net) || micro_for(net) || via_useful())) ? via_cost_at(w, cx, cy, net, vd, vdrill) : -1;
       if (vextra < 0 && (blind_for(net) || micro_for(net))) {
         // Through via blocked: a micro via to the next layer from an outer one, or a blind or buried via spanning
         // only the layers between (dearer: costs more to make).
@@ -1591,6 +1629,9 @@ struct Router::Impl {
         for (int l2 = 0; l2 < nl; ++l2) {
           // A layer without tracks is a landing only where the via itself ends the connection (in a zone fill).
           if (l2 == l || (!layer_ok(net, l2) && !target(l2, ci))) continue;
+          if ((pv.close || pv.same) && std::min(l, l2) <= pv.l1 && pv.l0 <= std::max(l, l2) &&
+              !(micro_for(net) && micro_span(l, l2) && micro_span(pv.l0, pv.l1)))
+            continue;  // shares a layer with the path's previous via, on it or too close to it
           int vs = 2;
           if (micro_for(net) && micro_span(l, l2))
             vs = obs->via_state_span(vp, micro_diameter(net), micro_drill(net), net, vm, soft, nullptr, std::min(l, l2), std::max(l, l2), model::ViaType::Micro);
@@ -1684,6 +1725,27 @@ struct Router::Impl {
       if (sn[static_cast<std::size_t>(s)].parent < 0) break;
     }
     std::reverse(path.begin(), path.end());
+    return true;
+  }
+
+  // The holes of one route's new vias, pairwise at least hole to hole apart (the project's rule: board minimum or
+  // custom hole_to_hole, whatever the severity). The board checks of each via cannot see the others of the same
+  // route, so this is the only test between them. As KiCad's DRC: vias that share no copper layer (blind and buried
+  // vias are drilled before lamination) and two micro vias (laser, not drilled) are not a pair.
+  struct NewHole {
+    Point p;
+    Coord drill;
+    int l0, l1;  // copper span
+    bool micro;
+  };
+  bool holes_spaced(const std::vector<NewHole>& holes, NetId net) const {
+    for (std::size_t i = 0; i < holes.size(); ++i)
+      for (std::size_t j = i + 1; j < holes.size(); ++j) {
+        const NewHole &a = holes[i], &q = holes[j];
+        if ((a.micro && q.micro) || a.l1 < q.l0 || q.l1 < a.l0) continue;
+        const Coord req = obs->via_pair_hole_to_hole(a.p, a.drill, q.p, q.drill, net);
+        if (a.p == q.p || geom::closer_than(geom::Shape::point(a.p, a.drill / 2), geom::Shape::point(q.p, q.drill / 2), req)) return false;
+      }
     return true;
   }
 
@@ -1847,6 +1909,24 @@ struct Router::Impl {
     }
     if (!ok) {
       commit_why = "exact check rejected the lattice path";
+      return false;
+    }
+    // Two through vias on one spot (two layer changes there) are one via; a stack of micro or blind vias stays.
+    for (std::size_t k = vias.size(); k-- > 1;)
+      if (vias[k] == vias[k - 1] && !via_micro[k] && !via_micro[k - 1] && via_layers[k] == std::pair{0, nl - 1} && via_layers[k - 1] == via_layers[k]) {
+        const auto at_k = static_cast<std::ptrdiff_t>(k);
+        vias.erase(vias.begin() + at_k);
+        via_span.erase(via_span.begin() + at_k);
+        via_layers.erase(via_layers.begin() + at_k);
+        via_micro.erase(via_micro.begin() + at_k);
+      }
+    // The path's own holes against each other: each via above was checked against the board only.
+    std::vector<NewHole> holes;
+    for (std::size_t k = 0; k < vias.size(); ++k)
+      holes.push_back({vias[k], via_micro[k] ? micro_drill(net) : vdrill, via_layers[k].first, via_layers[k].second, via_micro[k] != 0});
+    for (const Point v : pad_vias) holes.push_back({v, in_pad_drill(), 0, nl - 1, false});
+    if (!holes_spaced(holes, net)) {
+      commit_why = "two vias of the path closer than hole to hole";
       return false;
     }
     if (lns_probing) {  // completion LNS: the caller lifts the victims itself and commits this path afterwards
@@ -2894,7 +2974,9 @@ struct Router::Impl {
         if (dbg) std::fprintf(stderr, "   pair half %s: via fails at %.4f %.4f\n", b.nets[static_cast<std::size_t>(h.net)].name.c_str(), nm_to_mm(v.x), nm_to_mm(v.y));
         return false;
       }
-    return true;
+    std::vector<NewHole> holes;
+    for (const Point v : h.vias) holes.push_back({v, vdrill, 0, nl - 1, false});  // the pair router's vias are through vias
+    return holes_spaced(holes, h.net);
   }
 
   bool route_pair(int ia, int ib) {

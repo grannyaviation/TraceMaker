@@ -925,6 +925,12 @@ Coord RuleEngine::hole_to_hole(const CopperItem* a, const CopperItem* b) const {
   return req;
 }
 
+Coord RuleEngine::max_hole_to_hole() const {
+  Coord req = r_.minimums.hole_to_hole;
+  for (const auto& m : min_rules_[HoleToHole]) req = std::max(req, m.min);
+  return req;
+}
+
 Coord RuleEngine::edge_clearance(const CopperItem& a, int layer) const {
   Coord req = r_.minimums.copper_edge_clearance;
   if (auto c = custom_min(EdgeClearance, &a, nullptr, layer)) req = *c;
