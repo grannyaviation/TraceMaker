@@ -333,3 +333,23 @@ TEST_CASE("Courtyard rings far from an item do not change its even/odd answer", 
   CHECK(hit({40 * M, 5 * M}));
   CHECK_FALSE(hit({25 * M, 5 * M}));
 }
+
+TEST_CASE("Courtyards are shrunk by KiCad's 5 um polygonization error before the test", "[rules][drc][rule_geometry][courtyard_tol]") {
+  // sensor_ts (layout-farm aiu-smoke-fix5): R186's courtyard, a rectangle 0.94 x 1.86 mm round (159.25, 125.25), and
+  // a 0.6 mm via at (158.84, 124.025) that reaches 5 um into it. KiCad (FOOTPRINT::BuildCourtyardCaches deflates by
+  // 0.005 mm) counts it out at 5 um and in at 10 um (kicad-cli DRC on that board, the via moved by 5 um); so does
+  // the rule engine now. Before, any overlap counted, and the via took the courtyard rule's smaller clearance.
+  auto b = court_board();
+  model::Graphic r;
+  r.kind = model::Graphic::Kind::Rect;
+  r.layer = "F.CrtYd";
+  r.a = {158'780'000, 124'320'000};
+  r.b = {159'720'000, 126'180'000};
+  add_graphic(b, r);
+  const auto cache = drc::build_courtyards(b);
+  auto via = [&](Coord y) { return copper(Shape::point({158'840'000, y}, 300'000)); };
+  CHECK_FALSE(drc::courtyard_matches(via(124'025'000), cache, "R*", "intersectsCourtyard"));  // 5 um in: out
+  CHECK(drc::courtyard_matches(via(124'030'000), cache, "R*", "intersectsCourtyard"));        // 10 um in: in
+  CHECK_FALSE(drc::courtyard_matches(via(124'020'000), cache, "R*", "intersectsCourtyard"));  // touching: out
+  CHECK(drc::courtyard_matches(copper(Shape::point({159'250'000, 125'250'000}, 1'000)), cache, "R*", "intersectsCourtyard"));
+}

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <utility>
 
+#include "geom/clip.hpp"
 #include "model/rules.hpp"
 
 namespace tmk::drc {
@@ -64,7 +65,7 @@ bool contains_twice(const Rings& rings, i128 x, i128 y) {
   }
   return inside;
 }
-bool contains(const Rings& rings, Point p) {
+bool in_rings(const Rings& rings, Point p) {
   return contains_twice(rings, 2 * static_cast<i128>(p.x), 2 * static_cast<i128>(p.y));
 }
 bool strict_inside(Point p, const Shape& shape) {
@@ -78,7 +79,7 @@ bool proper_crossing(Point a, Point b, Point c, Point d) {
 }
 
 bool segment_enclosed(Point a, Point b, const Rings& rings) {
-  if (!contains(rings, a) || !contains(rings, b)) return false;
+  if (!in_rings(rings, a) || !in_rings(rings, b)) return false;
   if (a == b) return true;
   if (boundaries(rings, [&](Point c, Point d) { return proper_crossing(a, b, c, d); })) return false;
   // With proper crossings excluded, the only places membership can change are
@@ -110,7 +111,7 @@ bool segment_enclosed(Point a, Point b, const Rings& rings) {
 
 bool collides(const Shape& shape, const Rings& rings) {
   if (shape.pts.empty() || rings.empty()) return false;
-  if (contains(rings, shape.pts.front())) return true;
+  if (in_rings(rings, shape.pts.front())) return true;
   if (shape.closed)
     for (const auto& ring : rings)
       if (!ring.empty() && geom::point_in_polygon(ring.front(), shape.pts)) return true;
@@ -233,6 +234,12 @@ CourtyardRegion prepare_courtyard(const model::Board& board, const model::Footpr
     for (auto& ring : rings) region.parts.push_back({std::move(ring)});
   else
     region.parts.push_back(std::move(rings));
+  // KiCad shrinks the courtyard by its polygonization error before any test (FOOTPRINT::BuildCourtyardCaches:
+  // Inflate(-maxError, CHAMFER_ACUTE_CORNERS), maxError 0.005 mm), so an item that reaches 5 um or less into the
+  // outline is not in it. Without this a via 5 um into a resistor's courtyard took a courtyard rule's 0.2 mm where
+  // KiCad asks 0.6 mm (sensor_ts, hv-31-50-in-protector against hv-31-50-outer).
+  for (auto& part : region.parts) part = geom::offset(geom::even_odd(part), -kCourtyardError, geom::Corners::Chamfer, kCourtyardError);
+  std::erase_if(region.parts, [](const Rings& part) { return part.empty(); });
   for (const auto& part : region.parts) {
     auto& boxes = region.ring_boxes.emplace_back();
     for (const auto& ring : part) {

@@ -1148,3 +1148,27 @@ TEST_CASE("constraint flags in brackets: within_diff_pairs is kept, anything els
   CHECK(warned("rule 'no value': cannot read value of max"));
   CHECK(warned("rule 'unknown flag': cannot read value of some_new_flag"));
 }
+
+TEST_CASE("courtyard rules: a via 5 um into a courtyard is outside it as in KiCad", "[rules][route][courtyard_tol]") {
+  // sensor_ts (layout-farm aiu-smoke-fix5): a V_MOUNT via 0.457 mm from U69's pad reached 5 um into R186's courtyard;
+  // the router took hv-31-50-in-protector's 0.2 mm (insideCourtyard) where KiCad, which shrinks courtyards by 5 um,
+  // asks hv-31-50-outer's 0.6 mm. Here: SIG keeps 0.6 mm, 0.2 mm inside R9's courtyard (y >= 5.30); a GND pad's edge
+  // is 0.457 mm left of the via's.
+  const std::string parts =
+      "  (footprint \"U\" (layer \"F.Cu\") (at 9.443 5.005)\n"
+      "    (property \"Reference\" \"U1\" (at 0 0) (layer \"F.SilkS\"))\n"
+      "    (pad \"1\" smd rect (at 0 0) (size 0.4 0.3) (layers \"F.Cu\") (net 2 \"GND\"))\n  )\n"
+      "  (footprint \"R\" (layer \"F.Cu\") (at 10.5 6.15)\n"
+      "    (property \"Reference\" \"R9\" (at 0 0) (layer \"F.SilkS\"))\n"
+      "    (fp_rect (start -0.5 -0.85) (end 0.5 0.85) (layer \"F.CrtYd\") (stroke (width 0.05) (type solid)))\n  )\n";
+  const std::string rules =
+      "(version 1)\n(rule \"outer\" (condition \"A.NetName == 'SIG'\") (constraint clearance (min 0.6mm)))\n"
+      "(rule \"in-court\" (condition \"A.NetName == 'SIG' && A.insideCourtyard('R9')\") (constraint clearance (min 0.2mm)))\n";
+  const Files f("court_tolerance", board_text(parts), rules);
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto dr = io::read_design_rules(f.pcb.string());
+  const route::Obstacles obs(lb.board, dr);
+  const Coord d = 600'000, drill = 300'000;
+  CHECK(obs.via_state({10'400'000, 5'005'000}, d, drill, 1, 0, false) == 2);  // 5 um in: outside, 0.6 mm > 0.457
+  CHECK(obs.via_state({10'400'000, 5'010'000}, d, drill, 1, 0, false) == 0);  // 10 um in: inside, 0.2 mm
+}
