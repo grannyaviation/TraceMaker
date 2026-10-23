@@ -602,3 +602,65 @@ TEST_CASE("stitch: a signal via gets one plane via within the distance", "[passe
   CHECK(r.vias.empty());
   CHECK(r.returns[0].stitched_after == 0);
 }
+
+// Six-layer stack-up (TM-1c): a laser via ties a surface to its adjacent layer only, so it is no return for a side
+// change and a laser signal via needs no through via beside it. Four layers here, GND planes on the two inner layers.
+namespace {
+const std::string kInnerGnd = gnd_zone("In1.Cu") + gnd_zone("In2.Cu");
+const char* kLaserGnd = "  (via micro (at 15.8 5) (size 0.3) (drill 0.15) (layers \"F.Cu\" \"In1.Cu\") (net 1))\n";
+const char* kThroughSig = "  (via (at 15 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 3))\n";
+}  // namespace
+
+TEST_CASE("stitch: a laser GND via is no return for a side change", "[passes][stitch]") {
+  const std::string sig = seg(10, 5, 15, 5, 3) + seg(15, 5, 20, 5, 3, 0.2, "B.Cu") + kThroughSig;
+  passes::StitchOptions o;
+  o.returns = {{3, 1, 2 * mm, "option"}};
+  // The laser GND via is 0.8 mm from the signal via and joins F.Cu to In1 only: it does not count, a through via is added.
+  const auto l = load("return_laser", board_text(kGndPin + kInnerGnd + sig + kLaserGnd, 4));
+  const auto r = passes::stitch_vias(l.board, l.rules, o);
+  REQUIRE(r.vias.size() == 1);
+  CHECK(r.return_path[0] == 1);
+  CHECK(r.vias[0].net == 1);
+  CHECK(r.vias[0].layer_top == 0);
+  CHECK(r.vias[0].layer_bottom == 3);  // a through via
+  CHECK(r.returns[0].signal_vias == 1);
+  CHECK(r.returns[0].stitched_before == 0);
+  CHECK(r.returns[0].stitched_after == 1);
+  // Control: a through GND via at the same place counts, and nothing is added.
+  const auto c = load("return_through", board_text(kGndPin + kInnerGnd + sig +
+                      "  (via (at 15.8 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))\n", 4));
+  const auto rc = passes::stitch_vias(c.board, c.rules, o);
+  CHECK(rc.vias.empty());
+  CHECK(rc.returns[0].stitched_before == 1);
+}
+
+TEST_CASE("stitch: a laser signal via is not served, a through signal via beside it is", "[passes][stitch]") {
+  const std::string sig = seg(10, 5, 15, 5, 3) + seg(15, 5, 22, 5, 3, 0.2, "B.Cu") +
+                          "  (via micro (at 15 5) (size 0.3) (drill 0.15) (layers \"F.Cu\" \"In1.Cu\") (net 3))\n";
+  passes::StitchOptions o;
+  o.returns = {{3, 1, 2 * mm, "option"}};
+  const auto l = load("return_signal_laser", board_text(kGndPin + kInnerGnd + sig, 4));
+  const auto r = passes::stitch_vias(l.board, l.rules, o);
+  CHECK(r.vias.empty());  // the laser via is the only signal via and needs no through via beside it
+  CHECK(r.returns[0].signal_vias == 0);
+  const auto m = load("return_signal_mixed", board_text(kGndPin + kInnerGnd + sig +
+                      "  (via (at 22 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 3))\n", 4));
+  const auto rm = passes::stitch_vias(m.board, m.rules, o);
+  REQUIRE(rm.vias.size() == 1);
+  CHECK(rm.returns[0].signal_vias == 1);
+  const Coord dx = rm.vias[0].pos.x - 22 * mm, dy = rm.vias[0].pos.y - 5 * mm;
+  CHECK(dx * dx + dy * dy <= 4 * mm * mm);  // beside the through via, not the laser one
+}
+
+TEST_CASE("stitch: a laser GND via does not serve a grid site", "[passes][stitch]") {
+  passes::StitchOptions o;
+  o.planes = true;
+  o.pitch = 5 * mm;
+  const auto plain = load("grid_laser0", board_text(kGndPin + kInnerGnd, 4));
+  const auto laser = load("grid_laser1", board_text(kGndPin + kInnerGnd +
+                          "  (via micro (at 12.5 7.5) (size 0.3) (drill 0.15) (layers \"F.Cu\" \"In1.Cu\") (net 1))\n", 4));
+  const auto a = passes::stitch_vias(plain.board, plain.rules, o);
+  const auto b = passes::stitch_vias(laser.board, laser.rules, o);
+  CHECK(a.site_served == 1);  // the plated pin at (3, 17)
+  CHECK(b.site_served == 1);  // the laser via at the site (12.5, 7.5) ties two layers only, not the plane's span
+}
