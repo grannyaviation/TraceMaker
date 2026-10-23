@@ -390,6 +390,11 @@ OPTIONS:
           --stitch-pitch FLOAT:POSITIVE
                               Grid pitch of plane stitching vias, mm (default 5.08, the
                               catalogue's value)
+          --stitch-coverage FLOAT:POSITIVE
+                              Plane stitching: the largest empty circle the grid may leave, mm
+                              (default: the grid's own radius, pitch / sqrt 2, plus 0.8 %). A
+                              grid site the exact check refuses moves on rings round it as far
+                              as this allows, else it is a gap
           --stitch-distance FLOAT:POSITIVE
                               Return-path stitching: largest distance from a signal via to its
                               plane via, mm (default: the rule's, else 5.08)
@@ -787,12 +792,22 @@ OPTIONS:
           --rules-override TEXT:FILE
                               User override file for --component-rules (JSON, doc 15 §6.3):
                               disable rules, assert/deny categories, set parameters
+          --tidy              full/refine/auto: after placing, snap parts to a grid, align
+                              nearly aligned parts exactly and turn clusters of two-pad
+                              passives to one axis; only exactly legal moves (doc 04 §11)
+          --tidy-grid FLOAT:NONNEGATIVE
+                              With --tidy: grid for footprint origins, mm (0 = no snap)
+          --tidy-align FLOAT:NONNEGATIVE
+                              With --tidy: align body centres closer than this, mm (0 = no
+                              alignment)
           --json TEXT         Write the placement report as JSON
   -v,     --verbose           Log the spreading iterations
           --route-check INT   Route the input and the new placement with this work budget (A*
                               expansions per variant) and keep the placement that routes more
                               connections (0 = off)
           --route-threads INT Router portfolio size for --route-check
+          --skip-net TEXT ... Nets the --route-check router leaves out (poured or hand-routed
+                              nets; repeatable)
           --no-fallback       Full mode: keep the result even if some parts could not be placed
           --debug-part TEXT   Print the legality map of one part and exit
           --tempering         Parallel tempering over the annealing runs (replica exchange)
@@ -811,6 +826,10 @@ OPTIONS:
           --flip-rate FLOAT   With --flip: share of annealing moves that are flips
           --keep-side TEXT    With --flip: references that must stay on their side (comma
                               separated)
+          --low TEXT          References that footprint keepouts whose name contains low-ok do
+                              not apply to (comma separated)
+          --groups TEXT       JSON file: groups of references, leader first, each placed as one
+                              rigid unit (layout-farm IC clusters)
           --debug-flip TEXT   Write the input with these footprints (comma separated
                               references, or 'all') flipped in place, KiCad style, and exit
           --rounds INT        routable: re-placement rounds after the seeds

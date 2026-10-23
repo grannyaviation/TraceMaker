@@ -898,6 +898,7 @@ RouteJobResult run_route_job(RouteJob job) {
       passes::StitchOptions so;
       so.planes = stitch_planes;
       so.pitch = static_cast<Coord>((job.stitch_pitch_mm > 0 ? job.stitch_pitch_mm : crules::builtin_catalogue().stitch_via_within_mm) * 1e6);
+      so.coverage = static_cast<Coord>(job.stitch_coverage_mm * 1e6);
       so.returns = stitch_returns;
       so.work_limit = job.pass_work;
       model::Board bd = *route_board;
@@ -937,16 +938,16 @@ RouteJobResult run_route_job(RouteJob job) {
                 mm(r.distance).c_str(), r.signal_vias, r.stitched_before, now));
       }
       if (stitch_return && sr.returns.empty()) log("  stitching: no net needs a reference plane (component rules of kind reference_plane, or --stitch-return)");
-      log(fmt("stitch vias: %d plane, %d return-path; %d grid sites in overlapping fills (%d already tied, %d blocked), %d dropped after the refill, "
+      log(fmt("stitch vias: %d plane, %d return-path; %d grid sites in overlapping fills (%d already tied, %d blocked, %d of them moved on a ring, %d gaps), %d dropped after the refill, "
               "%ld checks%s%s",
-              grid, ret, sr.sites, sr.site_served, sr.site_blocked, sr.dropped, sr.checks, sr.out_of_work ? " (work budget used up)" : "",
+              grid, ret, sr.sites, sr.site_served, sr.site_blocked, sr.site_moved, static_cast<int>(sr.gaps.size()), sr.dropped, sr.checks, sr.out_of_work ? " (work budget used up)" : "",
               sr.discarded ? "; withdrawn: the refill with the vias cut a fill"
               : !sr.vias.empty() && !kept ? fmt("; discarded: a net has more unconnected items with them (%d in all, %d without)", after, before).c_str() : ""));
       nlohmann::json gaps = nlohmann::json::array();
       for (const auto& g : sr.gaps)
         gaps.push_back({{"net", bd.nets[static_cast<std::size_t>(g.net)].name}, {"x_mm", nm_to_mm(g.pos.x)}, {"y_mm", nm_to_mm(g.pos.y)}});
       stitch_summary = {{"plane_vias", grid}, {"return_path_vias", ret}, {"sites", sr.sites}, {"sites_already_tied", sr.site_served},
-                        {"sites_blocked", sr.site_blocked}, {"gaps", gaps}, {"dropped", sr.dropped}, {"checks", sr.checks}, {"out_of_work", sr.out_of_work},
+                        {"sites_blocked", sr.site_blocked}, {"sites_moved", sr.site_moved}, {"shift_bound_mm", nm_to_mm(passes::stitch_shift_bound(so.pitch, passes::stitch_coverage(so)))}, {"gaps", gaps}, {"dropped", sr.dropped}, {"checks", sr.checks}, {"out_of_work", sr.out_of_work},
                         {"kept", kept}, {"pitch_mm", nm_to_mm(so.pitch)}, {"nets", nets}, {"return_paths", rets}};
       if (kept) {
         for (std::size_t i = 0; i < sr.vias.size(); ++i) {

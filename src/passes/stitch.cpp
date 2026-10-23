@@ -54,6 +54,11 @@ Coord stitch_shift_bound(Coord pitch, Coord coverage) {
   return d > 0 ? static_cast<Coord>(d) : 0;
 }
 
+Coord stitch_coverage(const StitchOptions& opt) {
+  // The farm's gate over its grid: 6.2 mm over 6.15 mm = 0.8 % above the grid's own radius.
+  return opt.coverage > 0 ? opt.coverage : static_cast<Coord>(static_cast<double>(opt.pitch) / std::sqrt(2.0) * 1.008);
+}
+
 StitchResult stitch_vias(const model::Board& board, const model::DesignRules& rules, const StitchOptions& opt) {
   StitchResult res;
   for (const auto& r : opt.returns) res.returns.push_back({r.signal, r.plane, r.source, r.distance, 0, 0, 0});
@@ -110,8 +115,11 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
   // ties only the layers of its span (on six layers an outer layer to its adjacent plane), so it is no return for a
   // side change and serves no grid site.
   std::map<NetId, std::vector<Point>> ties;
+  // shortcut: through-only is conservative. A laser or blind via whose span covers every layer the net fills at the site
+  // would serve too; upgrade when a board shows redundant through vias beside such vias.
+  auto through = [nl](const model::Via& v) { return v.layer_top == 0 && v.layer_bottom == nl - 1; };  // by span, not by type
   for (const auto& v : w.vias)
-    if (v.net > 0 && v.type == model::ViaType::Through && v.layer_top != v.layer_bottom) ties[v.net].push_back(v.pos);
+    if (v.net > 0 && through(v)) ties[v.net].push_back(v.pos);
   for (const auto& p : w.pads)
     if (p.net > 0 && p.type == model::PadType::ThruHole) ties[p.net].push_back(p.pos);
   const auto ties_before = ties;
@@ -207,6 +215,7 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
   };
 
   if (opt.planes && opt.pitch > 0) {
+    const Coord shift_bound = stitch_shift_bound(opt.pitch, stitch_coverage(opt));
     geom::Box frame = w.edge_bbox();
     if (frame.empty()) frame = obs.bounds();
     for (const auto& [net, per] : fills) {
@@ -232,10 +241,22 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
             continue;
           }
           bool blocked = false;
-          if (!try_place(net, p, false, &blocked) && blocked) {
-            ++res.site_blocked;
-            res.gaps.push_back({net, p});
-          }
+          if (try_place(net, p, false, &blocked) || !blocked) continue;
+          ++res.site_blocked;
+          // Ring search round the site, nearest first, up to what the coverage radius allows one site to move; the
+          // other sites still cover the corners. Only a site with no legal ring point is a gap.
+          bool placed = false;
+          const Coord step = std::max<Coord>(r, 100'000);
+          for (Coord ring = step; ring <= shift_bound && !placed && !res.out_of_work; ring += step)
+            for (int d = 0; d < 16 && !placed && !res.out_of_work; ++d) {
+              Point q{p.x + ring * kDirs[d][0] / 1000, p.y + ring * kDirs[d][1] / 1000};
+              q.x -= q.x % 1'000;  // whole micrometres
+              q.y -= q.y % 1'000;
+              if (layers_inside(net, q, r) < 2) continue;
+              placed = try_place(net, q, false, nullptr);
+            }
+          if (placed) ++res.site_moved;
+          else res.gaps.push_back({net, p});
         }
     }
   }
@@ -246,7 +267,7 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
     if (rn.signal <= 0 || rn.plane <= 0 || rn.signal == rn.plane || rn.distance <= 0) continue;
     std::vector<const model::Via*> sv;
     for (const auto& v : board.vias)  // a laser or blind signal via changes no side: it needs no through via beside it
-      if (v.net == rn.signal && v.type == model::ViaType::Through) sv.push_back(&v);
+      if (v.net == rn.signal && v.layer_top == 0 && v.layer_bottom == nl - 1) sv.push_back(&v);
     std::sort(sv.begin(), sv.end(), [](const model::Via* a, const model::Via* b) { return std::tie(a->pos.x, a->pos.y) < std::tie(b->pos.x, b->pos.y); });
     const model::Via proto = via_for(rn.plane, {});
     const Coord gap = std::max(rules.class_for(w.nets[static_cast<std::size_t>(rn.signal)].name).clearance,
@@ -331,7 +352,7 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
       const auto& rn = opt.returns[k];
       res.returns[k].stitched_after = 0;
       for (const auto& v : board.vias)
-        if (v.net == rn.signal && rn.signal > 0 && v.type == model::ViaType::Through)
+        if (v.net == rn.signal && rn.signal > 0 && through(v))
           res.returns[k].stitched_after += tied(now, rn.plane, v.pos, rn.distance);
     }
   }

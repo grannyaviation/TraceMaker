@@ -1601,9 +1601,15 @@ Vias of an existing net, added where they tie that net's copper on two or more l
   the board, anchored half a pitch inside the outline's bounding-box corner) where the via's pad lies wholly inside
   that net's fill on at least two layers. A site with a via or plated through-hole pad of the net within half a
   pitch is already tied and gets none.
-  A site the exact check refuses is not moved (the farm's 8.7 mm grid has about 0.05 mm of coverage slack); it is listed in
-  `StitchResult::gaps` and the route summary's `stitch.gaps` (net and position), for the caller to lay a stub (granny fork,
-  TM-1c). Listing costs no checks.
+  A site the exact check refuses (granny fork, TM-1c) gets a ring search round it, nearest first (16 directions, step half a
+  via), up to what the coverage radius allows one site to move: `--stitch-coverage` (default the grid's own radius, pitch /
+  sqrt 2, plus 0.8 %, the farm's 6.2 mm over its 8.7 mm grid's 6.15 mm). The other sites still cover the cell corners, so a
+  site may move far more than the margin between the radii: with one site moved by d the largest empty circle is
+  (p^2 + 2pt + 2t^2) / (sqrt 2 (p + 2t)), t = d / sqrt 2, which gives 0.82 mm for p = 8.7 mm and 6.2 mm (a missing site
+  leaves about 8.7 mm). `stitch_shift_bound` solves it for d. A site with no legal ring point is listed in
+  `StitchResult::gaps` and the route summary's `stitch.gaps` (net and position), for the caller to lay a stub; `sites_moved`
+  and `shift_bound_mm` are in the summary too. The ring tries are exact checks inside the work budget (`--pass-work`).
+  Several moved sites next to each other can add up: the bound is per site.
 - **Return-path stitching** (`return`): every via of a signal that needs a reference plane wants a via or plated
   pad of the plane's net within a distance, centre to centre. Signals come from component rules of kind
   `reference_plane` (doc 15 §4; with `--component-rules report`, `soft` or `on`, instances at the apply threshold:

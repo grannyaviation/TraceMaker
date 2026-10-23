@@ -99,6 +99,7 @@ struct RouteJob {
   // reference_plane, and --stitch-return "PATTERN=PLANE_NET"), or "all". Empty = off.
   std::string stitch_vias;
   double stitch_pitch_mm = 0;      // 0 = the catalogue's stitch_via_within_mm
+  double stitch_coverage_mm = 0;   // 0 = the grid's own coverage radius plus 0.8 %: how far a blocked grid site may move (stitch.hpp)
   double stitch_distance_mm = 0;   // 0 = the rule's stitch_via_mm, else the catalogue value
   std::vector<std::string> stitch_returns;
   long pass_work = 2'000'000;      // work budget of each pass, in exact checks (rule 5)

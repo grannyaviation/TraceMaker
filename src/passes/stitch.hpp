@@ -33,6 +33,10 @@ struct StitchOptions {
   long work_limit = 2'000'000;
 };
 
+// The coverage radius the pass uses: `opt.coverage`, else the grid's own radius plus 0.8 % (the farm's 6.2 mm gate over its
+// 8.7 mm grid's 6.15 mm).
+Coord stitch_coverage(const StitchOptions& opt);
+
 struct StitchReturn {
   model::NetId signal = 0, plane = 0;
   std::string source;
@@ -54,6 +58,7 @@ struct StitchGap {
 // t = d / sqrt 2 the worst radius is (p^2 + 2pt + 2t^2) / (sqrt 2 (p + 2t)), so d = (sqrt 2 R - p + sqrt(2R^2 - p^2)) / sqrt 2.
 // 0 when `coverage` is below the grid's own radius. 8.7 mm and 6.2 mm give 0.82 mm.
 Coord stitch_shift_bound(Coord pitch, Coord coverage);
+
 
 struct StitchResult {
   std::vector<model::Via> vias;            // the vias to add, plane stitches first; all marked free

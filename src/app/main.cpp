@@ -1098,6 +1098,10 @@ int main(int argc, char** argv) {
                     "return: a plane via near each via of the nets that need a reference plane (component rules, --stitch-return); all: both")
       ->check(CLI::IsMember({"planes", "return", "all"}));
   route->add_option("--stitch-pitch", r_job.stitch_pitch_mm, "Grid pitch of plane stitching vias, mm (default 5.08, the catalogue's value)")->check(CLI::PositiveNumber);
+  route->add_option("--stitch-coverage", r_job.stitch_coverage_mm,
+                    "Plane stitching: the largest empty circle the grid may leave, mm (default: the grid's own radius, pitch / sqrt 2, plus 0.8 %). "
+                    "A grid site the exact check refuses moves on rings round it as far as this allows, else it is a gap")
+      ->check(CLI::PositiveNumber);
   route->add_option("--stitch-distance", r_job.stitch_distance_mm, "Return-path stitching: largest distance from a signal via to its plane via, mm (default: the rule's, else 5.08)")
       ->check(CLI::PositiveNumber);
   route->add_option("--stitch-return", r_job.stitch_returns, "Return-path stitching for nets as PATTERN=PLANE_NET, e.g. 'USB_D*=GND' (repeatable). Return-path stitching from component rules is experimental");
