@@ -439,6 +439,16 @@ TEST_CASE("stitch: an obstacle removes exactly the sites it blocks", "[passes][s
   CHECK(positions(r) == want);
   CHECK(r.sites == 23);
   CHECK(r.site_blocked == 2);
+  // Fallback for a blocked site: it is reported, not moved (moving it would spend the stitch pitch's coverage slack:
+  // a 0.05 mm shift is all an 8.7 mm grid has). The farm lays a stub there. No extra work: the entry is recorded where
+  // the exact check refused the via.
+  REQUIRE(r.gaps.size() == 2);
+  CHECK(r.gaps[0].net == 1);
+  CHECK(r.gaps[0].pos == Point{12'500'000, 7'500'000});
+  CHECK(r.gaps[1].pos == Point{17'500'000, 7'500'000});
+  const auto free_board = load("obstacle_open", board_text(kGndPin + gnd_zone("F.Cu") + gnd_zone("B.Cu"), 4));
+  const auto open = passes::stitch_vias(free_board.board, free_board.rules, o);
+  CHECK(open.gaps.empty());
   model::Board b = l.board;
   b.vias.insert(b.vias.end(), r.vias.begin(), r.vias.end());
   CHECK(errors(drc::refill_zones(b, l.rules).board, l.rules) == 0);

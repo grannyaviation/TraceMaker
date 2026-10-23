@@ -1601,6 +1601,9 @@ Vias of an existing net, added where they tie that net's copper on two or more l
   the board, anchored half a pitch inside the outline's bounding-box corner) where the via's pad lies wholly inside
   that net's fill on at least two layers. A site with a via or plated through-hole pad of the net within half a
   pitch is already tied and gets none.
+  A site the exact check refuses is not moved (the farm's 8.7 mm grid has about 0.05 mm of coverage slack); it is listed in
+  `StitchResult::gaps` and the route summary's `stitch.gaps` (net and position), for the caller to lay a stub (granny fork,
+  TM-1c). Listing costs no checks.
 - **Return-path stitching** (`return`): every via of a signal that needs a reference plane wants a via or plated
   pad of the plane's net within a distance, centre to centre. Signals come from component rules of kind
   `reference_plane` (doc 15 §4; with `--component-rules report`, `soft` or `on`, instances at the apply threshold:

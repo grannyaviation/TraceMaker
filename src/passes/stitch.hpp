@@ -38,6 +38,13 @@ struct StitchReturn {
   int stitched_after = 0;       // ... and after it
 };
 
+// A grid site the exact check refused. The pass does not move it (an 8.7 mm grid has about 0.05 mm of coverage slack): the
+// caller lays a stub there or accepts the gap.
+struct StitchGap {
+  model::NetId net = 0;
+  model::Point pos;
+};
+
 struct StitchResult {
   std::vector<model::Via> vias;            // the vias to add, plane stitches first; all marked free
   std::vector<std::uint8_t> return_path;   // per via: 1 = placed for a signal via, 0 = grid
@@ -45,6 +52,7 @@ struct StitchResult {
   int sites = 0;                // grid sites inside overlapping fills
   int site_served = 0;          // of them: already tied by a via or plated pad of the net within half the pitch
   int site_blocked = 0;         // of them: refused by the exact check
+  std::vector<StitchGap> gaps;  // ... the same sites, one entry each, in grid order
   int dropped = 0;              // vias placed and then removed because the second refill did not join them on two layers
   long checks = 0;              // the pass's work
   bool out_of_work = false;

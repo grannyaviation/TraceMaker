@@ -942,8 +942,11 @@ RouteJobResult run_route_job(RouteJob job) {
               grid, ret, sr.sites, sr.site_served, sr.site_blocked, sr.dropped, sr.checks, sr.out_of_work ? " (work budget used up)" : "",
               sr.discarded ? "; withdrawn: the refill with the vias cut a fill"
               : !sr.vias.empty() && !kept ? fmt("; discarded: a net has more unconnected items with them (%d in all, %d without)", after, before).c_str() : ""));
+      nlohmann::json gaps = nlohmann::json::array();
+      for (const auto& g : sr.gaps)
+        gaps.push_back({{"net", bd.nets[static_cast<std::size_t>(g.net)].name}, {"x_mm", nm_to_mm(g.pos.x)}, {"y_mm", nm_to_mm(g.pos.y)}});
       stitch_summary = {{"plane_vias", grid}, {"return_path_vias", ret}, {"sites", sr.sites}, {"sites_already_tied", sr.site_served},
-                        {"sites_blocked", sr.site_blocked}, {"dropped", sr.dropped}, {"checks", sr.checks}, {"out_of_work", sr.out_of_work},
+                        {"sites_blocked", sr.site_blocked}, {"gaps", gaps}, {"dropped", sr.dropped}, {"checks", sr.checks}, {"out_of_work", sr.out_of_work},
                         {"kept", kept}, {"pitch_mm", nm_to_mm(so.pitch)}, {"nets", nets}, {"return_paths", rets}};
       if (kept) {
         for (std::size_t i = 0; i < sr.vias.size(); ++i) {

@@ -223,7 +223,10 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
             continue;
           }
           bool blocked = false;
-          if (!try_place(net, p, false, &blocked) && blocked) ++res.site_blocked;
+          if (!try_place(net, p, false, &blocked) && blocked) {
+            ++res.site_blocked;
+            res.gaps.push_back({net, p});
+          }
         }
     }
   }
