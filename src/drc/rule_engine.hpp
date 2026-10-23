@@ -35,6 +35,8 @@ class RuleEngine {
   Coord max_hole_to_hole() const;
   bool any_custom_hole_to_hole() const { return !min_rules_[HoleToHole].empty(); }
   Coord edge_clearance(const CopperItem& a, int layer) const;
+  // Largest copper-to-edge clearance any item could need (board minimum or a custom rule), for spatial-index inflation.
+  Coord max_edge_clearance() const;
   // Minimum and maximum track width (max = 0: none).
   std::pair<Coord, Coord> track_width(const CopperItem& t, int layer) const;
   Coord via_diameter_min(const CopperItem& v) const;
@@ -54,8 +56,9 @@ class RuleEngine {
   std::pair<std::optional<Coord>, std::optional<Coord>> length_constraint(model::NetId net) const;
   // Maximum skew of the last custom rule with a `skew` constraint matching a track of `net`, if any.
   std::optional<Coord> skew_constraint(model::NetId net) const;
-  // Last custom constraint of `type` (e.g. diff_pair_gap, diff_pair_uncoupled) whose rule matches a track of `net`.
-  std::optional<model::Constraint> net_constraint(model::NetId net, const std::string& type) const;
+  // Last custom constraint of `type` (e.g. diff_pair_gap, diff_pair_uncoupled) whose rule matches a track of `net`. With
+  // `layer` >= 0, only rules whose layer selector admits that layer, judged on a track on it (sd50-inner's track_width).
+  std::optional<model::Constraint> net_constraint(model::NetId net, const std::string& type, int layer = -1) const;
 
   // Name of the last rule disallowing `it` on `layer`, if any (KiCad: items_not_allowed).
   std::optional<std::string> disallowed(const CopperItem& it, int layer) const;
@@ -111,6 +114,7 @@ class RuleEngine {
   // Value of the last matching custom constraint of `type` (min field), trying (a,b) and (b,a).
   std::optional<Coord> custom_min(Min type, const CopperItem* a, const CopperItem* b, int layer) const;
   bool layer_matches(const std::string& sel, int layer) const;
+  bool micro_via(const CopperItem& it) const;  // a board via or router probe of type Micro
 
   const model::Board& b_;
   const model::DesignRules& r_;

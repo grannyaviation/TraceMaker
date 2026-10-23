@@ -944,6 +944,11 @@ int main(int argc, char** argv) {
   route->add_flag("!--no-rip-up", ropt.rip_up, "Disable negotiated rip-up and reroute");
   route->add_flag("--micro-vias", ropt.micro_vias, "Use micro vias (outer layer to the next) where a through via is blocked (only on boards that allow them)");
   route->add_flag("--blind-vias", ropt.blind_vias, "Use blind/buried vias where a through via is blocked (only on boards that allow them)");
+  route->add_flag("--stacked-vias", ropt.stacked_vias, "Change between an outer layer and the second one in (F.Cu-In2, B.Cu-In3) only on a stacked laser via: two micro vias at one point at the class's micro via size, filled and capped (doc 05 §21.1)");
+  double r_stagger_mm = 0, r_stack_pitch_mm = 0, r_stack_through_pitch_mm = 0;
+  route->add_option("--stagger", r_stagger_mm, "With --stacked-vias: put the inner laser via this far (mm) beside the outer one, joined by a stub on the plane layer between (0 = stacked)");
+  route->add_option("--stack-pitch", r_stack_pitch_mm, "Plane voids: a laser via keeps this far (mm, centre to centre) from another net's laser via on its plane layer (In1, In4); a net with a zone there is exempt (0 = off)");
+  route->add_option("--stack-through-pitch", r_stack_through_pitch_mm, "Plane voids: a laser via and another net's through via keep this far apart (mm, centre to centre; 0 = off)");
   route->add_flag("--diff-pairs", ropt.diff_pairs, "Route differential pairs (KiCad P/N or +/- names) as coupled pairs first (doc 05 §15)");
   double r_pair_skew_mm = 0;
   route->add_flag("--pair-twists,!--no-pair-twists", ropt.pair_twists, "Coupled pairs may swap sides at a layer change, for pairs whose pin order is mirrored between the ends (default on; only with pair routing)");
@@ -1362,6 +1367,9 @@ int main(int argc, char** argv) {
         }
       }
       ropt.pair_skew = static_cast<tmk::Coord>(r_pair_skew_mm * 1e6);
+      ropt.stagger = static_cast<tmk::Coord>(std::llround(r_stagger_mm * 1e6));
+      ropt.stack_pitch = static_cast<tmk::Coord>(std::llround(r_stack_pitch_mm * 1e6));
+      ropt.stack_through_pitch = static_cast<tmk::Coord>(std::llround(r_stack_through_pitch_mm * 1e6));
       if (neck_reach_mm >= 0) ropt.neck_reach = static_cast<tmk::Coord>(neck_reach_mm * 1e6);
       ropt.gpu_device = tmk::app::default_gpu_device(!r_nogpu);
       auto job = std::move(r_job);

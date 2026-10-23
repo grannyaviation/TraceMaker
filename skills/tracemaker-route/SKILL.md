@@ -46,6 +46,7 @@ Start from the preflight's suggested command, then:
 | Clocks, crystals and fast pairs on a board with reference planes | `--critical-auto --split-cost 4 --critical-via-cost 3`: nets found from the component rules and pair names pay more for vias and for crossing a split of their reference plane; `route.json` gets `critical_nets`. Measured on four plane boards (one seed): about half the splits crossed, two connections fewer of 882. `--si-rules` adds routing them first, which measured worse for splits. All off by default; `tracemaker return-paths` audits a routed board |
 | Dense BGA / QFN | Escape planning runs in two of the eight portfolio variants by default; `--escape-plan` turns it on in all. `--escape-report` lists which deep BGA pins connected. `--via-in-pad` lets inner balls take a minimum via in the pad (needs filled, capped vias at the fab) |
 | Blind/buried or micro vias allowed by the board | `--blind-vias`, `--micro-vias` (used only where a through via is blocked) |
+| HDI board with stacked laser vias (F.Cu-In2, B.Cu-In3) | `--stacked-vias` (that change only on a stack of two micro vias, filled and capped); `--stagger 0.3` for staggered pairs; `--stack-pitch` / `--stack-through-pitch` keep other nets' vias off the plane voids (doc 05 §21.1) |
 | Component-aware keep-outs (crystals, switcher inductors) | `--component-rules report` writes a sidecar `.kicad_dru` to review; `on` also routes with the keep-outs |
 
 Work budget: start with `--work 10000000` for a board of a few hundred connections, measure, then raise.

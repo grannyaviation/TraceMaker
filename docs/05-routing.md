@@ -585,8 +585,57 @@ blind vias (§11): correct, no measurable gain on the boards at hand.
 for pads and through vias, the span for micro and blind vias. Copper is tested against a hole only on those layers, and
 two holes only meet when their spans share a layer, as in KiCad (`drc_test_provider_copper_clearance.cpp` testHoles,
 `drc_test_provider_hole_to_hole.cpp`). The DRC also skips pairs of micro vias, as KiCad does, so the two halves of a
-stacked laser via at one point (F.Cu-In1 and In1-In2) raise no `holes_co_located`; the router's obstacle checks still
-keep a new micro via away from a fixed micro hole that shares a layer. Stacked vias as router moves are not built.
+stacked laser via at one point (F.Cu-In1 and In1-In2) raise no `holes_co_located`.
+
+### 21.1 Stacked laser vias (granny fork, TM-2)
+
+`--stacked-vias` (off; four copper layers or more): a layer change between an outer layer and the second layer in
+(F.Cu-In2, B.Cu-In3, through the plane layer In1 or In4 between) is a stack of two micro vias at one point, F.Cu-In1
+plus In1-In2 (B.Cu-In4 plus In4-In3), at the net class's micro via size (`uvia_diameter` / `uvia_drill`, not below the
+board's micro-via minimums), written `(capping yes) (filling yes)`. This is how KiCad models a stacked via, and it gives
+one drill file per laser step. For that pair of layers the stack is the only move: the search offers no through or blind
+via for it, and the commit types such a change as a stack (`RouteResult::stacked_vias`). A net that a rule keeps from
+micro vias (`disallow micro_via`, or `disallow via` with `A.Via_Type == 'Micro'`) changes layer on through vias as before;
+a position-dependent rule or a via keep-out moves the stack elsewhere. KiCad 10 has no board switch for micro vias, so
+the option does not ask for one (`--micro-vias` still reads KiCad 6's `allow_microvias`).
+
+`--stagger MM` puts the inner half that far beside the outer one, joined by a stub on the plane layer at the micro via's
+diameter (JLC's fallback if it refuses stacking: 0.30 mm, plan §1.6). The commit tries the direction of the inner track
+first, then the eight lattice directions nearest to it, and the inner track then leaves from the inner half. The stub is
+part of the via: it is allowed on a layer that `--no-tracks-on` closes to tracks, but rules and keep-outs against tracks
+there still hold. shortcut: the search judges a staggered stack as a stacked one at the lattice point, and the commit's
+exact check decides.
+
+**What the router holds for them.**
+- **Rules on the probe's via type.** Every via probe carries its type (`drc::CopperItem::via_type`), so rule conditions on
+  `A.Via_Type` judge a laser via as one: `jlc-hdi-microvia-hole-to-hole` (0.24 mm) and `jlc-hdi-microvia-edge` (0.35 mm) on
+  the new via, and `disallow` rules. `Via_Type` is therefore no longer a position-dependent condition: `via_allowed` asks per
+  type (a blind probe is judged as blind and as buried, either forbidding it, as the keywords do).
+- **Edge clearance by rule.** New copper keeps the board minimum or the custom `edge_clearance` rule that matches it, as the
+  DRC does (`Obstacles::edge_blocked`), in the exact and the cached checks.
+- **Laser pairs.** KiCad tests no pair of micro vias. The router keeps the project's hole-to-hole (JLC's laser spacing, the
+  0.24 mm rule) between laser holes of one layer pair, any nets, as the farm's `micro_hole_spacing` gate measures; laser
+  holes of different spans, a stack's two halves included, are no pair, so the second half may sit on the first. The DRC
+  stays KiCad's. JLC allows 0.13 mm within a net; the rule has no net term, so the router holds 0.24 mm there too.
+- **Plane voids.** `--stack-pitch MM` and `--stack-through-pitch MM` (0 = off): a laser via keeps that far, centre to
+  centre, from another net's laser via, or through via, whose copper is on the same plane layer (In1 or In4, the stacks'
+  middle layers); a net with a copper zone on that layer leaves no void there and is exempt (GND stitching). Both
+  directions: a new through via keeps the second distance from another net's laser vias. Plan §1.10: 0.95 mm and 1.0 mm.
+- **Micro-via minimums in the DRC.** KiCad's implicit rule "board setup constraints micro-via" (`A.Via_Type == 'Micro'`)
+  holds micro vias to the micro-via diameter and drill minimums instead of the via ones; `RuleEngine::via_diameter_min`
+  and `hole_size_min` now do the same.
+- **The split cost** (§44) counts the antipads of the vias a route adds (a routed via of another net whose copper is on a
+  layer's reference plane, radius: its pad plus the larger of its class clearance and the zones' own clearance), not only
+  the voids of the fills the run started from. shortcut: the radius ignores custom clearance rules between the plane and
+  the via.
+
+**Rule widths per layer.** A `track_width` rule that matches a net's tracks on a layer (`sd50-inner`, `usb90-inner`,
+`(layer inner)`) sets the committed width there: its `opt`, else the width within its `min` and `max`
+(`RuleEngine::net_constraint` with a layer). The search keeps the class width (a narrower track passes wherever the wider
+one does; learned blocks stay keyed by the search's width). Coupled pairs keep off layers where such a rule asks for
+another width than the pair's, and their halves are routed one by one there (shortcut: no per-layer pair geometry).
+
+Tests: `tests/test_stacked_vias.cpp`; end to end with KiCad's DRC: `tests/integration/stacked_vias.py`.
 
 ## 22. Successive halving for the portfolio (M10, 2026-10-06)
 
@@ -1521,7 +1570,7 @@ kept.
 **Limits.** One width per track as the router cut it: a long track with one tight spot stays narrow along its
 whole length (splitting a track at the obstacle is not done). Tracks are not moved to make room. A custom rule's
 maximum `track_width` caps what this pass does (`RuleEngine::track_width` returns it, and the in-engine DRC reports
-tracks above it); the router itself still routes at the class width where such a rule asks for less. Inner-layer
+tracks above it); the router commits a rule's width on the layers it covers (§21.1). Inner-layer
 widths from IPC-2221 (wider than outer) are reported by the component rules but the pass uses the one width a net
 class holds. With `--soft-zones` the widened tracks are judged like the routing itself, after a refill.
 
