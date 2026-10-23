@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <string>
 
+#include "drc/drc.hpp"
 #include "io/kicad/board_reader.hpp"
 #include "route/router.hpp"
 
@@ -103,4 +104,68 @@ TEST_CASE("from copper: a stub on the pad does not move the route off the pad ce
     from_centre = from_centre || t.a == centre || t.b == centre;
   }
   CHECK((!on_pad || from_centre));  // a track that ends on R1's copper comes with the leg from its centre
+}
+
+namespace {
+
+// U1: two rows of four 0.6 x 0.3 mm pads at 0.5 mm pitch (x 13.1 and 16.9), each pin on its own net to J1 (right row) or J2
+// (left row), whose pads are on `j_layer`. Every pad centre is a point of a 0.05 mm lattice.
+model::Board package_board(const std::string& j_layer) {
+  std::string nets = "(net 0 \"\")", u1, j1, j2;
+  for (int k = 0; k < 4; ++k) {
+    const std::string s = std::to_string(k + 1), t = std::to_string(k + 5), dy = std::to_string(-0.75 + 0.5 * k), jy = std::to_string(-1.8 + 1.2 * k);
+    nets += " (net " + s + " \"S" + s + "\") (net " + t + " \"S" + t + "\")";
+    u1 += "(pad \"" + t + "\" smd rect (at 1.9 " + dy + ") (size 0.6 0.3) (layers \"F.Cu\") (net " + t + " \"S" + t + "\"))\n";
+    u1 += "(pad \"" + s + "\" smd rect (at -1.9 " + dy + ") (size 0.6 0.3) (layers \"F.Cu\") (net " + s + " \"S" + s + "\"))\n";
+    j1 += "(pad \"" + s + "\" smd rect (at 0 " + jy + ") (size 1 0.8) (layers \"" + j_layer + "\") (net " + t + " \"S" + t + "\"))\n";
+    j2 += "(pad \"" + s + "\" smd rect (at 0 " + jy + ") (size 1 0.8) (layers \"" + j_layer + "\") (net " + s + " \"S" + s + "\"))\n";
+  }
+  return io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20240108) (generator \"pcbnew\") (general (thickness 1.6))\n"
+      "(layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal) (44 \"Edge.Cuts\" user)) (setup (pad_to_mask_clearance 0))\n" + nets + "\n"
+      "(footprint \"T:U\" (layer \"F.Cu\") (at 15 10) (property \"Reference\" \"U1\")\n" + u1 + ")\n"
+      "(footprint \"T:J\" (layer \"F.Cu\") (at 25 10) (property \"Reference\" \"J1\")\n" + j1 + ")\n"
+      "(footprint \"T:J\" (layer \"F.Cu\") (at 5 10) (property \"Reference\" \"J2\")\n" + j2 + ")\n"
+      "(gr_rect (start 0 0) (end 30 20) (stroke (width 0.1) (type default)) (fill none) (layer \"Edge.Cuts\")))"));
+}
+
+// Routes `b` at a 0.05 mm lattice: every connection the router counts as routed must join both pads (KiCad's view).
+void check_joined(const model::Board& b, route::RouterOptions o) {
+  o.work_budget = 40'000'000;
+  o.time_limit_s = 600;
+  o.gpu_device = -1;
+  o.pitch = 50'000;
+  const auto r = route::Router(b, rules(), o).run();
+  CHECK(r.connections == 8);
+  CHECK(r.routed == 8);
+  auto routed = b;
+  routed.tracks.insert(routed.tracks.end(), r.tracks.begin(), r.tracks.end());
+  routed.vias.insert(routed.vias.end(), r.vias.begin(), r.vias.end());
+  drc::DrcOptions d;
+  d.connectivity_only = true;
+  d.dangling = false;
+  const auto rep = drc::run_drc(routed, rules(), d);
+  for (const auto& v : rep.unconnected) UNSCOPED_INFO(v.description << " at (" << v.items.front().pos.x << "," << v.items.front().pos.y << ")");
+  CHECK(rep.unconnected.empty());
+}
+
+}  // namespace
+
+TEST_CASE("from copper: an escape stub that ends on a lattice point keeps its leg to the pad", "[route][from_copper][escape]") {
+  // With --escape-stubs a pin may start at the end of its straight corridor, 0.3 + 2 mm out (x 19.2 and 10.8): lattice
+  // points here, as at sensor_ts's 0.045 mm lattice for CAN_RXD (U27.4). commit() took such an end for the net's
+  // existing copper, dropped the leg to the pad and still counted the connection as routed.
+  route::RouterOptions o;
+  o.escape_plan = true;
+  o.escape_stubs = true;
+  check_joined(package_board("F.Cu"), o);
+}
+
+TEST_CASE("from copper: a via drop whose via sits on a lattice point keeps its via and its leg", "[route][from_copper][escape]") {
+  // J1 and J2 on B.Cu: with --via-drops a pin may drop to a via straight out of the pad, off the lattice in general,
+  // but here (a pad centre on the lattice, an even number of half-pitch steps) on a lattice point. Such an end lost
+  // its leg and its via too.
+  route::RouterOptions o;
+  o.via_drops = true;
+  check_joined(package_board("B.Cu"), o);
 }

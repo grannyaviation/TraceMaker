@@ -26,6 +26,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "core/rng.hpp"
 #include "drc/connectivity.hpp"
@@ -785,6 +786,7 @@ struct Router::Impl {
     std::vector<std::int64_t> cost;                    // per cell: cost from the pad centre
     std::size_t in_pad_from = SIZE_MAX;                // cells from here on are via-in-pad endpoints (add_in_pad)
     std::size_t on_copper = 0;                         // cells on the cluster's existing tracks and vias
+    std::size_t copper_from = 0;                       // they are cells [copper_from, copper_from + on_copper)
     std::vector<int> drop_layer;                       // per cell (may be shorter): the pad's layer when the cell is reached through a via drop (stub = the via), else -1
   };
   // Off-lattice escapes: straight exits from the pad centre in 8 directions, exactly checked, joining the
@@ -1115,6 +1117,7 @@ struct Router::Impl {
     const auto found = root_copper.find(init_root[static_cast<std::size_t>(item)]);
     if (found == root_copper.end()) return;
     const auto& pad_it = obs->copper().items[static_cast<std::size_t>(item)];
+    e.copper_from = e.cells.size();
     const model::LayerMask pad_layers = b.pads[static_cast<std::size_t>(pad)].copper;
     for (const int id : found->second) {
       const auto& it = obs->copper().items[static_cast<std::size_t>(id)];
@@ -1702,12 +1705,16 @@ struct Router::Impl {
     target_stub.clear();
     start_drop.clear();
     target_drop.clear();
+    start_cu.clear();
+    target_cu.clear();
     for (std::size_t k = 0; k < dst.cells.size(); ++k) {
       const auto key = cell_key(dst.cells[k].first, w.x0 + static_cast<int>(dst.cells[k].second % w.w), w.y0 + static_cast<int>(dst.cells[k].second / w.w));
       if (!target_stub.count(key) || dst.stub[k] == tp) {
         target_stub[key] = dst.stub[k];
         if (k < dst.drop_layer.size() && dst.drop_layer[k] >= 0) target_drop[key] = dst.drop_layer[k];
         else target_drop.erase(key);
+        if (k - dst.copper_from < dst.on_copper) target_cu.insert(key);
+        else target_cu.erase(key);
       }
     }
     (void)sp;
@@ -1720,6 +1727,8 @@ struct Router::Impl {
       start_stub[cell_key(l, w.x0 + cx, w.y0 + cy)] = src.stub[k];
       if (k < src.drop_layer.size() && src.drop_layer[k] >= 0) start_drop[cell_key(l, w.x0 + cx, w.y0 + cy)] = src.drop_layer[k];
       else start_drop.erase(cell_key(l, w.x0 + cx, w.y0 + cy));
+      if (k - src.copper_from < src.on_copper) start_cu.insert(cell_key(l, w.x0 + cx, w.y0 + cy));
+      else start_cu.erase(cell_key(l, w.x0 + cx, w.y0 + cy));
       sn[s] = SNode{g0, gen | (static_cast<std::uint32_t>(kNoDir) << 28), -1};
       if (h(l, w.x0 + cx, w.y0 + cy) >= kUnreachable) continue;
       open.emplace(g0 + h(l, w.x0 + cx, w.y0 + cy), s);
@@ -1973,13 +1982,11 @@ struct Router::Impl {
     std::vector<Seg> segs;
     std::vector<Point> vias;
     std::vector<std::pair<int, int>> via_span;  // layers joined by each via
-    // An end on the cluster's existing copper (its stub is the lattice point itself) needs no leg to the pad.
-    auto on_copper = [&](const std::unordered_map<std::int64_t, Point>& stubs, const PathNode& n) {
-      const auto it = stubs.find(cell_key(n.layer, n.gx, n.gy));
-      return it != stubs.end() && it->second == at(n.gx, n.gy);
-    };
-    const Point pa = on_copper(start_stub, path.front()) ? at(path.front().gx, path.front().gy) : b.pads[static_cast<std::size_t>(c.pad_a)].pos;
-    const Point pb = c.pad_b < 0 || on_copper(target_stub, path.back()) ? at(path.back().gx, path.back().gy) : b.pads[static_cast<std::size_t>(c.pad_b)].pos;
+    // An end on the cluster's existing copper needs no leg to the pad. Marked by add_copper_cells(), not told by a stub
+    // equal to its lattice point: an escape, a corridor end or a drop's via can sit exactly on one too (sensor_ts CAN_RXD).
+    auto on_copper = [&](const std::unordered_set<std::int64_t>& cu, const PathNode& n) { return cu.count(cell_key(n.layer, n.gx, n.gy)) > 0; };
+    const Point pa = on_copper(start_cu, path.front()) ? at(path.front().gx, path.front().gy) : b.pads[static_cast<std::size_t>(c.pad_a)].pos;
+    const Point pb = c.pad_b < 0 || on_copper(target_cu, path.back()) ? at(path.back().gx, path.back().gy) : b.pads[static_cast<std::size_t>(c.pad_b)].pos;
     // Corner points: pad centre, direction changes and layer changes, pad centre.
     Point cur = pa;
     int layer = path.front().layer;
@@ -2538,6 +2545,7 @@ struct Router::Impl {
   }
   std::unordered_map<std::int64_t, Point> start_stub, target_stub;  // lattice point -> escape point (pad centre if none)
   std::unordered_map<std::int64_t, int> start_drop, target_drop;    // lattice point -> the pad's layer, when its stub is the via of a via drop
+  std::unordered_set<std::int64_t> start_cu, target_cu;             // lattice points on the net's existing copper (no leg to the pad)
   bool search_and_commit(const Connection& c, bool soft_mode) {
     soft = soft_mode;
     // Skip an attempt that already failed in exactly this situation.
