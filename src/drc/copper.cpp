@@ -142,6 +142,7 @@ CopperModel build_copper(const model::Board& b) {
       }
       h.item = item;
       h.pad = static_cast<int>(i);
+      h.layers = b.copper_count() >= 64 ? ~model::LayerMask{0} : (model::LayerMask{1} << b.copper_count()) - 1;  // a drilled pad hole goes through the board
       h.plated = p.type != model::PadType::NpThruHole;
       h.clearance = p.clearance >= 0 ? p.clearance : b.footprints[static_cast<std::size_t>(p.footprint)].clearance;
       h.net = p.net;
@@ -206,6 +207,7 @@ CopperModel build_copper(const model::Board& b) {
     h.shape = Shape::point(v.pos, v.drill / 2);
     h.item = static_cast<int>(m.items.size());
     h.via = static_cast<int>(i);
+    h.layers = it.layers;
     h.net = v.net;
     h.pos = v.pos;
     m.items.push_back(std::move(it));

@@ -361,7 +361,7 @@ int Obstacles::holes_edges_state(const Shape& s, model::NetId net, int layer, bo
   hgrid_->query(s.box.inflated(std::max({hc, h2h_max, max_hole_local_}) + 1), [&](int id) {
     if (state == 2) return;
     const auto& h = cm_.holes[static_cast<std::size_t>(id)];
-    if (h.removed) return;
+    if (h.removed || !(h.layers & model::layer_bit(layer))) return;  // a laser via's hole is no obstacle on the other layers
     bool hit = false;
     if (!(h.net == net && net != 0 && h.plated) && geom::closer_than(s, h.shape, std::max(hc, h.clearance))) hit = true;
     if (!hit && is_via_hole) {  // any net, the via's own included: KiCad's hole_to_hole knows no nets
@@ -647,6 +647,7 @@ int Obstacles::add_via(int index, int owner) {
   h.shape = Shape::point(v.pos, v.drill / 2);
   h.item = static_cast<int>(cm_.items.size());
   h.via = index;
+  h.layers = it.layers;
   h.net = v.net;
   h.pos = v.pos;
   it.owner = owner;
@@ -729,7 +730,7 @@ std::int32_t Obstacles::fixed_code(Point p, int layer, Coord hw, Coord margin, m
   hgrid_->query(s.box.inflated(std::max(hc, max_hole_local_) + 1), [&](int id) {
     if (code == kBlocked) return;
     const auto& h = cm_.holes[static_cast<std::size_t>(id)];
-    if (h.removed || (h.item >= 0 && cm_.items[static_cast<std::size_t>(h.item)].owner >= 0)) return;
+    if (h.removed || !(h.layers & model::layer_bit(layer)) || (h.item >= 0 && cm_.items[static_cast<std::size_t>(h.item)].owner >= 0)) return;
     if (geom::closer_than(s, h.shape, std::max(hc, h.clearance))) {
       if (h.plated && h.net != 0) add_net(h.net);
       else code = kBlocked;
@@ -910,13 +911,13 @@ int Obstacles::routed_copper_part(const Shape& s, int layer, model::NetId net, d
   return state;
 }
 
-// New copper against routed vias' holes of other nets (hole clearance; vias span every layer).
-int Obstacles::routed_via_holes_part(const Shape& s, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const {
+// New copper on `layers` against routed vias' holes of other nets (hole clearance), on the layers a via spans.
+int Obstacles::routed_via_holes_part(const Shape& s, model::LayerMask layers, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const {
   int state = 0;
   rgrid_->query(s.box.inflated(hc + 1), [&](int id) {
     if (state == 2) return;
     const auto& it = cm_.items[static_cast<std::size_t>(id)];
-    if (it.removed || it.kind != drc::ItemKind::Via || (it.net == net && net != 0)) return;
+    if (it.removed || it.kind != drc::ItemKind::Via || (it.net == net && net != 0) || !(it.layers & layers)) return;
     if (geom::closer_than_disk(s, it.pos, b_.vias[static_cast<std::size_t>(it.index)].drill / 2, hc)) {
       if (soft) {
         state = 1;
@@ -964,13 +965,13 @@ Coord Obstacles::via_pair_hole_to_hole(Point a, Coord drill_a, Point b, Coord dr
   return via_hole_to_hole(a, drill_a / 2, net, &*pb);
 }
 
-// A new via hole against routed vias' holes (hole to hole, any net, the new via's own net included).
-int Obstacles::routed_hole_to_hole_part(const Shape& hole, model::NetId net, bool soft, std::vector<int>* owners) const {
+// A new via hole on `layers` against routed vias' holes that share a layer with it (hole to hole, any net, the new via's own net included).
+int Obstacles::routed_hole_to_hole_part(const Shape& hole, model::LayerMask layers, model::NetId net, bool soft, std::vector<int>* owners) const {
   int state = 0;
   rgrid_->query(hole.box.inflated(std::max<Coord>(re_->max_hole_to_hole(), 0) + 1), [&](int id) {
     if (state == 2) return;
     const auto& it = cm_.items[static_cast<std::size_t>(id)];
-    if (it.removed || it.kind != drc::ItemKind::Via) return;
+    if (it.removed || it.kind != drc::ItemKind::Via || !(it.layers & layers)) return;
     const Coord h2h = via_hole_to_hole(hole.pts[0], hole.r, net, &it);
     if (geom::closer_than_disk(hole, it.pos, b_.vias[static_cast<std::size_t>(it.index)].drill / 2, h2h)) {
       if (soft) {
@@ -990,14 +991,14 @@ int Obstacles::routed_state(const Shape& s, int layer, model::NetId net, drc::It
   if (state == 2) return state;
   const Coord hc = std::max<Coord>(r_.minimums.hole_clearance, 0);
   if (hc > 0) {
-    state = std::max(state, routed_via_holes_part(s, net, hc, soft, owners));
+    state = std::max(state, routed_via_holes_part(s, model::layer_bit(layer), net, hc, soft, owners));
     if (via_hole && state != 2) state = std::max(state, routed_hole_copper_part(scratch_hole(s.pts[0], hole_r), layer, net, hc, soft, owners));
   }
   if (state != 2) state = std::max(state, physical_copper_state(s, kind, net, layer, false, true, soft, owners));
   if (state == 2 || !via_hole) return state;
   state = std::max(state, physical_hole_state(scratch_hole(s.pts[0], hole_r), net, layer, false, true, soft, owners));
   if (state == 2) return state;
-  return std::max(state, routed_hole_to_hole_part(scratch_hole(s.pts[0], hole_r), net, soft, owners));
+  return std::max(state, routed_hole_to_hole_part(scratch_hole(s.pts[0], hole_r), model::layer_bit(layer), net, soft, owners));
 }
 
 int Obstacles::routed_via_state(const Shape& s, model::LayerMask layers, model::NetId net, bool soft, Coord hole_r) const {
@@ -1015,9 +1016,9 @@ int Obstacles::routed_via_state(const Shape& s, model::LayerMask layers, model::
     if (state != 2) state = std::max(state, physical_hole_state(hole, net, l, false, true, soft, nullptr));
     if (state == 2) return state;
   }
-  if (hc > 0) state = std::max(state, routed_via_holes_part(s, net, hc, soft, nullptr));
+  if (hc > 0) state = std::max(state, routed_via_holes_part(s, layers, net, hc, soft, nullptr));
   if (state == 2) return state;
-  return std::max(state, routed_hole_to_hole_part(hole, net, soft, nullptr));
+  return std::max(state, routed_hole_to_hole_part(hole, layers, net, soft, nullptr));
 }
 
 void Obstacles::routed_items_in(const geom::Box& box, std::vector<int>& out) const {

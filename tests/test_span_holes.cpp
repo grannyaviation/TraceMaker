@@ -88,6 +88,31 @@ TEST_CASE("span holes: an In1-In2 micro via parses with its span", "[drc][route]
   CHECK(lb.board.copper_count() == 6);
 }
 
+TEST_CASE("span holes: a laser via's hole is on its own layers only", "[drc][route][span_holes]") {
+  const Files f("mask", board_text(""));
+  const auto lb = io::read_board_file(f.pcb.string());
+  const auto cm = drc::build_copper(lb.board);
+  REQUIRE(cm.holes.size() == 2);
+  CHECK(cm.holes[0].layers == (model::layer_bit(0) | model::layer_bit(1)));
+  CHECK(cm.holes[1].layers == (model::layer_bit(1) | model::layer_bit(2)));
+}
+
+TEST_CASE("span holes: a through hole is on every layer", "[drc][route][span_holes]") {
+  const Files f("mask_pth", board_text(
+      "  (footprint \"H\" (layer \"F.Cu\") (at 3 3) (property \"Reference\" \"H1\" (at 0 0) (layer \"F.SilkS\"))\n"
+      "    (pad \"1\" thru_hole circle (at 0 0) (size 1 1) (drill 0.5) (layers \"*.Cu\") (net 2 \"B\")))\n"
+      "  (footprint \"N\" (layer \"F.Cu\") (at 6 3) (property \"Reference\" \"H2\" (at 0 0) (layer \"F.SilkS\"))\n"
+      "    (pad \"\" np_thru_hole circle (at 0 0) (size 0.8 0.8) (drill 0.8) (layers \"*.Cu\")))\n"
+      "  (via (at 15 15) (size 0.45) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 2))\n"));
+  const auto lb = io::read_board_file(f.pcb.string());
+  const auto cm = drc::build_copper(lb.board);
+  const model::LayerMask all = (model::LayerMask{1} << 6) - 1;
+  REQUIRE(cm.holes.size() == 5);  // the plated pad, the NPTH, the two laser vias, the through via
+  for (const auto& h : cm.holes)
+    if (h.pad >= 0 || lb.board.vias[static_cast<std::size_t>(h.via)].type == model::ViaType::Through) CHECK(h.layers == all);
+    else CHECK(h.layers != all);
+}
+
 TEST_CASE("span holes: the router lets copper pass under a laser via on the layers it does not drill", "[route][span_holes]") {
   const Files f("route_copper", board_text(""));
   auto lb = io::read_board_file(f.pcb.string());

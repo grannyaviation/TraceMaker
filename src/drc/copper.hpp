@@ -32,6 +32,9 @@ struct Hole {
   int item = -1;                  // copper item owning the hole (-1 for NPTH pads without copper)
   int pad = -1, via = -1;
   bool plated = true;
+  // Copper layers the hole is drilled through: every layer for pads and through vias, the span for micro and blind
+  // vias (KiCad tests a via's hole only on the layers of the via: drc_test_provider_copper_clearance.cpp testHoles).
+  model::LayerMask layers = ~model::LayerMask{0};
   model::NetId net = 0;
   model::Point pos;
   Coord clearance = -1;         // local clearance of the owning pad/footprint (applies as hole clearance), -1 = none

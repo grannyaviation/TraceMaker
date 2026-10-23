@@ -372,6 +372,13 @@ class Checker {
       hg.query(a.shape.box.inflated(reach_), [&](int j) {
         if (static_cast<std::size_t>(j) <= i) return;
         const Hole& c = holes[static_cast<std::size_t>(j)];
+        // Holes that share no layer never meet (blind and buried vias are drilled before lamination), and KiCad does not
+        // test laser vias against each other at all (drc_test_provider_hole_to_hole.cpp: only non-micro vias and pads
+        // query the hole tree, so the halves of a stacked laser via at one point raise nothing).
+        if (!(a.layers & c.layers)) return;
+        if (a.via >= 0 && c.via >= 0 && b_.vias[static_cast<std::size_t>(a.via)].type == model::ViaType::Micro &&
+            b_.vias[static_cast<std::size_t>(c.via)].type == model::ViaType::Micro)
+          return;
         const CopperItem* co = c.item >= 0 ? &cm_.items[static_cast<std::size_t>(c.item)] : nullptr;
         if (a.pad >= 0 && c.pad >= 0) {
           const auto& pa = b_.pads[static_cast<std::size_t>(a.pad)];
@@ -416,6 +423,7 @@ class Checker {
         const CopperItem& c = cm_.items[static_cast<std::size_t>(j)];
         if (j == a.item) return;
         if (c.net == a.net && a.net != 0) return;
+        if (!(c.layers & a.layers)) return;  // copper on a layer the hole does not reach
         if (c.kind == ItemKind::Zone) {
           // testItemAgainstZone: the hole of a via or pad against another net's fill on each of the owner's
           // layers, only with a positive hole clearance (a fill poured before a via was added can cover it).
@@ -576,7 +584,7 @@ class Checker {
         const CopperItem& c = cm_.items[static_cast<std::size_t>(jj)];
         Coord req = -1;
         int at = -1;
-        for (model::LayerMask m = c.layers; m; m &= m - 1)
+        for (model::LayerMask m = c.layers & h.layers; m; m &= m - 1)
           if (const Coord r = re_.physical_hole_clearance(&owner, c, std::countr_zero(m)); r > req) req = r, at = std::countr_zero(m);
         if (req <= 0) return;
         for (const auto& s : c.shapes)

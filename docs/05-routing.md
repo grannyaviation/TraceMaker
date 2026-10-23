@@ -581,6 +581,13 @@ two layers; on two four-layer boards with the setting switched on (EUC-VESC BJT,
 routing was complete or unchanged, KiCad reported no error on routed copper, and no micro via was needed. Like
 blind vias (§11): correct, no measurable gain on the boards at hand.
 
+**Holes by layer span (granny fork, TM-1).** A hole belongs to the layers of its via (`drc::Hole::layers`): every layer
+for pads and through vias, the span for micro and blind vias. Copper is tested against a hole only on those layers, and
+two holes only meet when their spans share a layer, as in KiCad (`drc_test_provider_copper_clearance.cpp` testHoles,
+`drc_test_provider_hole_to_hole.cpp`). The DRC also skips pairs of micro vias, as KiCad does, so the two halves of a
+stacked laser via at one point (F.Cu-In1 and In1-In2) raise no `holes_co_located`; the router's obstacle checks still
+keep a new micro via away from a fixed micro hole that shares a layer. Stacked vias as router moves are not built.
+
 ## 22. Successive halving for the portfolio (M10, 2026-10-06)
 
 `--halving` (off): with more variants than threads, every variant runs on a small budget, the better half runs

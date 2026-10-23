@@ -122,9 +122,9 @@ class Obstacles {
                             std::vector<int>* owners) const;
   int physical_hole_state(const geom::Shape& hole, model::NetId net, int layer, bool fixed, bool routed, bool soft, std::vector<int>* owners) const;
   int routed_copper_part(const geom::Shape& s, int layer, model::NetId net, drc::ItemKind kind, bool soft, std::vector<int>* owners) const;
-  int routed_via_holes_part(const geom::Shape& s, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
+  int routed_via_holes_part(const geom::Shape& s, model::LayerMask layers, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
   int routed_hole_copper_part(const geom::Shape& h, int layer, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
-  int routed_hole_to_hole_part(const geom::Shape& hole, model::NetId net, bool soft, std::vector<int>* owners) const;
+  int routed_hole_to_hole_part(const geom::Shape& hole, model::LayerMask layers, model::NetId net, bool soft, std::vector<int>* owners) const;
   // Hole to hole between a new via's hole (centre p, radius hole_r, of `net`) and the hole of `other` (null: an
   // NPTH without copper): the board minimum, or a custom hole_to_hole rule that matches the pair.
   Coord via_hole_to_hole(geom::Point p, Coord hole_r, model::NetId net, const drc::CopperItem* other) const;
