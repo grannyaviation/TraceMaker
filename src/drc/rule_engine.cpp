@@ -27,7 +27,7 @@ struct EvalCtx {
 // every clearance query, and comparing names there took most of a sensor_ts run (granny 05a6e1c).
 enum class Fn : std::uint8_t {
   Unknown,
-  NetClass, NetName, Type, L, Layer, Reference, PadType, Width, SizeX, SizeY, PositionX, PositionY,  // properties
+  NetClass, NetName, Type, L, Layer, Reference, PadType, ViaType, Width, SizeX, SizeY, PositionX, PositionY,  // properties
   IsPlated, ExistsOnLayer, Area, Courtyard, InDiffPair, MemberOfFootprint,                         // functions
 };
 
@@ -107,7 +107,7 @@ class Condition {
     const std::string& s = n.name;
     if (n.op == Node::Op::Prop) {
       n.fn = s == "NetClass" ? Fn::NetClass : s == "NetName" ? Fn::NetName : s == "Type" ? Fn::Type : s == "L" ? Fn::L
-           : s == "Layer" ? Fn::Layer : s == "Reference" ? Fn::Reference : s == "Pad_Type" ? Fn::PadType : s == "Width" ? Fn::Width
+           : s == "Layer" ? Fn::Layer : s == "Reference" ? Fn::Reference : s == "Pad_Type" ? Fn::PadType : s == "Via_Type" ? Fn::ViaType : s == "Width" ? Fn::Width
            : s == "Size_X" ? Fn::SizeX : s == "Size_Y" ? Fn::SizeY : s == "Position_X" ? Fn::PositionX
            : s == "Position_Y" ? Fn::PositionY : Fn::Unknown;
     } else if (n.op == Node::Op::Call) {
@@ -281,7 +281,7 @@ class Condition {
   }
 
   static std::string unsupported(const Node& n) {
-    static constexpr std::string_view props[] = {"NetClass", "NetName", "Type", "Layer", "L", "Reference", "Pad_Type", "Width",
+    static constexpr std::string_view props[] = {"NetClass", "NetName", "Type", "Layer", "L", "Reference", "Pad_Type", "Via_Type", "Width",
                                                  "Size_X", "Size_Y", "Position_X", "Position_Y"};
     static constexpr std::string_view calls[] = {"isPlated", "existsOnLayer", "insideArea", "intersectsArea", "enclosedByArea", "inDiffPair",
                                                  "memberOfFootprint", "intersectsCourtyard", "intersectsFrontCourtyard", "intersectsBackCourtyard"};
@@ -412,6 +412,20 @@ class Condition {
     } else if (n.fn == Fn::PadType && it->kind == ItemKind::Pad) {
       static const char* names[] = {"SMD", "Through-hole", "NPTH, mechanical", "Edge connector"};
       v.s = names[static_cast<int>(b.pads[static_cast<std::size_t>(it->index)].type)];
+      v.wild = 0;
+    } else if (n.fn == Fn::ViaType) {
+      if (it->kind != ItemKind::Via) return {};  // undefined on other items, as Width is on vias
+      // KiCad's ENUM_MAP<VIATYPE> names. A blind via touches an outer layer, a buried one does not. A router probe has
+      // no board via behind it and reads Through.
+      // shortcut: a micro-via probe (--micro-vias) reads Through; give the probe its type with TM-2.
+      model::ViaType t = model::ViaType::Through;
+      bool outer = true;
+      if (it->index >= 0) {
+        const auto& via = b.vias[static_cast<std::size_t>(it->index)];
+        t = via.type;
+        outer = via.layer_top == 0 || via.layer_bottom == b.copper_count() - 1;
+      }
+      v.s = t == model::ViaType::Micro ? "Micro" : t == model::ViaType::Blind ? (outer ? "Blind" : "Buried") : "Through";
       v.wild = 0;
     } else if (n.fn == Fn::Width) {
       // Only tracks and arcs have a Width in KiCad. A via's diameter (CopperItem::width) is not one: for pads and
@@ -563,7 +577,7 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
     }
     c.positional = c.cond && c.cond->references({"insideArea", "intersectsArea", "enclosedByArea", "memberOfFootprint",
                                                "intersectsCourtyard", "intersectsFrontCourtyard", "intersectsBackCourtyard",
-                                               "Reference", "Pad_Type", "Width", "Size_X", "Size_Y", "Position_X", "Position_Y"});
+                                               "Reference", "Pad_Type", "Via_Type", "Width", "Size_X", "Size_Y", "Position_X", "Position_Y"});
     // The per-class obstacle cache evaluates one representative net per (class, width, via size), cell by cell, so
     // positional conditions agree with the per-net check; only a condition that reads the net's own name (NetName,
     // inDiffPair) tells two nets of one class apart. Invalid rules are skipped by both paths.

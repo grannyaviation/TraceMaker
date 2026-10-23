@@ -69,7 +69,9 @@ class Obstacles {
   // Routed (rippable) copper only: 0 free, 1 conflicts (owners appended), 2 blocked when !soft.
   int routed_state(const geom::Shape& s, int layer, model::NetId net, drc::ItemKind kind, bool soft, std::vector<int>* owners,
                    bool via_hole = false, Coord hole_r = 0) const;
-  // Maximum routed_state over `layers` for a via and its hole; layer-independent hole checks run once.
+  // Maximum routed_state over `layers` for a via and its hole; layer-independent hole checks run once. Routed vias are
+  // tested on `layers` only: the caller passes every layer with routed copper near the point (router.cpp near_mark marks all
+  // layers of a routed via in reach), so a routed via within hole-to-hole reach shares a layer with it.
   int routed_via_state(const geom::Shape& s, model::LayerMask layers, model::NetId net, bool soft, Coord hole_r) const;
   // Rules outside the per-class cache require exact per-point checks.
   bool needs_exact_routing() const { return re_->needs_exact_routing(); }

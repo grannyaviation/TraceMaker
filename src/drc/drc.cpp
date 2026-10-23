@@ -394,7 +394,9 @@ class Checker {
         if (slot(a) || slot(c)) return;
         // KiCad tests via holes, then pad holes, clearing its list of tested pairs in between: a via and a pad
         // are reported twice (drc_test_provider_hole_to_hole.cpp).
-        const int reps = (a.via >= 0) != (c.via >= 0) ? 2 : 1;
+        // A laser via never runs the via pass (line 165), so a laser via and a pad hole are found once.
+        auto drilled_via = [&](const Hole& h) { return h.via >= 0 && b_.vias[static_cast<std::size_t>(h.via)].type != model::ViaType::Micro; };
+        const int reps = (a.via >= 0) != (c.via >= 0) && (drilled_via(a) || drilled_via(c)) ? 2 : 1;
         if (a.shape.pts.size() == 1 && c.shape.pts.size() == 1 && a.shape.pts[0] == c.shape.pts[0]) {
           for (int k = 0; k < reps; ++k) {
             Violation v;

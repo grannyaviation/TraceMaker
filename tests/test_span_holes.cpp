@@ -8,9 +8,11 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "drc/copper.hpp"
 #include "drc/drc.hpp"
@@ -42,7 +44,7 @@ std::string board_text(const std::string& extra) {
 // The project: JLCPCB's HDI numbers. `hole_clearance` and `clearance` are the knobs a test turns.
 struct Files {
   fs::path dir, pcb;
-  Files(const std::string& name, const std::string& board, const std::string& dru = "", double hole_clearance = 0.25, double clearance = 0.1) {
+  Files(const std::string& name, const std::string& board, const std::string& dru = "", double hole_clearance = 0.25, double clearance = 0.1, double hole_to_hole = 0.24) {
     dir = fs::temp_directory_path() / ("tmk_span_holes_" + name + "_" + std::to_string(::getpid()));
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -51,7 +53,7 @@ struct Files {
     if (!dru.empty()) std::ofstream(dir / "b.kicad_dru") << dru;
     std::ofstream(dir / "b.kicad_pro")
         << R"({"board":{"design_settings":{"rules":{"min_clearance":)" << clearance << R"(,"min_track_width":0.1,"min_hole_clearance":)"
-        << hole_clearance << R"(,"min_hole_to_hole":0.24,"min_copper_edge_clearance":0.2,"min_microvia_diameter":0.3,)"
+        << hole_clearance << R"(,"min_hole_to_hole":)" << hole_to_hole << R"(,"min_copper_edge_clearance":0.2,"min_microvia_diameter":0.3,)"
         << R"("min_microvia_drill":0.15,"min_via_diameter":0.3,"min_through_hole_diameter":0.15,"min_via_annular_width":0.05,)"
         << R"("allow_microvias":true,"allow_blind_buried_vias":true}}},)"
         << R"("net_settings":{"classes":[{"name":"Default","clearance":)" << clearance
@@ -273,4 +275,114 @@ TEST_CASE("span holes: a (layer inner) disallow track rule with a NetClass condi
   CHECK(ruled.routed == 1);  // net A cannot cross the wall
   CHECK_FALSE(inner(ruled, 1));
   CHECK(inner(ruled, 2));
+}
+
+// The sensor's own laser-via rules, copied from sensor_ts kicad/sensor/sensor.kicad_dru (jlc-hdi-microvia-hole-to-hole,
+// jlc-hdi-microvia-edge). KiCad's hole-to-hole rule has no net, so it binds a same-net through via too.
+const char* kJlcMicroviaRules =
+    "(version 1)\n"
+    "(rule \"jlc-hdi-microvia-hole-to-hole\" (condition \"A.Via_Type == 'Micro' || B.Via_Type == 'Micro'\") (constraint hole_to_hole (min 0.24mm)))\n"
+    "(rule \"jlc-hdi-microvia-edge\" (condition \"A.Via_Type == 'Micro'\") (constraint edge_clearance (min 0.35mm)))\n";
+
+TEST_CASE("span holes: the sensor's microvia hole-to-hole rule binds a through via of the same net", "[route][drc][span_holes]") {
+  // Board minimum 0.2 mm. A same-net 0.45 / 0.30 through via 0.45 mm away has 0.225 mm between the holes: legal by the
+  // board minimum, short of the rule's 0.24 mm. 0.50 mm away (0.275 mm) is legal.
+  const std::string via45 = "  (via (at 10.45 10) (size 0.45) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))\n";
+  {
+    // Without the rule the board minimum decides.
+    const Files f("via_type_off", board_text(""), "", 0.25, 0.1, 0.2);
+    auto lb = io::read_board_file(f.pcb.string());
+    const auto rules = io::read_design_rules(f.pcb.string());
+    route::Obstacles obs(lb.board, rules);
+    CHECK(obs.via_state({10 * MM + 450'000, 10 * MM}, 450'000, 300'000, 1, 0, false) == 0);
+  }
+  const Files f("via_type", board_text(""), kJlcMicroviaRules, 0.25, 0.1, 0.2);
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto rules = io::read_design_rules(f.pcb.string());
+  route::Obstacles obs(lb.board, rules);
+  CHECK(obs.rules().warnings().empty());
+  CHECK(obs.via_state({10 * MM + 450'000, 10 * MM}, 450'000, 300'000, 1, 0, false) == 2);
+  CHECK(obs.via_state({10 * MM + 500'000, 10 * MM}, 450'000, 300'000, 1, 0, false) == 0);
+  CHECK(obs.fixed_via_code({10 * MM + 450'000, 10 * MM}, 450'000, 300'000, 0, 1) == route::Obstacles::kBlocked);
+  CHECK(obs.fixed_via_code({10 * MM + 500'000, 10 * MM}, 450'000, 300'000, 0, 1) != route::Obstacles::kBlocked);
+  // Two through vias 0.225 mm between holes stay legal: the rule names laser vias.
+  const Files g("via_type_pair", board_text("  (via (at 5 5) (size 0.45) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))\n" +
+                                            std::string("  (via (at 5.525 5) (size 0.45) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))\n")),
+                 kJlcMicroviaRules, 0.25, 0.1, 0.2);
+  const auto lg = io::read_board_file(g.pcb.string());
+  CHECK(count(drc::run_drc(lg.board, io::read_design_rules(g.pcb.string())), "hole_to_hole") == 0);
+  // DRC: the through via is flagged against both halves (the stack, F.Cu-In1 and In1-In2), as KiCad does.
+  const Files h("via_type_drc", board_text(via45), kJlcMicroviaRules, 0.25, 0.1, 0.2);
+  const auto lh = io::read_board_file(h.pcb.string());
+  const auto r = drc::run_drc(lh.board, io::read_design_rules(h.pcb.string()));
+  CHECK(count(r, "hole_to_hole") == 2);
+  for (const auto& w : r.warnings) CHECK(w.find("not applied") == std::string::npos);
+  // jlc-hdi-microvia-edge: 0.35 mm from the edge for a laser via only (the board minimum is 0.2 mm).
+  const Files e("via_type_edge", board_text("  (via micro (at 0.45 5) (size 0.3) (drill 0.15) (layers \"F.Cu\" \"In1.Cu\") (net 1))\n"
+                                            "  (via (at 0.45 15) (size 0.45) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))\n"),
+                kJlcMicroviaRules, 0.25, 0.1, 0.2);
+  const auto le = io::read_board_file(e.pcb.string());
+  const auto re = drc::run_drc(le.board, io::read_design_rules(e.pcb.string()));
+  CHECK(count(re, "copper_edge_clearance") == 1);
+}
+
+TEST_CASE("span holes: a laser via and a pad hole are one hole-to-hole pair per via, as in KiCad", "[drc][span_holes]") {
+  // A plated 0.3 mm pad hole 0.45 mm from the stack: 0.225 mm between holes. KiCad's pad pass finds each laser via once
+  // (a laser via never runs the via pass), so two violations for the two halves.
+  const Files f("pad_pair", board_text(
+      "  (footprint \"H\" (layer \"F.Cu\") (at 10.45 10) (property \"Reference\" \"H1\" (at 0 0) (layer \"F.SilkS\"))\n"
+      "    (pad \"1\" thru_hole circle (at 0 0) (size 0.45 0.45) (drill 0.3) (layers \"*.Cu\") (net 2 \"B\")))\n"), "", 0.1, 0.05);
+  const auto lb = io::read_board_file(f.pcb.string());
+  const auto r = drc::run_drc(lb.board, io::read_design_rules(f.pcb.string()));
+  CHECK(count(r, "hole_to_hole") == 2);
+}
+
+TEST_CASE("span holes: a routed laser via is an obstacle on its own layers only", "[route][span_holes]") {
+  const Files f("routed_micro", board_text(""));
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto rules = io::read_design_rules(f.pcb.string());
+  route::Obstacles obs(lb.board, rules);
+  model::Via v;
+  v.pos = {5 * MM, 5 * MM};
+  v.size = 300'000;
+  v.drill = 150'000;
+  v.layer_top = 0;
+  v.layer_bottom = 1;
+  v.type = model::ViaType::Micro;
+  v.net = 1;
+  lb.board.vias.push_back(v);
+  obs.add_via(static_cast<int>(lb.board.vias.size()) - 1, 7);
+  const geom::Point a{4 * MM, 5 * MM + 330'000}, b{6 * MM, 5 * MM + 330'000};
+  for (int l = 0; l <= 1; ++l) {
+    std::vector<int> owners;
+    CHECK(obs.segment_state(a, b, l, kW, 2, true, &owners) == 1);  // rippable, not fixed
+    CHECK(std::find(owners.begin(), owners.end(), 7) != owners.end());
+    CHECK(obs.segment_state(a, b, l, kW, 2, false) == 2);
+  }
+  for (int l = 2; l <= 5; ++l) CHECK(obs.segment_state(a, b, l, kW, 2, true) == 0);
+  // The search's routed-copper check agrees (its via parts take the layers of the probe).
+  const auto probe = geom::Shape::segment(a, b, kW / 2);
+  CHECK(obs.routed_state(probe, 1, 2, drc::ItemKind::Track, false, nullptr) == 2);
+  CHECK(obs.routed_state(probe, 3, 2, drc::ItemKind::Track, false, nullptr) == 0);
+  // A new micro via on In3-In4 beside it meets nothing: no shared layer, whatever the distance of the holes.
+  CHECK(obs.via_state_span({5 * MM + 300'000, 5 * MM}, 300'000, 150'000, 2, 0, true, nullptr, 3, 4, model::ViaType::Micro) == 0);
+  CHECK(obs.routed_via_state(geom::Shape::point({5 * MM + 300'000, 5 * MM}, 150'000), model::layer_bit(3) | model::layer_bit(4), 2, false, 75'000) == 0);
+  CHECK(obs.routed_via_state(geom::Shape::point({5 * MM + 300'000, 5 * MM}, 150'000), model::layer_bit(0), 2, false, 75'000) == 2);
+}
+
+TEST_CASE("span holes: a (layer inner) track_width rule with a NetClass condition", "[drc][span_holes]") {
+  const char* dru = "(version 1)\n(rule \"pwr inner width\" (layer inner) (condition \"A.NetClass == 'PWR_0A5'\") (constraint track_width (min 0.25mm)))\n";
+  const std::string tracks =
+      "  (segment (start 3 3) (end 5 3) (width 0.1) (layer \"In2.Cu\") (net 1))\n"  // class PWR_0A5, inner, 0.1 < 0.25: flagged
+      "  (segment (start 3 5) (end 5 5) (width 0.1) (layer \"F.Cu\") (net 1))\n"     // outer: the rule does not apply
+      "  (segment (start 3 7) (end 5 7) (width 0.1) (layer \"In3.Cu\") (net 2))\n"   // other class: not applied
+      "  (segment (start 3 9) (end 5 9) (width 0.25) (layer \"In4.Cu\") (net 1))\n"; // wide enough
+  const Files f("width_rule", board_text(tracks), dru);
+  const auto lb = io::read_board_file(f.pcb.string());
+  const auto r = drc::run_drc(lb.board, io::read_design_rules(f.pcb.string()));
+  CHECK(count(r, "track_width") == 1);
+  for (const auto& v : r.violations)
+    if (v.type == "track_width") CHECK(v.layer == 2);
+  // The router takes its width from the net class and does not read a track_width minimum from a rule: net A's class
+  // width is 0.25 mm here, so its tracks meet the rule; a rule above the class width would not be met by the router.
 }

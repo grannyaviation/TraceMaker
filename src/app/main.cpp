@@ -564,6 +564,7 @@ int cmd_debug_seg(const std::string& path, const std::vector<double>& v, int lay
     }
   }
   for (const auto& h : obs.copper().holes) {
+    if (!(h.layers & tmk::model::layer_bit(layer))) continue;  // a laser via's hole is no obstacle on the other layers
     const double g = tmk::geom::gap(s, h.shape);
     if (g < 1.0e6) std::printf("  hole plated %d net %d clearance %.4f gap %.4f mm\n", h.plated ? 1 : 0, static_cast<int>(h.net), tmk::nm_to_mm(h.clearance), g / 1e6);
   }
