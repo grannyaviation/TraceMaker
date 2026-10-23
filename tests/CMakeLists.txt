@@ -2,8 +2,8 @@ find_package(Catch2 3 REQUIRED)
 include(Catch)
 
 find_package(nlohmann_json 3 REQUIRED)
-add_executable(tm_tests test_units.cpp test_rng.cpp test_gpu.cpp test_sexpr.cpp test_kicad_io.cpp test_rules.cpp test_netlist.cpp test_geom.cpp test_escape.cpp test_diff_pair.cpp test_plane_smd.cpp test_design_rules.cpp test_rule_geometry.cpp test_rule_layer_context.cpp test_layer_limits.cpp test_from_copper.cpp test_via_spacing.cpp test_soft_zones.cpp test_refill.cpp test_work_profile.cpp test_txn.cpp test_bus.cpp test_passes.cpp test_srj.cpp test_tui.cpp test_advice.cpp test_stall.cpp test_return_path.cpp test_footprint_check.cpp test_critical.cpp)
-target_link_libraries(tm_tests PRIVATE tm::core tm::gpu tm::sexpr tm::model tm::io tm::geom tm::drc tm::route tm::passes tm::advice tm::analysis tm::crules tm::app_tui nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
+add_executable(tm_tests test_units.cpp test_rng.cpp test_gpu.cpp test_sexpr.cpp test_kicad_io.cpp test_rules.cpp test_netlist.cpp test_geom.cpp test_escape.cpp test_diff_pair.cpp test_plane_smd.cpp test_design_rules.cpp test_rule_geometry.cpp test_rule_layer_context.cpp test_layer_limits.cpp test_soft_zones.cpp test_refill.cpp test_work_profile.cpp test_txn.cpp test_bus.cpp test_passes.cpp test_srj.cpp test_tui.cpp test_advice.cpp test_stall.cpp test_return_path.cpp test_footprint_check.cpp test_critical.cpp test_session.cpp test_kicad_measured_shapes.cpp test_from_copper.cpp test_via_spacing.cpp)
+target_link_libraries(tm_tests PRIVATE tm::core tm::gpu tm::sexpr tm::model tm::io tm::geom tm::drc tm::route tm::passes tm::advice tm::session tm::analysis tm::crules tm::app_tui nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
 target_compile_definitions(tm_tests PRIVATE TM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 tm_set_warnings(tm_tests)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test-results)
@@ -33,6 +33,8 @@ set_tests_properties(python_bindings PROPERTIES SKIP_RETURN_CODE 77 LABELS "pyth
 # KiCad PCM package: build the archive and check its layout and metadata.
 add_test(NAME pcm_package COMMAND sh -c "python3 '${PROJECT_SOURCE_DIR}/scripts/make_pcm_package.py' --out '${CMAKE_BINARY_DIR}/pcm-test' && python3 '${PROJECT_SOURCE_DIR}/scripts/validate_pcm.py' '${CMAKE_BINARY_DIR}/pcm-test/tracemaker-${PROJECT_VERSION}.zip'")
 set_tests_properties(pcm_package PROPERTIES LABELS "kicad" TIMEOUT 120)
+add_test(NAME pcm_package_bundled COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/pcm_bundled.py $<TARGET_FILE:tracemaker> $<TARGET_FILE:tracemaker-place> ${CMAKE_BINARY_DIR}/integration/pcm_bundled)
+set_tests_properties(pcm_package_bundled PROPERTIES LABELS "kicad;integration" TIMEOUT 300)
 add_test(NAME length_tuning COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/length_tuning.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/length)
 set_tests_properties(length_tuning PROPERTIES SKIP_RETURN_CODE 77 LABELS "kicad;integration" TIMEOUT 600)
 
@@ -68,6 +70,16 @@ set_tests_properties(tui_options PROPERTIES LABELS "integration" TIMEOUT 300)
 # Frozen KiCad 10 custom-rule item/pair multisets (expected.json names the judging version); normal runs do not require KiCad.
 add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/rule_parity/run.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/rule_parity)
 set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)
+# Copper against the outline at zero clearance, per shape, against frozen KiCad 10.0.6 counts (issue #42, D120); normal runs do not require KiCad.
+add_test(NAME edge_touch COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/edge_touch/run.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/edge_touch)
+set_tests_properties(edge_touch PROPERTIES LABELS "integration;rules" TIMEOUT 300)
+# --relax and the other round-based options run with --variants 1 instead of being ignored (M17, D122).
+add_test(NAME round_options COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/round_options.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/round_options)
+set_tests_properties(round_options PROPERTIES LABELS "route;integration" TIMEOUT 600)
+# The agent skills' scripts (D84): preflight findings on plane_smd, reports that board text cannot forge, sign-off
+# verdicts and exit codes against a stand-in kicad-cli. Needs neither KiCad nor, for most of it, the engine.
+add_test(NAME skills_scripts COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/skills_scripts.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/skills_scripts)
+set_tests_properties(skills_scripts PROPERTIES LABELS "integration;skills" TIMEOUT 300)
 # Buses (doc 05 §38, D91): generated boards routed lane by lane, judged by `tracemaker buses` on the written files
 # (members routed, equal vias, skew within the limit from an option or a .kicad_dru rule), and a bus run at 1, 2 and
 # 4 threads giving identical bytes. Needs no fixtures and no KiCad.
@@ -110,3 +122,7 @@ add_test(NAME footprint_check_cli COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/in
 set_tests_properties(footprint_check_cli PROPERTIES LABELS "route;integration" TIMEOUT 300)
 add_test(NAME critical_nets_cli COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/critical_nets.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/critical_nets)
 set_tests_properties(critical_nets_cli PROPERTIES LABELS "route;integration" TIMEOUT 300)
+
+# The board session an agent drives (doc 19, M18): both transports through the real binary, a hostile net name, replay, and equality with `route --variants 1`.
+add_test(NAME session_cli COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/session_cli.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/session_cli)
+set_tests_properties(session_cli PROPERTIES SKIP_RETURN_CODE 77 LABELS "integration;session" TIMEOUT 600)

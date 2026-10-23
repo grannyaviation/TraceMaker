@@ -269,7 +269,7 @@ namespace {
 
 struct Reply {
   http::status status = http::status::internal_server_error;
-  std::string body, set_cookie, referrer_policy;
+  std::string body, set_cookie, referrer_policy, frame_options, csp;
 };
 
 Reply get_with(std::uint16_t port, const std::string& target, const std::string& host, const std::string& cookie = "") {
@@ -286,7 +286,8 @@ Reply get_with(std::uint16_t port, const std::string& target, const std::string&
   beast::flat_buffer buf;
   http::response<http::string_body> res;
   http::read(s, buf, res);
-  return {res.result(), res.body(), std::string(res[http::field::set_cookie]), std::string(res["Referrer-Policy"])};
+  return {res.result(), res.body(), std::string(res[http::field::set_cookie]), std::string(res["Referrer-Policy"]), std::string(res["X-Frame-Options"]),
+          std::string(res["Content-Security-Policy"])};
 }
 
 // A WebSocket handshake with the given headers: the status of the answer (101 = accepted).
@@ -325,6 +326,21 @@ struct WebDir {
 };
 
 }  // namespace
+
+TEST_CASE("the viewer is found through TM_VIEW_DIR when it holds an index.html, and the variable is ignored when it does not", "[server]") {
+  WebDir w;  // a directory with an index.html
+  const auto empty = std::filesystem::temp_directory_path() / ("tm_view_empty_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(empty);
+  const char* before = std::getenv("TM_VIEW_DIR");
+  const std::string saved = before != nullptr ? before : "";
+  ::setenv("TM_VIEW_DIR", w.dir.c_str(), 1);
+  CHECK(server::default_web_root() == w.dir.string());
+  ::setenv("TM_VIEW_DIR", empty.c_str(), 1);
+  CHECK(server::default_web_root() != empty.string());  // no index.html there: the next candidate is used
+  if (before != nullptr) ::setenv("TM_VIEW_DIR", saved.c_str(), 1);
+  else ::unsetenv("TM_VIEW_DIR");
+  std::filesystem::remove_all(empty);
+}
 
 TEST_CASE("viewer server: by default only this machine can reach it, and a page on another site cannot read the stream", "[server][security]") {
   WebDir w;
@@ -578,4 +594,26 @@ TEST_CASE("viewer server: a burst of upgrades cannot overshoot the cap, and one 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(get_with(srv.port(), "/", "127.0.0.1").status == http::status::ok);
   }
+}
+
+TEST_CASE("viewer server: --view-embed lets the named dashboard frame the viewer and nobody else", "[server][security]") {
+  WebDir w;
+  auto o = test_options(w.dir, "0.0.0.0");
+  {
+    server::ViewerServer srv(o);
+    const auto r = get_with(srv.port(), "/?token=" + srv.token(), "127.0.0.1:" + std::to_string(srv.port()));
+    CHECK(r.frame_options == "DENY");  // by default no page may frame it
+    CHECK(r.csp.empty());
+  }
+  o.embed = "http://192.168.1.83:8771 http://localhost:8771";
+  {
+    server::ViewerServer srv(o);
+    const auto r = get_with(srv.port(), "/?token=" + srv.token(), "127.0.0.1:" + std::to_string(srv.port()));
+    CHECK(r.status == http::status::ok);
+    CHECK(r.frame_options.empty());
+    CHECK(r.csp == "frame-ancestors http://192.168.1.83:8771 http://localhost:8771");
+    CHECK(get_with(srv.port(), "/", "127.0.0.1:" + std::to_string(srv.port())).status == http::status::unauthorized);  // the token still guards it
+  }
+  o.embed = "http://x; script-src *";  // a header cannot be built from this
+  CHECK_THROWS(server::ViewerServer(o));
 }

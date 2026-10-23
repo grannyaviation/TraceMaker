@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "drc/copper.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -82,8 +85,18 @@ std::vector<Shape> pad_shapes(const model::Pad& p) {
       // Anchor (a small circle or rect of the pad size) plus the primitive polygons, each grown by half its outline
       // width as KiCad draws it (TI VSON-CLIP-8: 0.01 mm, else 5 µm short of KiCad's DRC).
       out.push_back(rect(w / 2, h / 2, 0));
-      for (std::size_t i = 0; i < p.custom_polys.size(); ++i)
-        if (p.custom_polys[i].size() >= 3) out.push_back(poly(p.custom_polys[i], i < p.custom_widths.size() ? p.custom_widths[i] / 2 : 0));
+      for (const auto& cp : p.custom_prims) {
+        using K = model::Pad::CustomPrim::Kind;
+        if (cp.kind == K::Disc) {
+          out.push_back(Shape::point(tf(cp.pts[0]), cp.radius));
+        } else if (cp.kind == K::Polyline) {
+          std::vector<Point> q = cp.pts;
+          for (auto& v : q) v = tf(v);
+          out.push_back(Shape::polyline(std::move(q), cp.radius));
+        } else if (cp.pts.size() >= 3) {
+          out.push_back(poly(cp.pts, cp.radius));
+        }
+      }
       break;
     }
   }
@@ -252,7 +265,9 @@ CopperModel build_copper(const model::Board& b) {
     if (shapes.empty()) continue;
     if (layer < 0) {  // Edge.Cuts: outline pieces, compared at zero width
       for (auto& s : shapes) {
-        s.r = 0;
+        // Edge.Cuts pieces count at zero width; Margin pieces with their stroke (KiCad's actual distance to a 2 mm Margin line is 0 for
+        // copper that touches the stroke: PCBench RaspberryPi-PoE_PoELLi_PI).
+        if (!margin) s.r = 0;
         s.update_box();
         (margin ? m.margins : m.edges).push_back(std::move(s));
       }
@@ -283,6 +298,29 @@ CopperModel build_copper(const model::Board& b) {
         g.net = p.net;
         break;
       }
+    }
+  }
+  // Board copper graphics (a manual pour drawn as a polygon) are copper of the net they touch: pads, tracks and vias of exactly one net. Touching several nets, or none: net-less.
+  if (b.infer_graphic_nets) {
+    for (auto& g : m.items) {
+      if (g.kind != ItemKind::Graphic || g.net != 0 || g.footprint >= 0) continue;
+      model::NetId only = 0;
+      bool many = false;
+      for (const auto& p : m.items) {
+        if (many) break;
+        if ((p.kind != ItemKind::Pad && p.kind != ItemKind::Track && p.kind != ItemKind::Via) || p.net == 0 || !(p.layers & g.layers) || p.net == only) continue;
+        bool touch = false;
+        for (const auto& s : g.shapes) {
+          for (const auto& u : p.shapes)
+            if (geom::closer_than(s, u, 1)) touch = true;
+          if (touch) break;
+        }
+        if (!touch) continue;
+        if (only == 0) only = p.net;
+        else many = true;
+      }
+      if (!many) g.net = only;
+      if (std::getenv("TM_DEBUG_GFX")) std::fprintf(stderr, "board copper graphic %d: net %d%s\n", g.index, static_cast<int>(g.net), many ? " (several nets: net-less)" : "");
     }
   }
   return m;

@@ -26,6 +26,8 @@
 #include "io/kicad/project_reader.hpp"
 #include "io/srj/srj.hpp"
 #include "route/router.hpp"
+#include "session/session.hpp"
+#include "session/transport.hpp"
 #include "server/messages.hpp"
 #include "server/viewer_server.hpp"
 #include "learn/knowledge_base.hpp"
@@ -399,6 +401,39 @@ int cmd_footprint_check(const std::string& path, const std::string& refs, const 
 }
 
 // `advice-check`: read an advice file and check it against a board without routing (the refusals `route --advice` would give).
+// `session`: a board session an agent can drive over MCP (standard input and output) or JSON lines (doc 19). Standard output carries the protocol only, so
+// everything else goes to standard error. `--replay LOG` runs the calls of a log again and checks every result and state digest.
+int cmd_session(const std::string& board, const std::string& out, std::uint64_t seed, long work_limit, int threads, bool use_gpu, const std::string& log, bool jsonl,
+                const std::string& replay, bool view, int view_port, const std::string& view_host, const std::string& view_token, bool view_insecure) {
+  tmk::session::SessionOptions so;
+  so.in = board;
+  so.out = out;
+  so.seed = seed;
+  so.work_limit = work_limit;
+  so.threads = threads;
+  so.gpu_device = tmk::app::default_gpu_device(use_gpu);
+  so.log = log;
+  std::unique_ptr<tmk::server::ViewerServer> server;
+  if (view) {
+    server = std::make_unique<tmk::server::ViewerServer>(viewer_options(view_host, view_port, view_token, view_insecure));
+    so.sink = server.get();
+  }
+  tmk::session::Session session(so);
+  if (server) {
+    server->publish(tmk::server::board_snapshot_json(session.base(), std::filesystem::path(board).filename().string()));
+    std::fprintf(stderr, "live view: %s\n", server->url().c_str());
+    if (const auto notice = server->notice(); !notice.empty()) std::fprintf(stderr, "warning: %s\n", notice.c_str());
+  }
+  if (!replay.empty()) {
+    const auto r = session.replay(replay);
+    std::fprintf(stderr, "%s\n", r.message.c_str());
+    return r.ok ? 0 : 1;
+  }
+  if (jsonl) tmk::session::run_jsonl(session, std::cin, std::cout);
+  else tmk::session::run_mcp(session, std::cin, std::cout);
+  return 0;
+}
+
 int cmd_advice_check(const std::string& board_path, const std::string& advice_path, const std::string& json_path) {
   const auto lb = tmk::io::read_board_file(board_path);
   const auto adv = tmk::advice::load_advice_file(advice_path);
@@ -880,6 +915,7 @@ int main(int argc, char** argv) {
   route->add_option("--rounds", ropt.rounds, "Portfolio: split the work budget into this many rounds; each round every variant continues from the best state of the last")->group("");
   route->add_option("--breakout-portfolio", ropt.breakout_portfolio, "1 (default): a ball-grid breakout board gets the breakout portfolio with --variants > 1; 0: the designed variants")->group("");
   std::string r_warm_pcb;
+  route->add_option("--legalize-subdivide", ropt.legalize_subdivide_mm, "With --legalize or --relax: cut route tracks into pieces of at most this length (mm) so a long track can bend where its neighbours are too close, not only move as a whole; straight pieces are merged again (default 0 = off)")->group("");
   route->add_flag("--legalize", ropt.legalize, "Warm start: move the vertices of the saved routes until the clearances hold (gridless compaction), then keep what is legal")->group("");
   route->add_option("--warm-pcb", r_warm_pcb, "Start from the tracks and vias of this routed board (e.g. a relaxed-clearance solution after legalisation); what is not legal under the input's rules is dropped and routed again")->group("");
   route->add_option("--state-out", ropt.state_out, "Portfolio: write the best routes after every round to this file so the run can be resumed")->group("");
@@ -929,6 +965,18 @@ int main(int argc, char** argv) {
   route->add_option("--global-congestion-from", ropt.global_congestion_from, "Congestion threshold, eighths of tile capacity")->group("");
   route->add_option("--global-congestion-pen", ropt.global_congestion_pen, "Congestion cost, pitches per step per eighth above the threshold")->group("");
   route->add_flag("--escape-plan,!--no-escape-plan", ropt.escape_plan, "Reserve escape corridors for the pins of dense packages (QFP, BGA) before routing");
+  route->add_option("--escape-length", ropt.escape_length_mm, "Escape plan: perimeter corridors run this far (mm) past the package edge, as far as no fixed copper is in the way (default 2): bundles of parallel straight escapes")->group("");
+  route->add_flag("--escape-stubs", ropt.escape_stubs, "Escape plan: a pin offers the end of its straight corridor (see --escape-length) as a start point, one exact off-lattice segment at a discount: parallel escapes at the pad pitch")->group("");
+  route->add_flag("--soft-mask-graphics", ropt.soft_mask_graphics, "Solder-mask openings drawn as footprint graphics (solder jumpers, a MEMS microphone's pad group) do not keep tracks and vias out; KiCad flags what then lies in them (judgement)")->group("");
+  route->add_flag("--soft-copper-graphics", ropt.soft_copper_graphics, "Board copper graphics (polygons on a copper layer, e.g. an EasyEDA import's pours) take the net of the one net whose pads, tracks or vias they touch: that net may touch them, no other (default: net-less copper nothing may touch)")->group("");
+  route->add_flag("--via-drops", ropt.via_drops, "Pins of dense packages may drop to a via a little way out, off the lattice, then go on on the other layer (short pin-to-via drops)")->group("");
+  route->add_flag("--bundle-escape", ropt.bundle_escape, "Bundle (river) escapes: the connections that leave one side of a dense package for one side of another part are placed first as a block of parallel straight lanes in pin order, peeling off at their pads; the router may not rip the lanes (doc 05 section 50)")->group("");
+  route->add_flag("--package-tunnels", ropt.package_tunnels, "A connection between two perimeter pins of one dense package on one net gets a stub and a via at each pin and its run on the other layer between them (the core rail's tunnel under the package), placed before the search (doc 05 section 52)")->group("");
+  route->add_flag("--supply-first", ropt.supply_first, "Route first, and protect from ripping, the nets with two or more perimeter pins on one dense package and no pour (supply and core nets)(doc 05 section 51)")->group("");
+  route->add_option("--bundle-min", ropt.bundle_min_lanes, "With --bundle-escape: connections needed in a group to form a bundle (default 3)")->group("");
+  route->add_flag("--escape-persist", ropt.escape_persist, "Escape plan: a ripped-up connection gets its pins' corridors back, and a corridor is kept while the net has other open connections at that package")->group("");
+  route->add_flag("--radial-supply", ropt.radial_supply, "Spanning tree: a net with 3+ pins on one dense package gets no edge between two of those pins (each goes to a capacitor or via: radial supply pins)")->group("");
+  route->add_option("--radial-penalty", ropt.radial_penalty_mm, "With --radial-supply: what such an edge costs in the spanning tree (mm, default 10)")->group("");
   route->add_flag("--escape-second-ring", ropt.escape_second_ring, "Escape plan: second-ring balls between two outer balls (else dog-bone vias)")->group("");
   route->add_flag("--escape-flow", ropt.escape_flow,
                   "Escape plan v2: min-cost-flow channel and layer assignment for deep BGA arrays (implies --escape-plan; experimental)");
@@ -950,6 +998,8 @@ int main(int argc, char** argv) {
   route->add_flag("--keep-vias-off-pads", ropt.vias_off_pads, "Vias keep clear of SMD pads narrower than --vias-off-pads-below (via-in-pad excepted)");
   route->add_option("--vias-off-pads-below", ropt.vias_off_pads_below_mm, "Pad width (mm) below which --keep-vias-off-pads applies (default 2)");
   tmk::app::RouteJob r_job;
+  route->add_option("--no-neck-nets", ropt.no_neck_nets, "Comma-separated nets that are never narrowed below their class width nor given the small neck-down via (power nets of a rule-relaxed routing)")->delimiter(',');
+  route->add_flag("--first-nets-ordered", ropt.first_nets_ordered, "Route the --first-nets in the order of the list (e.g. the pins of a package round its perimeter), not in the router's own order");
   route->add_option("--first-nets", ropt.first_nets, "Comma-separated nets routed first, also after restarts; other nets do not rip them (e.g. crystal lines)")->delimiter(',');
   route->add_option("--bus", r_job.buses,
                     "Experimental. Route these nets as a bus, NAME=PATTERN (repeatable): lane by lane on the same layers, e.g. 'DATA=/D[0-7]' or 'LCD=/LCD_*'. "
@@ -1013,6 +1063,7 @@ int main(int argc, char** argv) {
   route->add_option("--view-token", r_job.view_token, "Token for a viewer that other machines can reach (16+ characters; default: a random one, printed in the URL)");
   route->add_flag("--view-insecure", r_job.view_insecure, "Serve a viewer that other machines can reach WITHOUT a token (anyone who can reach the port can watch the board)");
   route->add_option("--view-port", r_job.view_port, "Viewer port (default 8766)");
+  route->add_option("--view-embed", r_job.view_embed, "Pages that may show the viewer in a frame, origins separated by spaces (e.g. a dashboard: http://host:8771); default: none");
   route->add_flag("--hold", r_job.hold, "Keep serving the viewer after routing finishes");
   route->add_option("--json", r_json, "Write a result summary as JSON");
   route->add_option("--component-rules", r_job.component_rules,
@@ -1130,6 +1181,26 @@ int main(int argc, char** argv) {
   advice_cmd->add_option("board", ac_board)->required()->check(CLI::ExistingFile);
   advice_cmd->add_option("advice", ac_advice, "Advice file (JSON)")->required()->check(CLI::ExistingFile);
   advice_cmd->add_option("--json", ac_json, "Write what each hint became as JSON");
+  auto* session_cmd = app.add_subcommand("session", "Serve a board session to an agent over MCP (stdin/stdout) or JSON lines: list open connections, route with hints, rip, undo, save (doc 19)");
+  std::string se_board, se_out, se_log, se_replay, se_host, se_token;
+  std::uint64_t se_seed = 1;
+  long se_limit = 0;
+  int se_threads = 4, se_port = 8766;
+  bool se_jsonl = false, se_gpu = false, se_view = false, se_insecure = false;
+  session_cmd->add_option("board", se_board)->required()->check(CLI::ExistingFile);
+  session_cmd->add_option("--out", se_out, "Where the `save` tool writes the board (without it `save` is refused; the agent cannot name a path)");
+  session_cmd->add_option("--seed", se_seed, "Router seed of a route call that gives none")->default_val(1);
+  session_cmd->add_option("--work-limit", se_limit, "Search work (steps) of the whole session; 0 = none")->default_val(0);
+  session_cmd->add_option("--threads", se_threads, "Portfolio threads of a route call with several variants (the result does not depend on it)")->default_val(4);
+  session_cmd->add_option("--log", se_log, "Write every call, result digest and state digest here (JSON lines), to replay the session");
+  session_cmd->add_option("--replay", se_replay, "Run the calls of this log again and check every digest instead of serving an agent");
+  session_cmd->add_flag("--jsonl", se_jsonl, "JSON lines ({\"tool\": NAME, \"args\": {...}} per line) instead of MCP");
+  session_cmd->add_flag("--gpu", se_gpu, "Cost-to-go fields on the GPU (default: the CPU reference; same results)");
+  session_cmd->add_flag("--view", se_view, "Stream the router's events to the browser viewer, so a person can watch the agent");
+  session_cmd->add_option("--view-host", se_host, "Viewer bind address (default $TM_VIEW_HOST, else 127.0.0.1; another address needs a token)");
+  session_cmd->add_option("--view-port", se_port, "Viewer port")->default_val(8766);
+  session_cmd->add_option("--view-token", se_token, "Token for a viewer other machines can reach");
+  session_cmd->add_flag("--view-insecure", se_insecure, "A viewer other machines can reach WITHOUT a token");
   auto* style_cmd = app.add_subcommand("style", "Style metric of a routed board: bends, acute angles, stair-steps, detours (doc 05 §39)");
   std::string sty_board, sty_json;
   bool sty_conn = false;
@@ -1247,6 +1318,7 @@ int main(int argc, char** argv) {
     if (*pairs_cmd) return cmd_pairs(pr_board, pr_extra, pr_json);
     if (*buses_cmd) return cmd_buses(bu_board, bu_specs, bu_detect, bu_skew, bu_json);
     if (*advice_cmd) return cmd_advice_check(ac_board, ac_advice, ac_json);
+    if (*session_cmd) return cmd_session(se_board, se_out, se_seed, se_limit, se_threads, se_gpu, se_log, se_jsonl, se_replay, se_view, se_port, se_host, se_token, se_insecure);
     if (*rp_cmd) {
       for (const auto& r : rp_refs) {
         const auto eq = r.rfind('=');

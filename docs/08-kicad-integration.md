@@ -1,3 +1,8 @@
+---
+status: current
+code: [src/io, src/sexpr, kicad_plugin]
+---
+
 # 08 — KiCad integration
 
 > Part of the TraceMaker plan. Start at [`../PLAN.md`](../PLAN.md).
@@ -189,14 +194,22 @@ kicad-cli pcb drc --format json --severity-all --all-track-errors --exit-code-vi
   give byte-identical boards (ctest `python_bindings` checks this on a PCBench board). The GIL is released while
   routing and checking. The module is built into `build/<preset>/python/` (D18).
 - **PCM package**: `scripts/make_pcm_package.py` writes `build/pcm/tracemaker-<version>.zip` (metadata schema v2
-  as shipped with KiCad 10, `type: plugin`, `runtime: ipc`, `kicad_version: 10.0`, the plugin under `plugins/`, a
-  generated 64×64 `resources/icon.png`; reproducible archive). `scripts/validate_pcm.py` checks the layout and
+  as shipped with KiCad 10, `type: plugin`, `runtime: ipc`, `kicad_version: 10.0`, the plugin under `plugins/`, the
+  brand icon as `resources/icon.png` (64×64) and as the action's toolbar icons (`icons-light`/`icons-dark`, 24 and 48 px,
+  D123); reproducible archive). `scripts/validate_pcm.py` checks the layout and
   metadata and also runs kicad-python's official validator when it is installed; ctest `pcm_package` builds and
   validates the archive. The engine is not bundled by default (D19); `--binary`/`--module` bundle the Linux builds
   for use on the same machine. Installed through the Plugin and Content Manager of a running KiCad 10.0.6 (headless, as above; Install from
   File…): the manager lists TraceMaker 0.1.0 as installed and compatible, and the files are in
   `3rdparty/plugins/org_tracemaker_autoroute/` (`report/m11-gui/pcm-installed.png`). Not checked: that KiCad then
   builds the plugin's virtual environment and shows the toolbar button (the container had no network for pip).
+- **Release package (M17, D121)**: `scripts/make_release.py` builds the `dist` preset (CPU only, libstdc++, libgcc, SQLite and zstd linked statically; the binary needs glibc 2.38) and writes a
+  tarball and `tracemaker-<version>-pcm-linux-x86_64.zip`, the same package with `plugins/bin/tracemaker`, `plugins/bin/tracemaker-place` and the built viewer
+  (`plugins/share/tracemaker/viewer`, found because the binaries look in `../share/tracemaker/viewer` and `TM_VIEW_DIR`) inside. `scripts/test_release_install.py` installs the tarball in a clean
+  container with no compiler and no Python (Ubuntu 24.04, Debian 13 and Fedora pass; Debian 12 fails on glibc, as expected), serves the viewer page, routes the example board (49 of 49
+  connections; `tracemaker drc --refill-zones` finds no error and nothing unconnected) in 5 s, and validates the package. `scripts/kicad_gui_roundtrip.py --package ZIP` runs the plugin as unpacked from that
+  zip (no executable bit kept, no `TRACEMAKER` variable) in the live KiCad 10.0.6 GUI: 498 tracks and 15 vias added, one undo removes them, redo restores them, no new DRC error. Not
+  checked: KiCad's own Install from File on this archive, and its virtual environment for kicad-python.
 
 ## 9. Simple Route JSON (`src/io/srj`, D90)
 
