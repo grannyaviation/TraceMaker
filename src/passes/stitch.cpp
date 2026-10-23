@@ -97,10 +97,12 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
     }
     return n;
   };
-  // What already ties a net's layers together: its through vias and plated through-hole pads.
+  // What already ties a net's layers together: its through vias and plated through-hole pads. A laser or blind via
+  // ties only the layers of its span (on six layers an outer layer to its adjacent plane), so it is no return for a
+  // side change and serves no grid site.
   std::map<NetId, std::vector<Point>> ties;
   for (const auto& v : w.vias)
-    if (v.net > 0 && v.layer_top != v.layer_bottom) ties[v.net].push_back(v.pos);
+    if (v.net > 0 && v.type == model::ViaType::Through && v.layer_top != v.layer_bottom) ties[v.net].push_back(v.pos);
   for (const auto& p : w.pads)
     if (p.net > 0 && p.type == model::PadType::ThruHole) ties[p.net].push_back(p.pos);
   const auto ties_before = ties;
@@ -231,8 +233,8 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
     auto& out = res.returns[k];
     if (rn.signal <= 0 || rn.plane <= 0 || rn.signal == rn.plane || rn.distance <= 0) continue;
     std::vector<const model::Via*> sv;
-    for (const auto& v : board.vias)
-      if (v.net == rn.signal) sv.push_back(&v);
+    for (const auto& v : board.vias)  // a laser or blind signal via changes no side: it needs no through via beside it
+      if (v.net == rn.signal && v.type == model::ViaType::Through) sv.push_back(&v);
     std::sort(sv.begin(), sv.end(), [](const model::Via* a, const model::Via* b) { return std::tie(a->pos.x, a->pos.y) < std::tie(b->pos.x, b->pos.y); });
     const model::Via proto = via_for(rn.plane, {});
     const Coord gap = std::max(rules.class_for(w.nets[static_cast<std::size_t>(rn.signal)].name).clearance,
@@ -317,7 +319,8 @@ StitchResult stitch_vias(const model::Board& board, const model::DesignRules& ru
       const auto& rn = opt.returns[k];
       res.returns[k].stitched_after = 0;
       for (const auto& v : board.vias)
-        if (v.net == rn.signal && rn.signal > 0) res.returns[k].stitched_after += tied(now, rn.plane, v.pos, rn.distance);
+        if (v.net == rn.signal && rn.signal > 0 && v.type == model::ViaType::Through)
+          res.returns[k].stitched_after += tied(now, rn.plane, v.pos, rn.distance);
     }
   }
   return res;

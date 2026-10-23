@@ -17,8 +17,8 @@ struct StitchOptions {
   // Grid pitch. The default is the catalogue's general high-speed value (TI SPRAAR7J: a stitching via within
   // 200 mil); app code passes the catalogue's number, this is its fallback.
   Coord pitch = 5'080'000;
-  // Return-path stitching: every via of `signal` wants a via (or plated through-hole pad) of `plane` within
-  // `distance`, centre to centre.
+  // Return-path stitching: every through via of `signal` wants a through via (or plated through-hole pad) of `plane`
+  // within `distance`, centre to centre. Laser and blind vias count on neither side (they tie the layers of their span).
   struct ReturnNet {
     model::NetId signal = 0, plane = 0;
     Coord distance = 5'080'000;
@@ -33,7 +33,7 @@ struct StitchReturn {
   model::NetId signal = 0, plane = 0;
   std::string source;
   Coord distance = 0;
-  int signal_vias = 0;          // vias of the signal net on the board (old and new)
+  int signal_vias = 0;          // through vias of the signal net on the board (old and new); laser and blind vias change no side
   int stitched_before = 0;      // of them: with a plane via or plated pad within the distance before the pass
   int stitched_after = 0;       // ... and after it
 };

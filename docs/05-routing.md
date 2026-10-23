@@ -1610,6 +1610,9 @@ Vias of an existing net, added where they tie that net's copper on two or more l
   nearest first (16 directions, ring spacing half a via, positions on whole micrometres); the first site that
   passes is used. The same two-layer condition holds: a return via ties planes together, so a board with the
   plane net on one layer only gets none, and the via is reported as unstitched.
+  Only through vias count (granny fork, TM-1c): a laser or blind via of the signal changes no side and is not served, and
+  a laser or blind via of the plane net ties the layers of its span only, so it is no return for a side change and serves
+  no grid site of plane stitching.
 
 **Which fills.** The fills stored in the file may be older than the routing. The pass refills the zones in the
 engine for the routed board (§36) and places against those; hatched zones are left out (the refill does not
