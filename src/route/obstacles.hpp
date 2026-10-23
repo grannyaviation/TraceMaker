@@ -108,6 +108,12 @@ class Obstacles {
   // Reference path: test probes against every edge of a zone fill instead of the fill's edge index (the answers
   // are the same; tests/test_design_rules.cpp).
   void set_linear_zone_tests(bool on) { linear_zone_tests_ = on; }
+  // Plane voids (RouterOptions::stack_pitch): a laser via keeps `laser` from another net's laser via that shares its middle (plane)
+  // layer, and `through` from another net's through via (0 = off). A net with a zone on that layer leaves no void there.
+  void set_void_pitch(Coord laser, Coord through) {
+    void_laser_ = laser;
+    void_through_ = through;
+  }
   // Rejection counters (diagnostics): outside board, copper, holes/edges/keepouts.
   mutable long rej_outside = 0, rej_copper = 0, rej_other = 0, checks = 0;
 
@@ -174,6 +180,7 @@ class Obstacles {
   std::unique_ptr<index::UniformGrid> agrid_[2];
   std::vector<std::pair<int, geom::Shape>> texts_;   // copper text boxes (copper index, rectangle)
   Coord via_mask_ = 0;
+  Coord void_laser_ = 0, void_through_ = 0;
   Coord max_hole_local_ = 0;                         // largest local (pad/footprint) clearance on a hole                               // mask expansion of untented vias (0 when tented)
   // Mask-opening and copper-text conflicts for new copper on `layer` (fixed obstacles only).
   void aperture_codes(const geom::Shape& s, int layer, bool via_probe, const std::function<void(model::NetId)>& hit) const;

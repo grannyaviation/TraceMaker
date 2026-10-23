@@ -114,6 +114,14 @@ struct RouterOptions {
   // boards whose rules allow them (doc 05 §21).
   bool micro_vias = false;
   bool blind_vias = false;      // use blind/buried vias where a through via is blocked, if the board allows them
+  // Stacked laser vias (HDI, doc 05 §21.1): a layer change between an outer layer and the second layer in (F.Cu-In2, B.Cu-In3) is a
+  // stack of two micro vias at one point (outer to next, next to the one after) at the net class's micro via size, filled and capped,
+  // never a through via. Nets a rule keeps from micro vias (`disallow micro_via`) change layer on through vias as before.
+  bool stacked_vias = false;
+  Coord stagger = 0;            // with stacked_vias: the second micro via this far from the first, joined by a stub on the middle layer (0 = stacked)
+  // Plane voids (doc 05 §21.1): a stack keeps this far, centre to centre, from another net's laser via on its middle layer, and from
+  // another net's through via (0 = off). Vias of a net with a zone on that layer leave no void and are exempt.
+  Coord stack_pitch = 0, stack_through_pitch = 0;
   bool diff_pairs = false;      // route P/N pairs together as coupled tracks first (falls back to single routing)
   // Component rules (doc 15 P3): these net pairs only are routed coupled first when diff_pairs is off (e.g. USB 2.0
   // D+/D- bound by tm::crules, whose names need not end in P/N or +/-). Empty = none.
@@ -319,6 +327,7 @@ struct RouteResult {
   int tunnels = 0;              // package tunnels placed (--package-tunnels)
   int micro_vias = 0;           // micro vias placed
   int blind_vias = 0;           // blind/buried vias placed
+  int stacked_vias = 0;         // stacked (or staggered) laser vias in the state returned, each two micro vias
   double escape_corridor_mm = 0;   // total length of the corridors reserved (centrelines, version 1)
   int package_pin_edges = 0;       // spanning-tree edges between two pins of one dense package, for nets with 3+ pins there (--radial-supply makes them rarer)
   int escape_reclaimed = 0;        // --escape-persist: corridors given back to the pins of a ripped-up connection

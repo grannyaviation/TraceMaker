@@ -157,6 +157,7 @@ struct Via {
   bool locked = false;
   sexpr::NodeId node = sexpr::kNoNode;
   bool free = false;         // (free yes): a stitching via whose net KiCad's connectivity never changes
+  bool filled = false;       // (capping yes) (filling yes): a new laser via of a stack, copper-filled and capped (JLC HDI); written, not read
 };
 
 struct Zone {
