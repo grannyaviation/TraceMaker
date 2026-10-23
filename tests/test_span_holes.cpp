@@ -34,7 +34,7 @@ std::string board_text(const std::string& extra) {
   return "(kicad_pcb (version 20240108) (generator \"pcbnew\")\n"
          "  (layers (0 \"F.Cu\" signal) (1 \"In1.Cu\" signal) (2 \"In2.Cu\" signal) (3 \"In3.Cu\" signal) (4 \"In4.Cu\" signal)\n"
          "    (31 \"B.Cu\" signal) (37 \"F.SilkS\" user) (44 \"Edge.Cuts\" user))\n"
-         "  (net 0 \"\") (net 1 \"A\") (net 2 \"B\")\n"
+         "  (net 0 \"\") (net 1 \"A\") (net 2 \"B\") (net 3 \"SD\")\n"
          "  (gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid)))\n"
          "  (via micro (at 10 10) (size 0.3) (drill 0.15) (layers \"F.Cu\" \"In1.Cu\") (net 1))\n"
          "  (via micro (at 10 10) (size 0.3) (drill 0.15) (layers \"In1.Cu\" \"In2.Cu\") (net 1))\n" +
@@ -58,8 +58,9 @@ struct Files {
         << R"("allow_microvias":true,"allow_blind_buried_vias":true}}},)"
         << R"("net_settings":{"classes":[{"name":"Default","clearance":)" << clearance
         << R"(,"track_width":0.1,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15},)"
-        << R"({"name":"PWR_0A5","clearance":)" << clearance << R"(,"track_width":0.25}],)"
-        << R"("netclass_patterns":[{"pattern":"A","netclass":"PWR_0A5"}]}})";
+        << R"({"name":"PWR_0A5","clearance":)" << clearance << R"(,"track_width":0.25},)"
+        << R"({"name":"SD50","clearance":)" << clearance << R"(,"track_width":0.174}],)"
+        << R"("netclass_patterns":[{"pattern":"A","netclass":"PWR_0A5"},{"pattern":"SD","netclass":"SD50"}]}})";
   }
   ~Files() { fs::remove_all(dir); }
 };
@@ -370,19 +371,27 @@ TEST_CASE("span holes: a routed laser via is an obstacle on its own layers only"
   CHECK(obs.routed_via_state(geom::Shape::point({5 * MM + 300'000, 5 * MM}, 150'000), model::layer_bit(0), 2, false, 75'000) == 2);
 }
 
-TEST_CASE("span holes: a (layer inner) track_width rule with a NetClass condition", "[drc][span_holes]") {
-  const char* dru = "(version 1)\n(rule \"pwr inner width\" (layer inner) (condition \"A.NetClass == 'PWR_0A5'\") (constraint track_width (min 0.25mm)))\n";
+TEST_CASE("span holes: a (layer inner) track_width rule with a NetClass condition and an upper limit", "[drc][span_holes]") {
+  // The plan's sd50-inner (sensor_ts config): SD50 is 0.174 mm on the outer layers and 0.134 mm on an inner one, where
+  // 0.174 mm would be too wide (0.14 mm maximum) and the maximum is what counts.
+  const char* dru = "(version 1)\n(rule \"sd50-inner\" (layer inner) (condition \"A.NetClass == 'SD50'\") "
+                    "(constraint track_width (min 0.13mm) (opt 0.134mm) (max 0.14mm)))\n";
   const std::string tracks =
-      "  (segment (start 3 3) (end 5 3) (width 0.1) (layer \"In2.Cu\") (net 1))\n"  // class PWR_0A5, inner, 0.1 < 0.25: flagged
-      "  (segment (start 3 5) (end 5 5) (width 0.1) (layer \"F.Cu\") (net 1))\n"     // outer: the rule does not apply
-      "  (segment (start 3 7) (end 5 7) (width 0.1) (layer \"In3.Cu\") (net 2))\n"   // other class: not applied
-      "  (segment (start 3 9) (end 5 9) (width 0.25) (layer \"In4.Cu\") (net 1))\n"; // wide enough
+      "  (segment (start 3 3) (end 5 3) (width 0.174) (layer \"In2.Cu\") (net 3))\n"   // too wide on an inner layer: flagged
+      "  (segment (start 3 5) (end 5 5) (width 0.134) (layer \"In2.Cu\") (net 3))\n"   // the inner width: fine
+      "  (segment (start 3 7) (end 5 7) (width 0.174) (layer \"F.Cu\") (net 3))\n"      // the class width on an outer layer: fine
+      "  (segment (start 3 9) (end 5 9) (width 0.12) (layer \"In3.Cu\") (net 3))\n"     // below the minimum: flagged
+      "  (segment (start 3 11) (end 5 11) (width 0.174) (layer \"In3.Cu\") (net 2))\n"; // another class: not applied
   const Files f("width_rule", board_text(tracks), dru);
   const auto lb = io::read_board_file(f.pcb.string());
   const auto r = drc::run_drc(lb.board, io::read_design_rules(f.pcb.string()));
-  CHECK(count(r, "track_width") == 1);
+  CHECK(r.warnings.empty());
+  int on_in2 = 0, on_in3 = 0;
   for (const auto& v : r.violations)
-    if (v.type == "track_width") CHECK(v.layer == 2);
-  // The router takes its width from the net class and does not read a track_width minimum from a rule: net A's class
-  // width is 0.25 mm here, so its tracks meet the rule; a rule above the class width would not be met by the router.
+    if (v.type == "track_width") (v.layer == 2 ? on_in2 : on_in3) += 1;
+  CHECK(count(r, "track_width") == 2);
+  CHECK(on_in2 == 1);
+  CHECK(on_in3 == 1);
+  // The router takes its width from the net class and does not read a track_width minimum from a rule: a rule width
+  // below the class width (0.134 mm on In2 for a 0.174 mm class) is checked by the DRC only.
 }
