@@ -2,6 +2,7 @@
 #include "passes/stitch.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <set>
 #include <tuple>
@@ -44,6 +45,14 @@ std::vector<std::size_t> fill_pieces(const model::Board& b) {
 }
 
 }  // namespace
+
+Coord stitch_shift_bound(Coord pitch, Coord coverage) {
+  const double p = static_cast<double>(pitch), R = static_cast<double>(coverage);
+  const double disc = 2 * R * R - p * p;
+  if (pitch <= 0 || disc < 0) return 0;
+  const double d = (std::sqrt(2.0) * R - p + std::sqrt(disc)) / std::sqrt(2.0);
+  return d > 0 ? static_cast<Coord>(d) : 0;
+}
 
 StitchResult stitch_vias(const model::Board& board, const model::DesignRules& rules, const StitchOptions& opt) {
   StitchResult res;

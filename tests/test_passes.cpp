@@ -439,9 +439,10 @@ TEST_CASE("stitch: an obstacle removes exactly the sites it blocks", "[passes][s
   CHECK(positions(r) == want);
   CHECK(r.sites == 23);
   CHECK(r.site_blocked == 2);
-  // Fallback for a blocked site: it is reported, not moved (moving it would spend the stitch pitch's coverage slack:
-  // a 0.05 mm shift is all an 8.7 mm grid has). The farm lays a stub there. No extra work: the entry is recorded where
-  // the exact check refused the via.
+  // A blocked site first gets a ring search (see the next test). With the default coverage radius (the grid's own radius
+  // plus 0.8 %) a 5 mm grid lets a site move 0.47 mm, and the track keeps every via 0.6 mm away: no ring point is legal, so
+  // the two sites are reported as gaps, in grid order, for the caller to lay a stub.
+  CHECK(r.site_moved == 0);
   REQUIRE(r.gaps.size() == 2);
   CHECK(r.gaps[0].net == 1);
   CHECK(r.gaps[0].pos == Point{12'500'000, 7'500'000});
@@ -613,6 +614,69 @@ TEST_CASE("stitch: a signal via gets one plane via within the distance", "[passe
   CHECK(r.returns[0].stitched_after == 0);
 }
 
+TEST_CASE("stitch: a blocked grid site gets a via on its ring, within what the coverage radius allows", "[passes][stitch]") {
+  // Same board as above, with a coverage radius that lets a 5 mm grid's site move 2.3 mm: both sites blocked by the S
+  // track on In1.Cu take a via on a ring round them, nearest first, 0.9 mm off the track (0.6 mm is the track's reach).
+  const auto l = load("ring", board_text(kGndPin + gnd_zone("F.Cu") + gnd_zone("B.Cu") + seg(11, 7.5, 19, 7.5, 3, 0.2, "In1.Cu") +
+                                             seg(22.5, 11, 22.5, 14, 3, 0.2, "B.Cu"),
+                                         4));
+  passes::StitchOptions o;
+  o.planes = true;
+  o.pitch = 5 * mm;
+  o.coverage = 4 * mm;
+  const Coord bound = passes::stitch_shift_bound(o.pitch, o.coverage);
+  CHECK(bound > 2 * mm);
+  const auto r = passes::stitch_vias(l.board, l.rules, o);
+  CHECK(r.gaps.empty());
+  CHECK(r.site_blocked == 2);
+  CHECK(r.site_moved == 2);
+  CHECK(r.vias.size() == 22);  // 20 grid sites, 2 moved
+  int moved = 0;
+  for (const auto& v : r.vias) {
+    for (const Point site : {Point{12'500'000, 7'500'000}, Point{17'500'000, 7'500'000}}) {
+      const Coord dx = v.pos.x - site.x, dy = v.pos.y - site.y;
+      if (dx * dx + dy * dy < 3 * mm * 3 * mm && !(dx == 0 && dy == 0)) {
+        ++moved;
+        CHECK(dx * dx + dy * dy <= bound * bound);
+        CHECK(std::abs(v.pos.y - 7'500'000) >= 600'000);  // off the track's reach
+      }
+    }
+  }
+  CHECK(moved == 2);
+  model::Board b = l.board;
+  b.vias.insert(b.vias.end(), r.vias.begin(), r.vias.end());
+  CHECK(errors(drc::refill_zones(b, l.rules).board, l.rules) == 0);
+}
+
+TEST_CASE("stitch: how far a grid site may move and still cover the board", "[passes][stitch]") {
+  // The farm's grid: 8.7 mm pitch, coverage gate 6.2 mm. One site moves by d, the others stay (the worst direction is
+  // away from the cell diagonally). The bound comes from the pitch and the radius; check it against the largest empty
+  // circle on a fine sample of the board.
+  const double p = 8.7, R = 6.2;
+  const double bound = nm_to_mm(passes::stitch_shift_bound(8'700'000, 6'200'000));
+  CHECK(bound > 0.80);
+  CHECK(bound < 0.84);
+  auto worst = [&](double d) {
+    const double t = d / std::sqrt(2.0);
+    std::vector<std::pair<double, double>> sites;
+    for (int i = -2; i <= 3; ++i)
+      for (int j = -2; j <= 3; ++j) sites.emplace_back(i * p - (i == 0 && j == 0 ? t : 0), j * p - (i == 0 && j == 0 ? t : 0));
+    double worst_r = 0;
+    for (double x = -0.5 * p; x <= 0.6 * p; x += 0.02)
+      for (double y = -0.5 * p; y <= 0.6 * p; y += 0.02) {
+        double m = 1e9;
+        for (const auto& [sx, sy] : sites) m = std::min(m, std::hypot(x - sx, y - sy));
+        worst_r = std::max(worst_r, m);
+      }
+    return worst_r;
+  };
+  CHECK(worst(bound) <= R + 0.02);
+  CHECK(worst(bound + 0.15) > R + 0.005);
+  CHECK(worst(0.0) < R);
+  // A radius below the grid's own (p / sqrt 2) leaves no room to move a site.
+  CHECK(passes::stitch_shift_bound(8'700'000, 6'000'000) == 0);
+}
+
 // Six-layer stack-up (TM-1c): a laser via ties a surface to its adjacent layer only, so it is no return for a side
 // change and a laser signal via needs no through via beside it. Four layers here, GND planes on the two inner layers.
 namespace {
@@ -673,4 +737,22 @@ TEST_CASE("stitch: a laser GND via does not serve a grid site", "[passes][stitch
   const auto b = passes::stitch_vias(laser.board, laser.rules, o);
   CHECK(a.site_served == 1);  // the plated pin at (3, 17)
   CHECK(b.site_served == 1);  // the laser via at the site (12.5, 7.5) ties two layers only, not the plane's span
+}
+
+TEST_CASE("stitch: a via written blind over the whole stack ties and is served like a through via", "[passes][stitch]") {
+  const std::string sig = seg(10, 5, 15, 5, 3) + seg(15, 5, 20, 5, 3, 0.2, "B.Cu") + kThroughSig;
+  passes::StitchOptions o;
+  o.returns = {{3, 1, 2 * mm, "option"}};
+  const auto l = load("return_blind_all", board_text(kGndPin + kInnerGnd + sig +
+                      "  (via blind (at 15.8 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))\n", 4));
+  const auto r = passes::stitch_vias(l.board, l.rules, o);
+  CHECK(r.vias.empty());  // its span is every layer: it is a return
+  CHECK(r.returns[0].stitched_before == 1);
+  // And as a signal via: served.
+  const std::string bsig = seg(10, 5, 15, 5, 3) + seg(15, 5, 20, 5, 3, 0.2, "B.Cu") +
+                           "  (via blind (at 15 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 3))\n";
+  const auto m = load("signal_blind_all", board_text(kGndPin + kInnerGnd + bsig, 4));
+  const auto rm = passes::stitch_vias(m.board, m.rules, o);
+  CHECK(rm.returns[0].signal_vias == 1);
+  CHECK(rm.vias.size() == 1);
 }

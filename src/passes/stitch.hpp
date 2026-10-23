@@ -17,6 +17,10 @@ struct StitchOptions {
   // Grid pitch. The default is the catalogue's general high-speed value (TI SPRAAR7J: a stitching via within
   // 200 mil); app code passes the catalogue's number, this is its fallback.
   Coord pitch = 5'080'000;
+  // Largest empty circle the grid may leave (centre of the board to its nearest via). A site the exact check refuses is
+  // moved on rings round it, nearest first, up to stitch_shift_bound(pitch, coverage). 0: the grid's own radius
+  // pitch / sqrt 2 plus 0.8 %, which is the farm's gate over its 8.7 mm grid (6.2 mm over 6.15 mm).
+  Coord coverage = 0;
   // Return-path stitching: every through via of `signal` wants a through via (or plated through-hole pad) of `plane`
   // within `distance`, centre to centre. Laser and blind vias count on neither side (they tie the layers of their span).
   struct ReturnNet {
@@ -38,12 +42,18 @@ struct StitchReturn {
   int stitched_after = 0;       // ... and after it
 };
 
-// A grid site the exact check refused. The pass does not move it (an 8.7 mm grid has about 0.05 mm of coverage slack): the
-// caller lays a stub there or accepts the gap.
+// A grid site the exact check refused and no point of its ring could take (StitchOptions::coverage bounds the ring).
+// The caller lays a stub there or accepts the gap.
 struct StitchGap {
   model::NetId net = 0;
   model::Point pos;
 };
+
+// How far one site of the square grid of `pitch` may move, in the worst direction (away from a cell diagonally), while
+// the largest empty circle on the board stays within `coverage` (the grid itself leaves pitch / sqrt 2). With
+// t = d / sqrt 2 the worst radius is (p^2 + 2pt + 2t^2) / (sqrt 2 (p + 2t)), so d = (sqrt 2 R - p + sqrt(2R^2 - p^2)) / sqrt 2.
+// 0 when `coverage` is below the grid's own radius. 8.7 mm and 6.2 mm give 0.82 mm.
+Coord stitch_shift_bound(Coord pitch, Coord coverage);
 
 struct StitchResult {
   std::vector<model::Via> vias;            // the vias to add, plane stitches first; all marked free
@@ -51,8 +61,9 @@ struct StitchResult {
   std::vector<StitchReturn> returns;       // one row per StitchOptions::returns entry
   int sites = 0;                // grid sites inside overlapping fills
   int site_served = 0;          // of them: already tied by a via or plated pad of the net within half the pitch
-  int site_blocked = 0;         // of them: refused by the exact check
-  std::vector<StitchGap> gaps;  // ... the same sites, one entry each, in grid order
+  int site_blocked = 0;         // of them: refused by the exact check at the site itself
+  int site_moved = 0;           // of those: placed on a ring round the site, within the coverage bound
+  std::vector<StitchGap> gaps;  // the rest: no ring point was legal; one entry each, in grid order
   int dropped = 0;              // vias placed and then removed because the second refill did not join them on two layers
   long checks = 0;              // the pass's work
   bool out_of_work = false;
