@@ -9,7 +9,8 @@ and net S2 B.Cu -> In3 -> B.Cu round keep-outs, routes it with --stacked-vias an
   * every connection is routed with four stacks: eight micro vias, in pairs at one point (F.Cu-In1 + In1-In2,
     B.Cu-In4 + In4-In3), written with (capping yes) (filling yes), no track on In1 or In4;
   * TraceMaker's DRC after a refill finds no violation type more often than on the input, and nothing unconnected;
-  * when kicad-cli is available (scripts/kicad-cli: KiCad 10.0.6), the same holds for KiCad's DRC with --refill-zones.
+  * the same holds for KiCad's DRC with --refill-zones (scripts/kicad-cli: KiCad 10.0.6); without kicad-cli the test is
+    skipped (77), never passed.
 """
 import json
 import pathlib
@@ -128,7 +129,10 @@ def main() -> int:
         print(f"KiCad DRC: {len(before_k['violations'])} errors before, {len(after_k['violations'])} after, "
               f"{len(after_k['unconnected_items'])} unconnected")
     else:
-        print("kicad-cli not found: KiCad DRC check skipped")
+        print("kicad-cli not found: the KiCad half of this test cannot run (put scripts/ first on PATH)")
+        for e in errors:
+            print("FAIL:", e)
+        return 1 if errors else 77
     print(f"routed {res['routed']}/{res['connections']}, {res.get('stacked_vias')} stacks, {len(b['vias'])} vias")
     for e in errors:
         print("FAIL:", e)

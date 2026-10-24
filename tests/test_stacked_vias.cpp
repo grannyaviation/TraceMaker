@@ -60,12 +60,12 @@ std::string gnd_plane(const std::string& layer, double w, double h) {
 }
 
 // Six layers F.Cu In1 In2 In3 In4 B.Cu (0..5), `w` x `h` mm. Nets: S (1), B (2), GND (3), SD (4, class SD50), C (5), USB_P (6) and
-// USB_N (7) in class USB90.
+// USB_N (7) in class USB90, VCC (8, class PWR_1A).
 std::string board(const std::string& extra, double w = 20, double h = 10) {
   return "(kicad_pcb (version 20240108) (generator \"pcbnew\")\n"
          "  (layers (0 \"F.Cu\" signal) (1 \"In1.Cu\" signal) (2 \"In2.Cu\" signal) (3 \"In3.Cu\" signal) (4 \"In4.Cu\" signal)\n"
          "    (31 \"B.Cu\" signal) (37 \"F.SilkS\" user) (44 \"Edge.Cuts\" user))\n"
-         "  (net 0 \"\") (net 1 \"S\") (net 2 \"B\") (net 3 \"GND\") (net 4 \"SD\") (net 5 \"C\") (net 6 \"USB_P\") (net 7 \"USB_N\")\n"
+         "  (net 0 \"\") (net 1 \"S\") (net 2 \"B\") (net 3 \"GND\") (net 4 \"SD\") (net 5 \"C\") (net 6 \"USB_P\") (net 7 \"USB_N\") (net 8 \"VCC\")\n"
          "  (gr_rect (start 0 0) (end " + mm(w) + " " + mm(h) + ") (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid)))\n" +
          extra + ")\n";
 }
@@ -97,8 +97,9 @@ struct Files {
         << R"(,"track_width":0.1,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15},)"
         << R"({"name":"SD50","clearance":)" << clearance << R"(,"track_width":0.174,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15},)"
         << R"({"name":"USB90","clearance":0.152,"track_width":0.152,"diff_pair_width":0.152,"diff_pair_gap":0.152,"via_diameter":0.45,"via_drill":0.3,)"
-        << R"("microvia_diameter":0.3,"microvia_drill":0.15}],)"
-        << R"("netclass_patterns":[{"pattern":"SD","netclass":"SD50"},{"pattern":"USB_*","netclass":"USB90"}]}})";
+        << R"("microvia_diameter":0.3,"microvia_drill":0.15},)"
+        << R"({"name":"PWR_1A","clearance":)" << clearance << R"(,"track_width":0.4,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15}],)"
+        << R"("netclass_patterns":[{"pattern":"SD","netclass":"SD50"},{"pattern":"USB_*","netclass":"USB90"},{"pattern":"VCC","netclass":"PWR_1A"}]}})";
   }
   ~Files() { fs::remove_all(dir); }
 };
@@ -261,6 +262,33 @@ TEST_CASE("stacked vias: laser holes keep JLC's spacing, which KiCad does not ch
   CHECK(through(10.6, 3) == 0);  // GND has the plane on In1: its via leaves no void there
 }
 
+TEST_CASE("stacked vias: the plane-void pitches are plan 1.10's, and drops on different planes are no pair", "[route][stacked]") {
+  // Net B: a top stack (F.Cu-In1-In2) at (10, 5) and a through via at (14, 5); GND planes on In1 and In4. Copper clearance 0.05 mm.
+  const std::string fixed =
+      "  (via micro (at 10 5) (size 0.3) (drill 0.15) (layers \"F.Cu\" \"In1.Cu\") (net 2))\n"
+      "  (via micro (at 10 5) (size 0.3) (drill 0.15) (layers \"In1.Cu\" \"In2.Cu\") (net 2))\n"
+      "  (via (at 14 5) (size 0.45) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 2))\n" +
+      gnd_plane("In1.Cu", 20, 10) + gnd_plane("In4.Cu", 20, 10);
+  const Files f("void_exact", board(fixed), kJlcRules, 0.05, 0.05);
+  auto l = load(f);
+  route::Obstacles obs(l.lb.board, l.rules);
+  obs.set_soft_zones(true);
+  obs.set_void_pitch(950'000, 1'000'000);
+  auto laser = [&](Coord x, int l0, int l1) { return obs.via_state_span({x, 5 * MM}, 300'000, 150'000, 1, 0, false, nullptr, l0, l1, model::ViaType::Micro); };
+  // Other-net drops on one plane: at least 0.95 mm centre to centre (0.95 itself is fine).
+  CHECK(laser(10'949'999, 0, 1) == 2);
+  CHECK(laser(10'950'000, 0, 1) == 0);
+  // A drop and another net's through via: at least 1.0 mm.
+  CHECK(laser(13'000'001, 0, 1) == 2);
+  CHECK(laser(13'000'000, 0, 1) == 0);
+  // A bottom drop (B.Cu-In4-In3, its void in In4) beside the top stack (its void in In1): no shared plane, no pitch; they share no
+  // layer either, so no hole-to-hole pair (KiCad's rule binds holes that share a layer). The same spot is legal.
+  CHECK(laser(10'500'000, 4, 5) == 0);
+  CHECK(laser(10'500'000, 3, 4) == 0);
+  CHECK(laser(10'000'000, 3, 4) == 0);
+  CHECK(laser(10'500'000, 0, 1) == 2);  // a top drop there shares In1
+}
+
 TEST_CASE("stacked vias: the router keeps its stacks off other nets' vias by the plane-void pitch", "[route][stacked]") {
   // S may change layer only in a pocket beside each pad (keep-outs cover the rest of F.Cu: y 4.2 to 5.8 is open for x below 4.6
   // and above 15.4). Net B has a laser via (F.Cu-In1) in the west pocket and a through via in the east one, about 0.7 and 0.55 mm
@@ -399,35 +427,74 @@ TEST_CASE("stacked vias: --split-cost sees the antipad of a stack the route adds
   CHECK(nearest >= 0.35 * MM);
 }
 
-TEST_CASE("stacked vias: rule widths per layer: SD50 and USB90 run at their inner opt on In2", "[route][stacked][rules]") {
-  const Files f("widths", board(crossing("F.Cu", 4, "SD") + pad_fp("U1", 3, 8, "F.Cu", 6, "USB_P", 0.3) + pad_fp("U2", 3, 8.6, "F.Cu", 7, "USB_N", 0.3) +
-                                pad_fp("U3", 17, 8, "F.Cu", 6, "USB_P", 0.3) + pad_fp("U4", 17, 8.6, "F.Cu", 7, "USB_N", 0.3)),
-                kInnerWidths);
+TEST_CASE("stacked vias: rule widths per layer: SD50 runs at its inner opt on In2", "[route][stacked][rules]") {
+  const Files f("widths", board(crossing("F.Cu", 4, "SD")), kInnerWidths);
   const auto l = load(f);
   auto o = options();
   o.stacked_vias = false;
   o.no_track_layers = bits({1, 3, 4, 5});
+  const auto r = route::Router(l.lb.board, l.rules, o).run();
+  REQUIRE(r.routed == r.connections);
+  int inner = 0;
+  for (const auto& t : r.tracks) {
+    CHECK(t.width == (t.layer == 2 ? 134'000 : 174'000));
+    inner += t.layer == 2;
+  }
+  CHECK(inner > 0);
+  // KiCad's track_width check finds nothing.
+  const auto rep = drc::run_drc(with_route(l.lb.board, r), l.rules);
+  CHECK(count(rep, "track_width") == 0);
+}
+
+TEST_CASE("stacked vias: a USB90 pair stays off the layers where usb90-inner's gap binds it and it cannot couple", "[route][stacked][rules]") {
+  // The pair must cross keep-outs on F.Cu and B.Cu, so only In2 and In3 lead across. usb90-inner asks for 0.106 mm and a
+  // 0.15-0.16 mm gap there, which the coupled search (0.152 mm) cannot run and single halves cannot hold: the pair stays unrouted
+  // rather than run uncoupled, with pair routing on or off. Without the gap constraint (the control) the halves cross on them.
+  const std::string usb = pad_fp("U1", 3, 4.7, "F.Cu", 6, "USB_P", 0.3) + pad_fp("U2", 3, 5.3, "F.Cu", 7, "USB_N", 0.3) +
+                          pad_fp("U3", 17, 4.7, "F.Cu", 6, "USB_P", 0.3) + pad_fp("U4", 17, 5.3, "F.Cu", 7, "USB_N", 0.3) +
+                          area("wall", "F.Cu", 8, 0, 12, 10, true, true) + area("wall_b", "B.Cu", 8, 0, 12, 10, true, true);
+  const Files f("usb_inner", board(usb), kInnerWidths);
+  const auto l = load(f);
+  auto o = options();
+  o.stacked_vias = false;
+  o.no_track_layers = bits({1, 4});  // the planes
   for (const bool pairs : {false, true}) {
     o.diff_pairs = pairs;
     const auto r = route::Router(l.lb.board, l.rules, o).run();
-    REQUIRE(r.routed == r.connections);
-    int inner_sd = 0, inner_usb = 0;
-    for (const auto& t : r.tracks) {
-      if (t.net == 4) {
-        CHECK(t.width == (t.layer == 2 ? 134'000 : 174'000));
-        inner_sd += t.layer == 2;
-      }
-      if (t.net == 6 || t.net == 7) {
-        CHECK(t.width == (t.layer == 2 ? 106'000 : 152'000));
-        inner_usb += t.layer == 2;
-      }
-    }
-    CHECK(inner_sd > 0);
-    CHECK(inner_usb > 0);
-    // KiCad's track_width check finds nothing.
-    const auto rep = drc::run_drc(with_route(l.lb.board, r), l.rules);
-    CHECK(count(rep, "track_width") == 0);
+    CHECK(r.routed == 0);
+    for (const auto& t : r.tracks) CHECK((t.layer == 0 || t.layer == 5));
   }
+  const std::string width_only = kInnerWidths.substr(0, kInnerWidths.find("(rule \"usb90-inner\"")) +
+                                 "(rule \"usb90-inner\" (condition \"A.NetClass == 'USB90' && A.Type == 'Track'\") (layer inner) "
+                                 "(constraint track_width (min 0.10mm) (opt 0.106mm) (max 0.112mm)))\n";
+  const Files g("usb_inner_free", board(usb), width_only);
+  const auto lg = load(g);
+  o.diff_pairs = false;
+  const auto rg = route::Router(lg.lb.board, lg.rules, o).run();
+  CHECK(rg.routed == rg.connections);
+  CHECK(std::any_of(rg.tracks.begin(), rg.tracks.end(), [](const model::Track& t) { return t.layer == 2 || t.layer == 3; }));
+}
+
+TEST_CASE("stacked vias: --no-stack-classes: a rail changes layer on through vias, F.Cu-In2 included", "[route][stacked]") {
+  const Files f("rail", board(crossing("F.Cu", 8, "VCC")));
+  const auto l = load(f);
+  auto o = options();
+  o.no_track_layers = bits({1, 3, 4, 5});  // F.Cu and In2 only
+  o.no_stack_classes = {"PWR_*"};
+  const auto r = route::Router(l.lb.board, l.rules, o).run();
+  REQUIRE(r.routed == r.connections);
+  CHECK(r.stacked_vias == 0);
+  REQUIRE(r.vias.size() == 2);
+  for (const auto& v : r.vias) {
+    CHECK(v.type == model::ViaType::Through);
+    CHECK(v.size == 450'000);
+  }
+  for (const auto& t : r.tracks) CHECK((t.layer == 0 || t.layer == 2));
+  // Without the option the rail stacks like any net.
+  o.no_stack_classes.clear();
+  const auto stacked = route::Router(l.lb.board, l.rules, o).run();
+  REQUIRE(stacked.routed == stacked.connections);
+  CHECK(stacked.stacked_vias == 2);
 }
 
 TEST_CASE("stacked vias: the routed board connects, writes and reads back with no new DRC violation", "[route][stacked]") {
@@ -499,4 +566,51 @@ TEST_CASE("stacked vias: staggered, the second laser via sits 0.30 mm off with a
   CHECK(count(rep, "clearance") == 0);
   CHECK(count(rep, "hole_clearance") == 0);
   CHECK(count(rep, "hole_to_hole") == 0);
+}
+
+TEST_CASE("stacked vias: staggered stacks keep the width rules and the spacing rules of stacked ones", "[route][stacked]") {
+  // An SD50 net with the sensor's sd50-inner rule: its In1 stub is a track on an inner layer, so it takes 0.134 mm, not the via's
+  // 0.30 mm (KiCad's track_width would flag that).
+  const Files f("stagger_sd", board(crossing("F.Cu", 4, "SD") + gnd_plane("In1.Cu", 20, 10)), kJlcRules + kInnerWidths);
+  const auto l = load(f);
+  auto o = options();
+  o.no_track_layers = bits({1, 3, 4, 5});
+  o.soft_zones = true;
+  o.stagger = 300'000;
+  const auto r = route::Router(l.lb.board, l.rules, o).run();
+  REQUIRE(r.routed == r.connections);
+  CHECK(r.stacked_vias == 2);
+  int stubs = 0;
+  for (const auto& t : r.tracks)
+    if (t.layer == 1) {
+      CHECK(t.width == 134'000);
+      ++stubs;
+    }
+  CHECK(stubs == 2);
+  const auto rep = drc::run_drc(drc::refill_zones(with_route(l.lb.board, r), l.rules).board, l.rules);
+  CHECK(count(rep, "track_width") == 0);
+  CHECK(rep.unconnected.empty());
+  // Net B has an In1-In2 laser via 0.7 mm east of where S's west drop goes (beside its pad, the inner track leaving east). With the
+  // plane-void pitch the inner half keeps 0.95 mm from it as a stacked one would; without it (the control) it sits closer.
+  const std::string other = crossing("F.Cu") + gnd_plane("In1.Cu", 20, 10) +
+                            "  (via micro (at 4.3 5.01) (size 0.3) (drill 0.15) (layers \"In1.Cu\" \"In2.Cu\") (net 2))\n";
+  const Files g("stagger_pitch", board(other), kJlcRules);
+  const auto lg = load(g);
+  auto nearest = [&](const route::RouteResult& rr) {
+    double d = 1e18;
+    for (const auto& v : rr.vias) d = std::min(d, dist(v.pos, geom::Point{4'300'000, 5'010'000}));
+    return d;
+  };
+  const auto free_run = route::Router(lg.lb.board, lg.rules, o).run();
+  REQUIRE(free_run.routed == free_run.connections);
+  CHECK(nearest(free_run) < 0.95 * MM);
+  o.stack_pitch = 950'000;
+  o.stack_through_pitch = 1'000'000;
+  const auto rp = route::Router(lg.lb.board, lg.rules, o).run();
+  REQUIRE(rp.routed == rp.connections);
+  CHECK(rp.stacked_vias == 2);
+  CHECK(nearest(rp) >= 0.95 * MM);
+  // and every laser hole of one layer pair keeps the 0.24 mm rule from it (In1-In2 halves: centres 0.39 mm apart at least).
+  for (const auto& v : rp.vias)
+    if (v.layer_top == 1) CHECK(dist(v.pos, geom::Point{4'300'000, 5'010'000}) >= 0.39 * MM);
 }

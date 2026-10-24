@@ -122,6 +122,9 @@ struct RouterOptions {
   // Plane voids (doc 05 §21.1): a stack keeps this far, centre to centre, from another net's laser via on its middle layer, and from
   // another net's through via (0 = off). Vias of a net with a zone on that layer leave no void and are exempt.
   Coord stack_pitch = 0, stack_through_pitch = 0;
+  // Net classes (KiCad wildcards, e.g. PWR_*) whose nets never stack: they change layer on through vias, F.Cu-In2 included. JLC
+  // gives a laser via no current rating, so rails take through vias (plan §1.2; --no-stack-classes).
+  std::vector<std::string> no_stack_classes;
   bool diff_pairs = false;      // route P/N pairs together as coupled tracks first (falls back to single routing)
   // Component rules (doc 15 P3): these net pairs only are routed coupled first when diff_pairs is off (e.g. USB 2.0
   // D+/D- bound by tm::crules, whose names need not end in P/N or +/-). Empty = none.
