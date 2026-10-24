@@ -949,6 +949,7 @@ int main(int argc, char** argv) {
   route->add_option("--stagger", r_stagger_mm, "With --stacked-vias: put the inner laser via this far (mm) beside the outer one, joined by a stub on the plane layer between (0 = stacked)");
   route->add_option("--stack-pitch", r_stack_pitch_mm, "Plane voids: a laser via keeps this far (mm, centre to centre) from another net's laser via on its plane layer (In1, In4); a net with a zone there is exempt (0 = off)");
   route->add_option("--stack-through-pitch", r_stack_through_pitch_mm, "Plane voids: a laser via and another net's through via keep this far apart (mm, centre to centre; 0 = off)");
+  route->add_option("--no-stack-classes", ropt.no_stack_classes, "With --stacked-vias: net classes (KiCad wildcards, comma separated, e.g. 'PWR_*,HV_31_50_4A') whose nets change layer on through vias only, F.Cu-In2 included: rails take no laser via")->delimiter(',');
   route->add_flag("--diff-pairs", ropt.diff_pairs, "Route differential pairs (KiCad P/N or +/- names) as coupled pairs first (doc 05 §15)");
   double r_pair_skew_mm = 0;
   route->add_flag("--pair-twists,!--no-pair-twists", ropt.pair_twists, "Coupled pairs may swap sides at a layer change, for pairs whose pin order is mirrored between the ends (default on; only with pair routing)");

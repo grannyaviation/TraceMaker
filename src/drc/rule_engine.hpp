@@ -57,7 +57,8 @@ class RuleEngine {
   // Maximum skew of the last custom rule with a `skew` constraint matching a track of `net`, if any.
   std::optional<Coord> skew_constraint(model::NetId net) const;
   // Last custom constraint of `type` (e.g. diff_pair_gap, diff_pair_uncoupled) whose rule matches a track of `net`. With
-  // `layer` >= 0, only rules whose layer selector admits that layer, judged on a track on it (sd50-inner's track_width).
+  // `layer` >= 0, only rules whose layer selector admits that layer and whose condition does not depend on position, judged on
+  // a track on it (sd50-inner's track_width).
   std::optional<model::Constraint> net_constraint(model::NetId net, const std::string& type, int layer = -1) const;
 
   // Name of the last rule disallowing `it` on `layer`, if any (KiCad: items_not_allowed).

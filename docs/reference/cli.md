@@ -197,6 +197,10 @@ OPTIONS:
           --stack-through-pitch FLOAT
                               Plane voids: a laser via and another net's through via keep this
                               far apart (mm, centre to centre; 0 = off)
+          --no-stack-classes TEXT ...
+                              With --stacked-vias: net classes (KiCad wildcards, comma
+                              separated, e.g. 'PWR_*,HV_31_50_4A') whose nets change layer on
+                              through vias only, F.Cu-In2 included: rails take no laser via
           --diff-pairs        Route differential pairs (KiCad P/N or +/- names) as coupled
                               pairs first (doc 05 §15)
           --pair-twists, --no-pair-twists{false}

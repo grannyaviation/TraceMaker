@@ -108,6 +108,8 @@ struct Router::Impl {
   // (net and width, layer-cell key) blocked by FIXED copper after exact-check failures (routed copper changes,
   // so conflicts with it are not learned permanently).
   std::set<std::pair<std::int64_t, std::int64_t>> learned_block;
+  // (net, stack's lowest layer and lattice point) where a staggered stack found no room among fixed copper (commit).
+  std::set<std::pair<NetId, std::int64_t>> learned_stack;
   std::int64_t block_owner(NetId net, Coord width = -1) const { return static_cast<std::int64_t>(net) * 10'000'000 + (width < 0 ? track_width(net) : width) / 1000; }
 
   // ---- negotiation state ----
@@ -293,10 +295,12 @@ struct Router::Impl {
     const auto i = static_cast<std::size_t>(net);
     return micro_ok && (i >= net_micro.size() || net_micro[i]);
   }
-  // Stacked laser vias (--stacked-vias) for this net: no rule keeps it from micro vias. KiCad 10 has no board switch for them.
+  // Stacked laser vias (--stacked-vias) for this net: no rule keeps it from micro vias and its class is not in --no-stack-classes.
+  // KiCad 10 has no board switch for them.
+  std::vector<std::uint8_t> net_stack;
   bool stack_for(NetId net) const {
     const auto i = static_cast<std::size_t>(net);
-    return stack_ok && (i >= net_micro.size() || net_micro[i]);
+    return stack_ok && (i >= net_stack.size() || net_stack[i]);
   }
   // A stack joins an outer layer and the second layer in (F.Cu-In2, B.Cu-In3), through the plane layer between.
   bool stack_span(int l0, int l1) const { return std::abs(l0 - l1) == 2 && (std::min(l0, l1) == 0 || std::max(l0, l1) == nl - 1); }
@@ -306,6 +310,29 @@ struct Router::Impl {
     const int st = obs->via_state_span(p, d, dr, net, margin, soft_mode, victims, lo, lo + 1, model::ViaType::Micro);
     if (st == 2) return 2;
     return std::max(st, obs->via_state_span(p, d, dr, net, margin, soft_mode, victims, lo + 1, lo + 2, model::ViaType::Micro));
+  }
+  // A half of a differential pair (KiCad's name match, or a component-rule pair) stays off a layer where a diff_pair_gap rule binds
+  // it and the coupled search cannot run (a track_width rule there asks for another width than the pair's: usb90-inner on In2).
+  // Routed singly there, its halves would miss the gap window KiCad checks on parallel runs.
+  void keep_pairs_off_gap_layers() {
+    auto partner = [&](NetId n) -> NetId {
+      for (const auto& [a, c] : opt.pair_nets)
+        if (a == n || c == n) return a == n ? c : a;
+      const std::string& name = b.nets[static_cast<std::size_t>(n)].name;
+      if (name.empty()) return 0;
+      std::string other = name;
+      const char last = name.back();
+      other.back() = last == 'P' ? 'N' : last == 'N' ? 'P' : last == '+' ? '-' : last == '-' ? '+' : last;
+      const NetId p = other == name ? 0 : b.net_by_name(other);
+      return p > 0 && obs->rules().coupled_diff_pair(n, p) ? p : 0;
+    };
+    for (std::size_t i = 1; i < net_layers.size(); ++i) {
+      const NetId n = static_cast<NetId>(i), p = partner(n);
+      if (p <= 0) continue;
+      const Coord pw = pair_rule(b, rules, obs->rules(), n, p, obs->via_mask()).width;
+      for (int l = 0; l < nl; ++l)
+        if (obs->rules().net_constraint(n, "diff_pair_gap", l) && layer_width(n, l, pw) != pw) net_layers[i] &= ~model::layer_bit(l);
+    }
   }
   // A track_width rule on `layer` for the net's tracks (sd50-inner, usb90-inner): its opt, else `w` within its min and max. Without
   // one, `w`. KiCad's router takes a rule's opt the same way.
@@ -443,6 +470,11 @@ struct Router::Impl {
       net_blind[i] = net_vias[i] && obs->rules().via_allowed(n.id, model::ViaType::Blind) ? 1 : 0;
       net_micro[i] = net_vias[i] && obs->rules().via_allowed(n.id, model::ViaType::Micro) ? 1 : 0;
     }
+    net_stack = net_micro;
+    for (std::size_t i = 0; i < net_stack.size(); ++i)
+      for (const auto& pat : opt.no_stack_classes)
+        if (model::wildcard_match(pat, netclass(static_cast<NetId>(i)).name)) net_stack[i] = 0;
+    keep_pairs_off_gap_layers();
     // Factors below 1 are raised to 1: the octile and field heuristics assume no track is cheaper than its length.
     for (std::size_t l = 0; l < opt.layer_cost_pm.size() && l < static_cast<std::size_t>(nl); ++l)
       if (opt.layer_cost_pm[l] > 1000) {
@@ -1138,7 +1170,9 @@ struct Router::Impl {
     if (sstamp[idx] != gen) {
       sstamp[idx] = gen;
       ++wc().fixed_checks;
-      stack_st[idx] = static_cast<std::uint8_t>(stack_state(at(w.x0 + cx, w.y0 + cy), net, pitch * 71 / 100 + 1, soft, nullptr, lo));
+      stack_st[idx] = learned_stack.count({net, cell_key(lo, w.x0 + cx, w.y0 + cy)})
+                          ? std::uint8_t{2}
+                          : static_cast<std::uint8_t>(stack_state(at(w.x0 + cx, w.y0 + cy), net, pitch * 71 / 100 + 1, soft, nullptr, lo));
     }
     return stack_st[idx];
   }
@@ -1841,10 +1875,15 @@ struct Router::Impl {
     // ponytail: looks back only as many steps as the gap spans; a path that loops back to its own via further on is
     // left to commit()'s exact check of the path's holes.
     const Coord vv_gap = vdrill + obs->via_pair_hole_to_hole(sp, vdrill, sp, vdrill, net);  // centre to centre
+    // Two stacks on one side share their laser layer pairs: centre to centre at least a micro drill plus the laser rule.
+    const Coord sv_gap = stack_for(net) ? micro_drill(net) + obs->via_pair_hole_to_hole(sp, micro_drill(net), sp, micro_drill(net), net, model::ViaType::Micro,
+                                                                                          model::ViaType::Micro)
+                                         : 0;
     const int vv_steps = static_cast<int>(vv_gap / pitch) + 2;
     struct PrevVia {
       bool close = false, same = false;
       int l0 = 0, l1 = 0;
+      std::int64_t d2 = 0;  // squared distance from it
     };
     auto prev_via = [&](std::size_t s0, int vx, int vy) {
       PrevVia pv;
@@ -1860,7 +1899,8 @@ struct Router::Impl {
           const std::int64_t vc = static_cast<std::int64_t>((t / D) % cells);
           const std::int64_t dx = (static_cast<std::int64_t>(vc % w.w) - vx) * pitch, dy = (static_cast<std::int64_t>(vc / w.w) - vy) * pitch;
           pv.same = dx == 0 && dy == 0;
-          pv.close = !pv.same && dx * dx + dy * dy < vv_gap * vv_gap;
+          pv.d2 = dx * dx + dy * dy;
+          pv.close = !pv.same && pv.d2 < vv_gap * vv_gap;
           pv.l0 = std::min(lt, lp);
           pv.l1 = std::max(lt, lp);
           break;
@@ -1976,13 +2016,16 @@ struct Router::Impl {
         }
       }
       // Stacked laser via (--stacked-vias): an outer layer and the second one in change layer only on a stack at this point (the
-      // through and blind moves above skip that pair). Laser vias of the path's previous change are no pair with it (other spans);
-      // a drilled one close by or on this spot shares a layer. commit() checks the path's own holes exactly.
+      // through and blind moves above skip that pair). The path's previous change: a drilled via close by or on this spot shares a
+      // layer; a stack on the same side keeps the laser spacing (sv_gap); laser vias of other spans are no pair. commit() checks the
+      // path's own holes exactly.
       if (opt.allow_vias && stack_for(net))
         for (const int l2 : {l - 2, l + 2}) {
           if (l2 < 0 || l2 >= nl || !stack_span(l, l2) || (!layer_ok(net, l2) && !target(l2, ci))) continue;
           const int lo = std::min(l, l2);
-          if ((pv.close || pv.same) && lo <= pv.l1 && pv.l0 <= lo + 2 && !stack_span(pv.l0, pv.l1) && !(micro_for(net) && micro_span(pv.l0, pv.l1))) continue;
+          const bool prev_stack = stack_span(pv.l0, pv.l1), prev_laser = prev_stack || (micro_for(net) && micro_span(pv.l0, pv.l1));
+          if ((pv.close || pv.same) && lo <= pv.l1 && pv.l0 <= lo + 2 && !prev_laser) continue;
+          if ((pv.close || pv.same) && prev_stack && std::min(pv.l0, pv.l1) == lo && pv.d2 < sv_gap * sv_gap) continue;
           const std::size_t ns = sidx(l2, ci, kNoDir);
           const std::int64_t ng0 = gs + via_cost + textra(static_cast<std::size_t>(l2) * cells + static_cast<std::size_t>(ci));
           if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= ng0) continue;  // cannot improve that state: no legality check
@@ -2226,6 +2269,7 @@ struct Router::Impl {
         const Point A = vias[k];
         const int inner = lo == 0 ? lo + 2 : lo, mid = lo + 1;
         const Coord ud = micro_diameter(net), udr = micro_drill(net);
+        const Coord sw = layer_width(net, mid, ud);  // the stub is a track on the plane layer: its width rules hold (sd50-inner)
         const auto hi = stack_halves(lo).second;
         std::size_t leg = merged.size();
         for (std::size_t i = 0; i < merged.size() && leg == merged.size(); ++i)
@@ -2242,22 +2286,32 @@ struct Router::Impl {
           dirs.emplace_back(std::cos(a), std::sin(a));
         }
         std::stable_sort(dirs.begin() + 1, dirs.end(), [&](const auto& u, const auto& v) { return u.first * ax + u.second * ay > v.first * ax + v.second * ay; });
-        bool placed = false;
-        for (const auto& [ux, uy] : dirs) {
-          const Point B{A.x + static_cast<Coord>(std::llround(ux * static_cast<double>(opt.stagger))), A.y + static_cast<Coord>(std::llround(uy * static_cast<double>(opt.stagger)))};
-          if (obs->segment_state(A, B, mid, ud, net, soft, nullptr) == 2 ||
-              obs->via_state_span(B, ud, udr, net, 0, soft, nullptr, hi.first, hi.second, model::ViaType::Micro) == 2)
-            continue;
+        auto fits = [&](Point B, bool ignore_routed) {
+          if (obs->segment_state(A, B, mid, sw, net, ignore_routed, nullptr) == 2 ||
+              obs->via_state_span(B, ud, udr, net, 0, ignore_routed, nullptr, hi.first, hi.second, model::ViaType::Micro) == 2)
+            return false;
           if (leg < merged.size()) {
             const Point o = merged[leg].a == A ? merged[leg].b : merged[leg].a;
-            if (!(o == B) && obs->segment_state(B, o, inner, merged[leg].w, net, soft, nullptr) == 2) continue;
+            if (!(o == B) && obs->segment_state(B, o, inner, merged[leg].w, net, ignore_routed, nullptr) == 2) return false;
           }
+          return true;
+        };
+        auto at_dir = [&](double ux, double uy) {
+          return Point{A.x + static_cast<Coord>(std::llround(ux * static_cast<double>(opt.stagger))), A.y + static_cast<Coord>(std::llround(uy * static_cast<double>(opt.stagger)))};
+        };
+        bool placed = false;
+        for (const auto& [ux, uy] : dirs) {
+          const Point B = at_dir(ux, uy);
+          if (!fits(B, soft)) continue;
           via_b[k] = B;
-          stubs.push_back({A, B, mid, ud, ud});
+          stubs.push_back({A, B, mid, sw, sw});
           placed = true;
           break;
         }
         if (!placed) {
+          // No direction fits even past routed copper: fixed copper closes this spot to the net's staggered stacks for good.
+          if (std::none_of(dirs.begin(), dirs.end(), [&](const auto& u) { return fits(at_dir(u.first, u.second), true); }))
+            learned_stack.insert({net, cell_key(lo, to_ix(A.x), to_iy(A.y))});
           commit_why = "no room for a staggered laser via";
           return false;
         }
@@ -2460,12 +2514,6 @@ struct Router::Impl {
           ++res.micro_vias;
           emit_via_add(id);
         }
-        if (!(via_b[k] == vias[k])) {
-          b.tracks.push_back(model::Track{vias[k], via_b[k], micro_diameter(net), via_layers[k].first + 1, net, false, sexpr::kNoNode});
-          st.items.push_back(obs->add_track(static_cast<int>(b.tracks.size() - 1), current));
-          near_mark(st.items.back(), +1);
-          emit_track_add(static_cast<int>(b.tracks.size() - 1));
-        }
         continue;
       }
       const auto [top, bot] = via_layers[k];
@@ -2483,6 +2531,12 @@ struct Router::Impl {
       near_mark(st.items.back(), +1);
       if (!through && !via_micro[k]) ++res.blind_vias;
       emit_via_add(id);
+    }
+    for (const auto& sg : stubs) {  // staggered stacks: the stub between the halves, on the plane layer
+      b.tracks.push_back(model::Track{sg.a, sg.b, sg.w, sg.layer, net, false, sexpr::kNoNode});
+      st.items.push_back(obs->add_track(static_cast<int>(b.tracks.size() - 1), current));
+      near_mark(st.items.back(), +1);
+      emit_track_add(static_cast<int>(b.tracks.size() - 1));
     }
     for (const Point pv : pad_vias) {
       b.vias.push_back(model::Via{pv, in_pad_diameter(), in_pad_drill(), 0, nl - 1, model::ViaType::Through, net, false, sexpr::kNoNode});

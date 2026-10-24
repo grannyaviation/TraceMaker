@@ -771,7 +771,9 @@ std::optional<model::Constraint> RuleEngine::net_constraint(model::NetId net, co
   probe.net = net;
   probe.layers = layer >= 0 ? model::layer_bit(layer) : ~model::LayerMask{0};
   for (const auto& c : rules_) {
-    if (!c.valid || (layer >= 0 && !layer_matches(c.rule->layer, layer))) continue;
+    // Per layer (the router's widths and pair layers): a rule whose condition needs the item's position, size or footprint cannot
+    // be judged on a track that is not there yet, so it is left out.
+    if (!c.valid || (layer >= 0 && (c.positional || !layer_matches(c.rule->layer, layer)))) continue;
     const model::Constraint* k = nullptr;
     for (const auto& x : c.rule->constraints)
       if (x.type == type) k = &x;
