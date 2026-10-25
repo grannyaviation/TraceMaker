@@ -49,3 +49,15 @@ comparable (judge version, time limit, machine load).
 | [rel090w-tierB](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.10.0/runs/rel090w-tierB/summary.json) | PCBench tier B | 40 | 374719b | 72.5% | 97.3% | 50.0% | 2605 |  |
 | [rel090w-tierC](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.10.0/runs/rel090w-tierC/summary.json) | PCBench tier C | 30 | 374719b | 46.7% | 97.4% | 46.7% | 2825 |  |
 | [rel090w-tierD](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.10.0/runs/rel090w-tierD/summary.json) | PCBench tier D | 22 | 374719b | 36.4% | 95.1% | 36.4% | 2172 |  |
+
+## release-0.11.0
+
+[Record and README](https://github.com/DingoOz/TraceMaker/tree/main/bench/records/release-0.11.0)
+
+| Run | Set | Boards | Commit | Clean | Completion | FR 2.5 | Seconds | Route options |
+|---|---|--:|---|--:|--:|--:|--:|---|
+| [rel0100w-tierD](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0100w-tierD/summary.json) | PCBench tier D | 22 | 225b68f | 31.8% | 94.5% | 36.4% | 2527 |  |
+| [rel0110-tierA](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0110-tierA/summary.json) | PCBench tier A | 40 | 225b68f | 100.0% | 100.0% | 100.0% | 1703 |  |
+| [rel0110-tierB](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0110-tierB/summary.json) | PCBench tier B | 40 | 225b68f | 70.0% | 97.1% | 50.0% | 3321 |  |
+| [rel0110-tierC](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0110-tierC/summary.json) | PCBench tier C | 30 | 225b68f | 46.7% | 97.4% | 46.7% | 3191 |  |
+| [rel0110-tierD](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0110-tierD/summary.json) | PCBench tier D | 22 | 225b68f | 36.4% | 94.9% | 36.4% | 2403 |  |
