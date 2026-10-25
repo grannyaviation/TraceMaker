@@ -358,7 +358,10 @@ class Checker {
     for (const auto& h : holes) {
       const CopperItem* owner = h.item >= 0 ? &cm_.items[static_cast<std::size_t>(h.item)] : nullptr;
       const Coord d = h.shape.r * 2;
-      if (owner && owner->kind == ItemKind::Via && d < re_.hole_size_min(owner)) add("drill_out_of_range", owner, nullptr, d, re_.hole_size_min(owner), -1);
+      // KiCad names a micro via's (drc_test_provider_hole_size.cpp: DRCE_MICROVIA_DRILL_OUT_OF_RANGE).
+      if (owner && owner->kind == ItemKind::Via && d < re_.hole_size_min(owner))
+        add(b_.vias[static_cast<std::size_t>(owner->index)].type == model::ViaType::Micro ? "microvia_drill_out_of_range" : "drill_out_of_range", owner, nullptr, d,
+            re_.hole_size_min(owner), -1);
     }
     // Hole to hole and hole to copper.
     geom::Box all;

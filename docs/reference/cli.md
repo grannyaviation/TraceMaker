@@ -186,6 +186,23 @@ OPTIONS:
                               blocked (only on boards that allow them)
           --blind-vias        Use blind/buried vias where a through via is blocked (only on
                               boards that allow them)
+          --stacked-vias      Change between an outer layer and the second one in (F.Cu-In2,
+                              B.Cu-In3) only on a stacked laser via: two micro vias at one
+                              point at the class's micro via size, filled and capped (doc 05
+                              §21.1)
+          --stagger FLOAT     With --stacked-vias: put the inner laser via this far (mm) beside
+                              the outer one, joined by a stub on the plane layer between (0 =
+                              stacked)
+          --stack-pitch FLOAT Plane voids: a laser via keeps this far (mm, centre to centre)
+                              from another net's laser via on its plane layer (In1, In4); a net
+                              with a zone there is exempt (0 = off)
+          --stack-through-pitch FLOAT
+                              Plane voids: a laser via and another net's through via keep this
+                              far apart (mm, centre to centre; 0 = off)
+          --no-stack-classes TEXT ...
+                              With --stacked-vias: net classes (KiCad wildcards, comma
+                              separated, e.g. 'PWR_*,HV_31_50_4A') whose nets change layer on
+                              through vias only, F.Cu-In2 included: rails take no laser via
           --diff-pairs        Route differential pairs (KiCad P/N or +/- names) as coupled
                               pairs first (doc 05 §15)
           --pair-twists, --no-pair-twists{false}

@@ -416,10 +416,12 @@ class Condition {
     } else if (n.fn == Fn::ViaType) {
       if (it->kind != ItemKind::Via) return {};  // undefined on other items, as Width is on vias
       // KiCad's ENUM_MAP<VIATYPE> names. A blind via touches an outer layer, a buried one does not. A router probe has
-      // no board via behind it and reads Through.
-      // shortcut: a micro-via probe (--micro-vias) reads Through; give the probe its type with TM-2.
-      model::ViaType t = model::ViaType::Through;
-      bool outer = true;
+      // no board via behind it: it carries its own type, and its layers tell blind from buried.
+      // shortcut: a per-layer clearance probe of a blind via carries one layer, so on an inner layer it reads Buried; exact
+      // once the router places blind vias for a board that has Via_Type rules (the farm never passes --blind-vias).
+      model::ViaType t = it->via_type;
+      const model::LayerMask outer_bits = model::layer_bit(0) | model::layer_bit(b.copper_count() - 1);
+      bool outer = !it->layers || (it->layers & outer_bits);
       if (it->index >= 0) {
         const auto& via = b.vias[static_cast<std::size_t>(it->index)];
         t = via.type;
@@ -575,9 +577,11 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
                             "fires through it");
       }
     }
+    // Via_Type is not positional: a via probe carries its type (via_allowed asks per type, so a rule on laser vias of a net is a
+    // per-net via mask like `disallow micro_via`).
     c.positional = c.cond && c.cond->references({"insideArea", "intersectsArea", "enclosedByArea", "memberOfFootprint",
                                                "intersectsCourtyard", "intersectsFrontCourtyard", "intersectsBackCourtyard",
-                                               "Reference", "Pad_Type", "Via_Type", "Width", "Size_X", "Size_Y", "Position_X", "Position_Y"});
+                                               "Reference", "Pad_Type", "Width", "Size_X", "Size_Y", "Position_X", "Position_Y"});
     // The per-class obstacle cache evaluates one representative net per (class, width, via size), cell by cell, so
     // positional conditions agree with the per-net check; only a condition that reads the net's own name (NetName,
     // inDiffPair) tells two nets of one class apart. Invalid rules are skipped by both paths.
@@ -760,20 +764,22 @@ std::optional<Coord> RuleEngine::skew_constraint(model::NetId net) const {
   return out;
 }
 
-std::optional<model::Constraint> RuleEngine::net_constraint(model::NetId net, const std::string& type) const {
+std::optional<model::Constraint> RuleEngine::net_constraint(model::NetId net, const std::string& type, int layer) const {
   std::optional<model::Constraint> out;
   CopperItem probe;
   probe.kind = ItemKind::Track;
   probe.net = net;
-  probe.layers = ~model::LayerMask{0};
+  probe.layers = layer >= 0 ? model::layer_bit(layer) : ~model::LayerMask{0};
   for (const auto& c : rules_) {
-    if (!c.valid) continue;
+    // Per layer (the router's widths and pair layers): a rule whose condition needs the item's position, size or footprint cannot
+    // be judged on a track that is not there yet, so it is left out.
+    if (!c.valid || (layer >= 0 && (c.positional || !layer_matches(c.rule->layer, layer)))) continue;
     const model::Constraint* k = nullptr;
     for (const auto& x : c.rule->constraints)
       if (x.type == type) k = &x;
     if (!k) continue;
     if (c.cond) {
-      EvalCtx ctx{this, &probe, nullptr, -1};
+      EvalCtx ctx{this, &probe, nullptr, layer};
       if (!c.cond->eval(ctx)) continue;
     }
     out = *k;  // later rules take precedence
@@ -793,7 +799,7 @@ bool RuleEngine::words_match(std::uint16_t words, const CopperItem& it, const mo
     case ItemKind::Graphic: return words & kGraphic;
     case ItemKind::Via: {
       if (words & kVia) return true;
-      const auto type = via_type ? *via_type : it.index >= 0 ? b_.vias[static_cast<std::size_t>(it.index)].type : model::ViaType::Through;
+      const auto type = via_type ? *via_type : it.index >= 0 ? b_.vias[static_cast<std::size_t>(it.index)].type : it.via_type;
       if (type == model::ViaType::Through) return words & kThroughVia;
       if (type == model::ViaType::Micro) return words & kMicroVia;
       int top = 0, bottom = 0;
@@ -859,12 +865,20 @@ bool RuleEngine::via_allowed(model::NetId net, model::ViaType type) const {
   CopperItem probe;
   probe.kind = ItemKind::Via;
   probe.net = net;
-  for (int l = 0; l < b_.copper_count(); ++l) probe.layers |= model::layer_bit(l);
-  for (int l = 0; l < b_.copper_count(); ++l) {
-    bool allowed = true;
-    for (const auto& c : rules_)
-      if (!c.positional && disallow_hit(c, probe, l, &type)) allowed = c.rule->severity == "ignore";
-    if (!allowed) return false;
+  probe.via_type = type;  // a condition on A.Via_Type sees it (`disallow via` for laser vias only)
+  const int nl = b_.copper_count();
+  // A blind probe has no span yet: its Via_Type reads Blind with an outer layer and Buried without one, and either forbids it
+  // (conservative, as the blind_via and buried_via keywords in words_match).
+  for (const bool buried : {false, true}) {
+    if (buried && (type != model::ViaType::Blind || nl < 4)) break;
+    probe.layers = 0;
+    for (int l = buried ? 1 : 0; l < (buried ? nl - 1 : nl); ++l) probe.layers |= model::layer_bit(l);
+    for (int l = 0; l < nl; ++l) {
+      bool allowed = true;
+      for (const auto& c : rules_)
+        if (!c.positional && disallow_hit(c, probe, l, &type)) allowed = c.rule->severity == "ignore";
+      if (!allowed) return false;
+    }
   }
   return true;
 }
@@ -945,6 +959,12 @@ Coord RuleEngine::max_hole_to_hole() const {
   return req;
 }
 
+Coord RuleEngine::max_edge_clearance() const {
+  Coord req = r_.minimums.copper_edge_clearance;
+  for (const auto& m : min_rules_[EdgeClearance]) req = std::max(req, m.min);
+  return req;
+}
+
 Coord RuleEngine::edge_clearance(const CopperItem& a, int layer) const {
   Coord req = r_.minimums.copper_edge_clearance;
   if (auto c = custom_min(EdgeClearance, &a, nullptr, layer)) req = *c;
@@ -971,8 +991,15 @@ std::pair<Coord, Coord> RuleEngine::track_width(const CopperItem& t, int layer) 
   return {mn, mx};
 }
 
+// KiCad's implicit rule "board setup constraints micro-via" (drc_engine.cpp, condition A.Via_Type == 'Micro') puts the board's
+// micro-via minimums in place of the via ones for a micro via.
+bool RuleEngine::micro_via(const CopperItem& it) const {
+  if (it.kind != ItemKind::Via) return false;
+  return (it.index >= 0 ? b_.vias[static_cast<std::size_t>(it.index)].type : it.via_type) == model::ViaType::Micro;
+}
+
 Coord RuleEngine::via_diameter_min(const CopperItem& v) const {
-  Coord req = r_.minimums.via_diameter;
+  Coord req = micro_via(v) ? r_.minimums.microvia_diameter : r_.minimums.via_diameter;
   if (auto c = custom_min(ViaDiameter, &v, nullptr, -1)) req = *c;
   return req;
 }
@@ -984,7 +1011,7 @@ Coord RuleEngine::annular_width_min(const CopperItem& v) const {
 }
 
 Coord RuleEngine::hole_size_min(const CopperItem* owner) const {
-  Coord req = r_.minimums.through_hole_diameter;
+  Coord req = owner && micro_via(*owner) ? r_.minimums.microvia_drill : r_.minimums.through_hole_diameter;
   if (auto c = custom_min(HoleSize, owner, nullptr, -1)) req = *c;
   return req;
 }

@@ -32,6 +32,13 @@ class Obstacles {
                      int l1, model::ViaType type = model::ViaType::Blind) const;
   int via_state(geom::Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed,
                 std::vector<int>* owners = nullptr) const;
+  // A via of a board (a warm start's copper) by its own type and span.
+  int board_via_state(const model::Via& v, bool ignore_routed, std::vector<int>* owners) const;
+  // Plane voids (set_void_pitch): 0 free, 1 only routed vias too close (owners appended when `ignore_routed`), 2 blocked. `laser`: the
+  // new via is a micro via; `span`: its layers.
+  int void_state(geom::Point p, model::NetId net, model::LayerMask span, bool laser, bool ignore_routed, std::vector<int>* owners) const;
+  // A copper zone of `net` is on `layer` (its vias leave no void in that plane).
+  bool plane_net(int layer, model::NetId net) const;
   bool disk_ok(geom::Point p, int layer, Coord hw, model::NetId net, Coord margin) const {
     return disk_state(p, layer, hw, net, margin, false) == 0;
   }
@@ -49,7 +56,9 @@ class Obstacles {
   bool via_disallowed(geom::Point p, Coord d, model::NetId net, int l0, int l1, model::ViaType type) const;
   // The gap two new vias of `net` need between their holes' edges: the board's hole-to-hole minimum, or a custom
   // hole_to_hole rule that matches them. KiCad applies it to every pair of holes, a path's own vias included.
-  Coord via_pair_hole_to_hole(geom::Point a, Coord drill_a, geom::Point b, Coord drill_b, model::NetId net) const;
+  // The types of the two vias reach the rule's conditions (jlc-hdi-microvia-hole-to-hole matches a laser via).
+  Coord via_pair_hole_to_hole(geom::Point a, Coord drill_a, geom::Point b, Coord drill_b, model::NetId net,
+                              model::ViaType type_a = model::ViaType::Through, model::ViaType type_b = model::ViaType::Through) const;
 
   // Registers committed copper (the board copy must already contain the track/via at `index`). Returns the
   // copper item index.
@@ -108,6 +117,12 @@ class Obstacles {
   // Reference path: test probes against every edge of a zone fill instead of the fill's edge index (the answers
   // are the same; tests/test_design_rules.cpp).
   void set_linear_zone_tests(bool on) { linear_zone_tests_ = on; }
+  // Plane voids (RouterOptions::stack_pitch): a laser via keeps `laser` from another net's laser via that shares its middle (plane)
+  // layer, and `through` from another net's through via (0 = off). A net with a zone on that layer leaves no void there.
+  void set_void_pitch(Coord laser, Coord through) {
+    void_laser_ = laser;
+    void_through_ = through;
+  }
   // Rejection counters (diagnostics): outside board, copper, holes/edges/keepouts.
   mutable long rej_outside = 0, rej_copper = 0, rej_other = 0, checks = 0;
 
@@ -116,8 +131,12 @@ class Obstacles {
   // True if `s` is closer than `req` to the copper of `it`. A zone fill answers from its edge index
   // (geom::PolygonIndex, exact), so a probe costs the fill's nearby edges instead of all of them.
   bool item_closer(const geom::Shape& s, const drc::CopperItem& it, Coord req) const;
-  int holes_edges_state(const geom::Shape& s, model::NetId net, int layer, bool is_via_hole, Coord hole_r, bool ignore_routed,
+  // `probe` is the new copper on `layer` (a via probe: its hole, radius `hole_r`, and its type; `span` its layers).
+  int holes_edges_state(const geom::Shape& s, const drc::CopperItem& probe, int layer, Coord hole_r, model::LayerMask span, bool ignore_routed,
                         std::vector<int>* owners) const;
+  // New copper `probe` nearer the board edge than the board minimum, or a custom edge_clearance rule that matches it, asks.
+  bool edge_blocked(const geom::Shape& s, const drc::CopperItem& probe, int layer) const;
+  model::LayerMask span_mask(int l0, int l1) const;
   // Custom physical_hole_clearance rules, any net: new copper against existing holes, and a new via's hole
   // against existing copper, on `layer`. 0 free, 1 conflict with routed copper (when soft), 2 blocked.
   int physical_copper_state(const geom::Shape& s, drc::ItemKind kind, model::NetId net, int layer, bool fixed, bool routed, bool soft,
@@ -129,7 +148,8 @@ class Obstacles {
   int routed_hole_to_hole_part(const geom::Shape& hole, model::LayerMask layers, model::NetId net, bool soft, std::vector<int>* owners) const;
   // Hole to hole between a new via's hole (centre p, radius hole_r, of `net`) and the hole of `other` (null: an
   // NPTH without copper): the board minimum, or a custom hole_to_hole rule that matches the pair.
-  Coord via_hole_to_hole(geom::Point p, Coord hole_r, model::NetId net, const drc::CopperItem* other) const;
+  Coord via_hole_to_hole(geom::Point p, Coord hole_r, model::NetId net, const drc::CopperItem* other, model::ViaType type = model::ViaType::Through,
+                         model::LayerMask span = ~model::LayerMask{0}) const;
   std::int32_t via_hole_code(geom::Point p, Coord drill, Coord margin, model::NetId probe_net, std::int32_t code) const;
 
   model::Board& b_;
@@ -174,6 +194,8 @@ class Obstacles {
   std::unique_ptr<index::UniformGrid> agrid_[2];
   std::vector<std::pair<int, geom::Shape>> texts_;   // copper text boxes (copper index, rectangle)
   Coord via_mask_ = 0;
+  Coord void_laser_ = 0, void_through_ = 0;
+  std::vector<std::vector<model::NetId>> zone_nets_;  // per copper layer: nets with a copper zone there
   Coord max_hole_local_ = 0;                         // largest local (pad/footprint) clearance on a hole                               // mask expansion of untented vias (0 when tented)
   // Mask-opening and copper-text conflicts for new copper on `layer` (fixed obstacles only).
   void aperture_codes(const geom::Shape& s, int layer, bool via_probe, const std::function<void(model::NetId)>& hit) const;

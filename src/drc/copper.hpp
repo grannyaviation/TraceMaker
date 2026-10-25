@@ -25,6 +25,7 @@ struct CopperItem {
   int owner = -1;                 // router connection that created this item (-1 = fixed copper)
   bool removed = false;           // ripped up (router working model only)
   bool free_via = false;          // via marked (free yes): its net is fixed for KiCad's net propagation
+  model::ViaType via_type = model::ViaType::Through;  // a router probe's via type (index -1); a board via has its own
 };
 
 struct Hole {
