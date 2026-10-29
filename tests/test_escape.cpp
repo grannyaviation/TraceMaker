@@ -493,6 +493,53 @@ TEST_CASE("neck-down of a wide net class stays next to the fine-pitch pad", "[ro
   CHECK(r.necked == 1);
 }
 
+TEST_CASE("neck-down: the late reachability proof floods at the A*'s width", "[route][neck]") {
+  constexpr Coord MM = 1'000'000;
+  // The board above: P (class PWR, 1.0 mm) leaves pin 3 of a 0.5 mm pitch row, so it routes on the neck-down rung (pin width
+  // within 2 mm of the pin, class width elsewhere: R1's 1 mm pad takes the full width). R1 sits in a track keep-out box whose
+  // side towards U1 has a 0.9 mm slot, which a 0.25 mm track passes and a 1.0 mm one does not; the box is open at its far end.
+  // A search caches each cell's verdict once, whatever width asked: a late proof flooding from R1 at the neck width hands the
+  // A* "free" through the slot at class width.
+  std::string pads;
+  for (int i = 1; i <= 5; ++i)
+    pads += "(pad \"" + std::to_string(i) + "\" smd rect (at " + std::to_string(-1.5 + 0.5 * i) + " 0) (size 0.25 0.8) (layers \"F.Cu\") (net " +
+            (i == 3 ? "1 \"P\"" : std::to_string(i + 1) + " \"S" + std::to_string(i) + "\"") + ")) ";
+  auto keepout = [](double x0, double y0, double x1, double y1) {
+    const auto xy = [](double x, double y) { return "(xy " + std::to_string(x) + " " + std::to_string(y) + ") "; };
+    return "(zone (net 0) (net_name \"\") (layer \"F.Cu\") (hatch edge 0.5) (connect_pads (clearance 0)) (min_thickness 0.25) "
+           "(keepout (tracks not_allowed) (vias not_allowed) (pads allowed) (copperpour allowed) (footprints allowed)) "
+           "(fill (thermal_gap 0.5) (thermal_bridge_width 0.5)) (polygon (pts " + xy(x0, y0) + xy(x1, y0) + xy(x1, y1) + xy(x0, y1) + "))) ";
+  };
+  auto b = io::read_board(sexpr::Document::parse(
+      "(kicad_pcb (version 20260624) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) "
+      "(setup (pad_to_mask_clearance 0)) (net 0 \"\") (net 1 \"P\") (net 2 \"S1\") (net 3 \"S2\") (net 5 \"S4\") (net 6 \"S5\") "
+      "(gr_rect (start 0 0) (end 20 10) (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid)) (fill no)) "
+      "(footprint \"t:U\" (layer \"F.Cu\") (transform (translate 5 5) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"U1\" (at 0 0 0) (layer \"F.SilkS\")) " + pads + ") "
+      "(footprint \"t:R\" (layer \"F.Cu\") (transform (translate 15 5) (rotate 0) (scale 1 1)) "
+      "(property \"Reference\" \"R1\" (at 0 0 0) (layer \"F.SilkS\")) "
+      "(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net 1 \"P\"))) " +
+      keepout(13.25, 2.5, 13.75, 4.55) + keepout(13.25, 5.45, 13.75, 7.5) +  // the side towards U1, slot at y 4.55..5.45
+      keepout(13.25, 2.5, 17.0, 3.0) + keepout(13.25, 7.0, 17.0, 7.5) + ")"));  // top and bottom; open beyond x 17
+  auto rules = io::read_design_rules("/nonexistent/board.kicad_pcb");
+  model::NetClass pwr = rules.default_class();
+  pwr.name = "PWR";
+  pwr.track_width = 1 * MM;
+  rules.classes.push_back(pwr);
+  rules.assignments["P"] = {"PWR"};
+  route::RouterOptions o;
+  o.time_limit_s = 20;
+  o.allow_vias = false;   // F.Cu only: into the box through its open end, or through the slot
+  o.reach_check = 0;      // no pre-check, so the late proof runs
+  o.reach_after = 1;      // in every strict search
+  o.reach_after_cap = 0;  // and floods to the end
+  o.rip_up = false;
+  const auto r = route::route_portfolio(b, rules, o, 1).best;
+  CHECK(r.late_proofs > 0);
+  REQUIRE(r.routed == r.connections);
+  CHECK(r.necked == 1);
+}
+
 TEST_CASE("solder-mask bridges: other copper keeps the board's mask-to-copper clearance from a pad's aperture", "[route]") {
   constexpr Coord MM = 1'000'000;
   auto b = io::read_board(sexpr::Document::parse(

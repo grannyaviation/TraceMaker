@@ -1637,7 +1637,9 @@ struct Router::Impl {
     const NetId net = c.net;
     const std::size_t cells = static_cast<std::size_t>(w.w) * static_cast<std::size_t>(w.h);
     auto tgt_of = [&](std::size_t i) -> std::uint8_t { return is_target[i]; };
-    // Window cell -> half width the A* tests there (local neck-down near the end pads), as the pre-check does.
+    // Window cell -> half width the A* tests there (local neck-down near the end pads), as the pre-check does. Not only exactness:
+    // cell_cost caches its verdict per cell for the whole search, so a flood at the neck width would hand the A* neck-width
+    // verdicts where it runs at the class width (test "neck-down: the late reachability proof floods at the A*'s width").
     const auto hw_at = [&](int cx, int cy) { return neck_reach > 0 ? width_at(net, at(w.x0 + cx, w.y0 + cy)) / 2 : hw; };
     int proved = 0;
     proved_edge = false;
@@ -1645,6 +1647,7 @@ struct Router::Impl {
     if (rstamp.size() < lcells) rstamp.assign(lcells, 0);
     if (bstamp.size() < lcells) bstamp.assign(lcells, 0);
     ++late_checks;
+    ++res.late_proofs;
     reach_q.clear();
     reach_bq.clear();
     for (const auto& [l, ci] : src.cells) {

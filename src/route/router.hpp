@@ -324,6 +324,7 @@ struct RouteResult {
   long pair_work = 0;           // the part of `expansions` spent in coupled pair searches (closed states and leg checks)
   int rips = 0, passes = 0;
   int enclosed = 0;             // searches that proved the source boxed in (no larger window tried)
+  long late_proofs = 0;         // late reachability proofs run (RouterOptions::reach_after, D154)
   long nogood_skips = 0;        // attempts skipped because an identical attempt already failed
   int necked = 0;               // connections routed at the neck-down width
   int restarts = 0;

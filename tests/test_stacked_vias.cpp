@@ -212,6 +212,7 @@ TEST_CASE("stacked vias: the late reachability proof (D154) takes a stack as a l
   o.reach_after_cap = 0;  // and floods to the end
   o.rip_up = false;
   const auto r = route::Router(l.lb.board, l.rules, o).run();
+  CHECK(r.late_proofs > 0);  // the proof ran
   REQUIRE(r.routed == r.connections);
   CHECK(r.enclosed == 0);
   CHECK(stacks_of(r).size() == 2);
