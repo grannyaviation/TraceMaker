@@ -28,6 +28,23 @@ comparable (judge version, time limit, machine load).
 | [d152-room](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d152-room/runs/d152-room/summary.json) | b2-delay | 1 | ca40050 | 0.0% | 71.9% |  | 41 | `--soft-zones` |
 | [main-b2](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d152-room/runs/main-b2/summary.json) | b2-delay | 3 | ca40050 | 0.0% | 80.5% |  | 188 | `--soft-zones` |
 
+## d154-speed
+
+[Record and README](https://github.com/DingoOz/TraceMaker/tree/main/bench/records/d154-speed)
+
+| Run | Set | Boards | Commit | Clean | Completion | FR 2.5 | Seconds | Route options |
+|---|---|--:|---|--:|--:|--:|--:|---|
+| [sp-mid-base](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-mid-base/summary.json) | mid | 11 | f2a7238 | 0.0% | 79.8% | 9.1% | 1279 |  |
+| [sp-mid-new](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-mid-new/summary.json) | mid | 11 | f2a7238 | 0.0% | 80.4% | 9.1% | 784 |  |
+| [sp-mid60-base](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-mid60-base/summary.json) | mid | 11 | f2a7238 | 0.0% | 80.9% | 9.1% | 689 |  |
+| [sp-mid60-new](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-mid60-new/summary.json) | mid | 11 | f2a7238 | 0.0% | 82.0% | 9.1% | 683 |  |
+| [sp-quick-base](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-quick-base/summary.json) | quick | 30 | f2a7238 | 86.7% | 99.3% | 100.0% | 87 |  |
+| [sp-quick-new](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-quick-new/summary.json) | quick | 30 | f2a7238 | 86.7% | 99.3% | 100.0% | 61 |  |
+| [sp-tierB-base](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-tierB-base/summary.json) | PCBench tier B | 40 | f2a7238 | 72.5% | 97.5% | 50.0% | 2740 |  |
+| [sp-tierB-new](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-tierB-new/summary.json) | PCBench tier B | 40 | f2a7238 | 72.5% | 97.5% | 50.0% | 2534 |  |
+| [sp-tierC-base](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-tierC-base/summary.json) | PCBench tier C | 30 | f2a7238 | 53.3% | 97.5% | 46.7% | 2926 |  |
+| [sp-tierC-new](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/d154-speed/runs/sp-tierC-new/summary.json) | PCBench tier C | 30 | f2a7238 | 56.7% | 97.6% | 46.7% | 2830 |  |
+
 ## m17
 
 [Record and README](https://github.com/DingoOz/TraceMaker/tree/main/bench/records/m17)
@@ -205,6 +222,17 @@ comparable (judge version, time limit, machine load).
 | [rel0110-tierB](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0110-tierB/summary.json) | PCBench tier B | 40 | 225b68f | 70.0% | 97.1% | 50.0% | 3321 |  |
 | [rel0110-tierC](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0110-tierC/summary.json) | PCBench tier C | 30 | 225b68f | 46.7% | 97.4% | 46.7% | 3191 |  |
 | [rel0110-tierD](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.11.0/runs/rel0110-tierD/summary.json) | PCBench tier D | 22 | 225b68f | 36.4% | 94.9% | 36.4% | 2403 |  |
+
+## release-0.12.0
+
+[Record and README](https://github.com/DingoOz/TraceMaker/tree/main/bench/records/release-0.12.0)
+
+| Run | Set | Boards | Commit | Clean | Completion | FR 2.5 | Seconds | Route options |
+|---|---|--:|---|--:|--:|--:|--:|---|
+| [rel0120-tierA](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.12.0/runs/rel0120-tierA/summary.json) | PCBench tier A | 40 | 4e69750 | 100.0% | 100.0% | 100.0% | 1166 |  |
+| [rel0120-tierB](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.12.0/runs/rel0120-tierB/summary.json) | PCBench tier B | 40 | 4e69750 | 72.5% | 97.4% | 50.0% | 3123 |  |
+| [rel0120-tierC](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.12.0/runs/rel0120-tierC/summary.json) | PCBench tier C | 30 | 4e69750 | 50.0% | 97.5% | 46.7% | 3043 |  |
+| [rel0120-tierD](https://github.com/DingoOz/TraceMaker/blob/main/bench/records/release-0.12.0/runs/rel0120-tierD/summary.json) | PCBench tier D | 22 | 4e69750 | 40.9% | 95.9% | 36.4% | 2290 |  |
 
 ## test-campaign-2026-10
 

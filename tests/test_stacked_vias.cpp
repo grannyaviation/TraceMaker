@@ -200,6 +200,24 @@ TEST_CASE("stacked vias: a layer change B.Cu to In3 is two micro vias at one poi
   for (const auto& t : r.tracks) CHECK((t.layer == 3 || t.layer == 5));
 }
 
+TEST_CASE("stacked vias: the late reachability proof (D154) takes a stack as a layer change", "[route][stacked]") {
+  // Through vias are kept off the whole board (a via keep-out on B.Cu), so only a stack takes S from F.Cu to In2. The proof's
+  // floods must make that move as the A* does, or the strict search is stopped as boxed in although a path exists.
+  const Files f("late", board(crossing("F.Cu") + area("novia", "B.Cu", 0, 0, 20, 10, false, true)));
+  const auto l = load(f);
+  auto o = options();
+  o.no_track_layers = bits({1, 3, 4, 5});
+  o.reach_check = 0;      // no pre-check, so the late proof runs
+  o.reach_after = 1;      // in every strict search
+  o.reach_after_cap = 0;  // and floods to the end
+  o.rip_up = false;
+  const auto r = route::Router(l.lb.board, l.rules, o).run();
+  REQUIRE(r.routed == r.connections);
+  CHECK(r.enclosed == 0);
+  CHECK(stacks_of(r).size() == 2);
+  for (const auto& v : r.vias) CHECK(v.type == model::ViaType::Micro);
+}
+
 TEST_CASE("stacked vias: the stack takes its In1 antipad from the refill and the router puts nothing else on In1", "[route][stacked]") {
   const Files f("antipad", board(crossing("F.Cu") + gnd_plane("In1.Cu", 20, 10)), kJlcRules);
   const auto l = load(f);
