@@ -5413,7 +5413,7 @@ struct Router::Impl {
               }
               for (int o : owners)
                 if (!room_rippable(o, net, keep)) soft_only = false;
-              if (soft_only && !owners.empty() && ripped->size() + owners.size() <= 16) {
+              if (ripped && soft_only && !owners.empty() && ripped->size() + owners.size() <= 16) {
                 for (int o : owners) {
                   if (cs[static_cast<std::size_t>(o)].routed) rip(o);
                   ripped->push_back(o);
