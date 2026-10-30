@@ -1236,6 +1236,20 @@ void Obstacles::routed_items_in(const geom::Box& box, std::vector<int>& out) con
   });
 }
 
+bool Obstacles::through_hole_within(Point p, Coord r, model::NetId net) const {
+  const int n = b_.copper_count();
+  const model::LayerMask all = n >= 64 ? ~model::LayerMask{0} : (model::LayerMask{1} << n) - 1;
+  const double r2 = static_cast<double>(r) * static_cast<double>(r);
+  bool hit = false;
+  hgrid_->query(Shape::point(p, r).box.inflated(1), [&](int id) {
+    const auto& h = cm_.holes[static_cast<std::size_t>(id)];
+    if (hit || h.removed || !h.plated || h.net != net || (h.layers & all) != all) return;
+    const double dx = static_cast<double>(h.pos.x - p.x), dy = static_cast<double>(h.pos.y - p.y);
+    hit = dx * dx + dy * dy <= r2;
+  });
+  return hit;
+}
+
 long double zone_fill_area(const drc::CopperModel& cm, const std::vector<int>& items) {
   long double a = 0;
   for (int z : items)

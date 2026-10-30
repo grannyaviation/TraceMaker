@@ -250,6 +250,18 @@ struct RouterOptions {
   double split_cost = 0;
   bool split_hard = false;
   double split_min_coverage = 0.3;  // a layer is a reference plane when its zone fills cover this share of the board
+  // Return-aware via cost (TM-5, sensor_ts rule RETURN): a through via that joins the top half of the copper (layer index < copper
+  // count / 2) to the bottom half costs `return_via_cost` times the search's via cost more where no plated hole of `return_net`
+  // through every layer (its through vias and PTH pads, fixed or routed, not laser vias) is within the net's radius, centre to centre:
+  // the first `return_via_radius_class` entry (net class pattern, KiCad wildcards) that matches, else `return_via_radius`.
+  // `return_net`, nets of `return_via_skip_classes` (the layout farm's POWER_CLASSES) and `return_via_exempt` (net name patterns)
+  // pay nothing. 0 = off: a run without it is the run it was.
+  double return_via_cost = 0;
+  Coord return_via_radius = 1'000'000;
+  std::vector<std::pair<std::string, Coord>> return_via_radius_class;
+  std::vector<std::string> return_via_exempt;
+  std::vector<std::string> return_via_skip_classes = {"PWR_*", "HV_*_4A", "HV_31_50_0A5", "Power"};
+  std::string return_net = "GND";
   // The board with its zones refilled by the engine, for the reference map: made once by the caller when the file's zones have no fills (every portfolio variant
   // would otherwise refill the whole board itself). Null = use the board's own fills, refilling here if it has none.
   std::shared_ptr<const model::Board> reference_fills;

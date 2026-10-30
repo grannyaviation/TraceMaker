@@ -93,6 +93,9 @@ class Obstacles {
   bool needs_exact_routing() const { return re_->needs_exact_routing(); }
   // Ids of live routed items whose box meets `box`.
   void routed_items_in(const geom::Box& box, std::vector<int>& out) const;
+  // A plated hole of `net` through every copper layer (a through via or a PTH pad, fixed or routed and not ripped up) within `r`
+  // of `p`, centre to centre (RouterOptions::return_via_cost).
+  bool through_hole_within(geom::Point p, Coord r, model::NetId net) const;
 
   const drc::CopperModel& copper() const { return cm_; }
   // Copper text as the model holds it: one estimated rectangle per line (copper index, rectangle).

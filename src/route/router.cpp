@@ -306,6 +306,16 @@ struct Router::Impl {
     const auto i = static_cast<std::size_t>(net);
     return stack_ok && (i >= net_stack.size() || net_stack[i]);
   }
+  // Return-aware via cost (RouterOptions::return_via_cost): each net's radius, 0 for a net that pays nothing (all 0 when off).
+  // The per-search cache `ret_tag` holds (search stamp << 1 | a return within reach) per window cell.
+  std::vector<Coord> net_ret_r;
+  NetId ret_net = 0;
+  std::vector<std::uint32_t> ret_tag;
+  std::uint32_t ret_stamp = 0;
+  Coord ret_radius(NetId net) const {
+    const auto i = static_cast<std::size_t>(net);
+    return i < net_ret_r.size() ? net_ret_r[i] : 0;
+  }
   // A stack joins an outer layer and the second layer in (F.Cu-In2, B.Cu-In3), through the plane layer between.
   bool stack_span(int l0, int l1) const { return std::abs(l0 - l1) == 2 && (std::min(l0, l1) == 0 || std::max(l0, l1) == nl - 1); }
   // Both micro vias of a stack over layers [lo, lo + 2] at `p`: 0 free, 1 only rippable copper, 2 blocked.
@@ -478,6 +488,37 @@ struct Router::Impl {
     for (std::size_t i = 0; i < net_stack.size(); ++i)
       for (const auto& pat : opt.no_stack_classes)
         if (model::wildcard_match(pat, netclass(static_cast<NetId>(i)).name)) net_stack[i] = 0;
+    if (opt.return_via_cost > 0) {
+      for (const auto& n : b.nets)
+        if (n.name == opt.return_net) ret_net = n.id;
+      // A net of several classes has them comma separated in its class name (KiCad 10), as the farm's metrics split them.
+      auto class_is = [&](const std::string& pat, NetId n) {
+        const std::string& cls = netclass(n).name;
+        for (std::size_t a = 0; a <= cls.size();) {
+          const std::size_t e = std::min(cls.find(',', a), cls.size());
+          std::string_view part(cls.data() + a, e - a);
+          while (!part.empty() && part.front() == ' ') part.remove_prefix(1);
+          while (!part.empty() && part.back() == ' ') part.remove_suffix(1);
+          if (model::wildcard_match(pat, part)) return true;
+          a = e + 1;
+        }
+        return false;
+      };
+      net_ret_r.assign(b.nets.size(), 0);
+      for (const auto& n : b.nets) {
+        const auto i = static_cast<std::size_t>(n.id);
+        if (ret_net <= 0 || n.id <= 0 || n.id == ret_net || i >= net_ret_r.size()) continue;
+        if (std::any_of(opt.return_via_skip_classes.begin(), opt.return_via_skip_classes.end(), [&](const std::string& p) { return class_is(p, n.id); }) ||
+            std::any_of(opt.return_via_exempt.begin(), opt.return_via_exempt.end(), [&](const std::string& p) { return model::wildcard_match(p, n.name); }))
+          continue;
+        net_ret_r[i] = opt.return_via_radius;
+        for (const auto& [pat, r] : opt.return_via_radius_class)
+          if (class_is(pat, n.id)) {
+            net_ret_r[i] = r;
+            break;
+          }
+      }
+    }
     keep_pairs_off_gap_layers();
     // Factors below 1 are raised to 1: the octile and field heuristics assume no track is cheaper than its length.
     for (std::size_t l = 0; l < opt.layer_cost_pm.size() && l < static_cast<std::size_t>(nl); ++l)
@@ -1932,6 +1973,24 @@ struct Router::Impl {
     const std::int64_t step = pitch, diag = static_cast<std::int64_t>(std::llround(static_cast<double>(pitch) * std::numbers::sqrt2));
     const double via_price = opt.via_cost_mm * via_cost_mult * via_mult_of(net);  // critical nets pay more for a via (issue #24)
     const std::int64_t via_cost = static_cast<std::int64_t>(via_price * 1e6);
+    // Return-aware via cost (--return-via-cost): a through via between the halves of the copper with no return-net hole within the
+    // net's radius pays ret_pen more. A cost only, never a block, so the reachability floods and the cost-to-go field (lower bounds)
+    // stay as they are. The holes do not change during one search: each window cell is looked up once (ret_tag).
+    const Coord ret_r = ret_radius(net);
+    const std::int64_t ret_pen = ret_r > 0 ? static_cast<std::int64_t>(opt.return_via_cost * static_cast<double>(via_cost)) : 0;
+    if (ret_pen > 0) {
+      if (ret_tag.size() < cells) ret_tag.resize(cells, 0);
+      if (++ret_stamp >= (1u << 31)) {
+        std::fill(ret_tag.begin(), ret_tag.end(), 0u);
+        ret_stamp = 1;
+      }
+    }
+    auto ret_extra = [&](std::int64_t ci, int cx, int cy, int la, int lb) -> std::int64_t {
+      if (ret_pen == 0 || (la < nl / 2) == (lb < nl / 2)) return 0;
+      std::uint32_t& t = ret_tag[static_cast<std::size_t>(ci)];
+      if ((t >> 1) != ret_stamp) t = (ret_stamp << 1) | (obs->through_hole_within(at(w.x0 + cx, w.y0 + cy), ret_r, ret_net) ? 1u : 0u);
+      return (t & 1) ? 0 : ret_pen;
+    };
     const std::int64_t dir_pen = static_cast<std::int64_t>(auto_dir_pen * static_cast<double>(pitch));
     // Cost-to-go field (GPU) for large windows: exact distances to the targets through cells not known to be
     // blocked by fixed copper; a lower bound on the true cost, so A* stays optimal while expanding far less.
@@ -2213,7 +2272,7 @@ struct Router::Impl {
           // A layer without tracks is a landing only where the via itself ends the connection (in a zone fill).
           if (l2 == l || (!layer_ok(net, l2) && !target(l2, ci)) || (stack_for(net) && stack_span(l, l2))) continue;
           const std::size_t ns = sidx(l2, ci, kNoDir);
-          const std::int64_t ng = gs + via_cost + vextra + textra(static_cast<std::size_t>(l2) * cells + static_cast<std::size_t>(ci));
+          const std::int64_t ng = gs + via_cost + vextra + ret_extra(ci, cx, cy, l, l2) + textra(static_cast<std::size_t>(l2) * cells + static_cast<std::size_t>(ci));
           if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= ng) continue;
           const std::int64_t hn = h(l2, w.x0 + cx, w.y0 + cy);
           if (hn >= kUnreachable) continue;
@@ -4210,6 +4269,7 @@ struct Router::Impl {
           if (good) relax(key(x.l, gx, gy, d2, x.s), g + K * steplen(d2, x.l) + bend_cost, q.id, -1, kTurn, c2, x.l);
         }
       // Coupled via pair: jog out to the via spacing, change layer, jog back, MV steps in all.
+      // shortcut: no --return-via-cost here (nor in the twist below, --via-drops or --via-in-pad), add it when a coupled pair's side change needs a return.
       if (vias_ok) {
         int gx = x.gx, gy = x.gy;
         delta(x.dd, MV, gx, gy);

@@ -3,7 +3,8 @@
 // vias at one point (F.Cu-In1 plus In1-In2, or B.Cu-In4 plus In4-In3), as KiCad models a stacked via; --stagger puts the second
 // one beside the first with a stub on the middle layer. The router holds what KiCad checks for them (micro-via rules, the 0.35 mm
 // edge rule, hole to hole against drilled holes) and JLC's laser spacing, which KiCad does not check. Also here: rule-based
-// track widths per layer (sd50-inner, usb90-inner) and the via type of a router probe in rule conditions.
+// track widths per layer (sd50-inner, usb90-inner), the via type of a router probe in rule conditions, and the return-aware via
+// cost of a side change (TM-5, --return-via-cost).
 #include <catch2/catch_test_macros.hpp>
 
 #include <unistd.h>
@@ -60,12 +61,12 @@ std::string gnd_plane(const std::string& layer, double w, double h) {
 }
 
 // Six layers F.Cu In1 In2 In3 In4 B.Cu (0..5), `w` x `h` mm. Nets: S (1), B (2), GND (3), SD (4, class SD50), C (5), USB_P (6) and
-// USB_N (7) in class USB90, VCC (8, class PWR_1A).
+// USB_N (7) in class USB90, VCC (8, class PWR_1A), HV (9, class HV_31_50).
 std::string board(const std::string& extra, double w = 20, double h = 10) {
   return "(kicad_pcb (version 20240108) (generator \"pcbnew\")\n"
          "  (layers (0 \"F.Cu\" signal) (1 \"In1.Cu\" signal) (2 \"In2.Cu\" signal) (3 \"In3.Cu\" signal) (4 \"In4.Cu\" signal)\n"
          "    (31 \"B.Cu\" signal) (37 \"F.SilkS\" user) (44 \"Edge.Cuts\" user))\n"
-         "  (net 0 \"\") (net 1 \"S\") (net 2 \"B\") (net 3 \"GND\") (net 4 \"SD\") (net 5 \"C\") (net 6 \"USB_P\") (net 7 \"USB_N\") (net 8 \"VCC\")\n"
+         "  (net 0 \"\") (net 1 \"S\") (net 2 \"B\") (net 3 \"GND\") (net 4 \"SD\") (net 5 \"C\") (net 6 \"USB_P\") (net 7 \"USB_N\") (net 8 \"VCC\") (net 9 \"HV\")\n"
          "  (gr_rect (start 0 0) (end " + mm(w) + " " + mm(h) + ") (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid)))\n" +
          extra + ")\n";
 }
@@ -98,8 +99,10 @@ struct Files {
         << R"({"name":"SD50","clearance":)" << clearance << R"(,"track_width":0.174,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15},)"
         << R"({"name":"USB90","clearance":0.152,"track_width":0.152,"diff_pair_width":0.152,"diff_pair_gap":0.152,"via_diameter":0.45,"via_drill":0.3,)"
         << R"("microvia_diameter":0.3,"microvia_drill":0.15},)"
-        << R"({"name":"PWR_1A","clearance":)" << clearance << R"(,"track_width":0.4,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15}],)"
-        << R"("netclass_patterns":[{"pattern":"SD","netclass":"SD50"},{"pattern":"USB_*","netclass":"USB90"},{"pattern":"VCC","netclass":"PWR_1A"}]}})";
+        << R"({"name":"PWR_1A","clearance":)" << clearance << R"(,"track_width":0.4,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15},)"
+        << R"({"name":"HV_31_50","clearance":)" << clearance << R"(,"track_width":0.1,"via_diameter":0.45,"via_drill":0.3,"microvia_diameter":0.3,"microvia_drill":0.15}],)"
+        << R"("netclass_patterns":[{"pattern":"SD","netclass":"SD50"},{"pattern":"USB_*","netclass":"USB90"},{"pattern":"VCC","netclass":"PWR_1A"},)"
+        << R"({"pattern":"HV","netclass":"HV_31_50"}]}})";
   }
   ~Files() { fs::remove_all(dir); }
 };
@@ -632,4 +635,80 @@ TEST_CASE("stacked vias: staggered stacks keep the width rules and the spacing r
   // and every laser hole of one layer pair keeps the 0.24 mm rule from it (In1-In2 halves: centres 0.39 mm apart at least).
   for (const auto& v : rp.vias)
     if (v.layer_top == 1) CHECK(dist(v.pos, geom::Point{4'300'000, 5'010'000}) >= 0.39 * MM);
+}
+
+namespace {
+
+// TM-5: net `name` changes side, from a pad on F.Cu at (3, 5) to one on B.Cu at (17, 5), with tracks on F.Cu and B.Cu only, so on one
+// through via. Via keep-outs leave two sites: window A on the straight line (6.5-7.5, 4.5-5.5) and window B off it (12.6-13.4,
+// 6.4-7.0), 1.4 mm of octilinear track longer. A fixed GND through via sits at (13, gnd_y).
+std::string two_sites(int net, const std::string& name, double gnd_y) {
+  std::string s = pad_fp("P1", 3, 5, "F.Cu", net, name) + pad_fp("P2", 17, 5, "B.Cu", net, name) + "  (via (at 13 " + mm(gnd_y) +
+                  ") (size 0.45) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 3))\n";
+  const double k[7][4] = {{0, 0, 6.5, 10},   {7.5, 0, 12.6, 10},   {13.4, 0, 20, 10},   {6.5, 0, 7.5, 4.5},
+                          {6.5, 5.5, 7.5, 10}, {12.6, 0, 13.4, 6.4}, {12.6, 7.0, 13.4, 10}};
+  for (int i = 0; i < 7; ++i) s += area("nv" + std::to_string(i), "F.Cu", k[i][0], k[i][1], k[i][2], k[i][3], false, true);
+  return s;
+}
+
+bool in_a(geom::Point p) { return p.x >= 6'500'000 && p.x <= 7'500'000 && p.y >= 4'500'000 && p.y <= 5'500'000; }
+bool in_b(geom::Point p) { return p.x >= 12'600'000 && p.x <= 13'400'000 && p.y >= 6'400'000 && p.y <= 7'000'000; }
+
+// The one through via of a two_sites route.
+geom::Point side_via(const route::RouteResult& r) {
+  REQUIRE(r.routed == r.connections);
+  REQUIRE(r.vias.size() == 1);
+  CHECK(r.vias[0].type == model::ViaType::Through);
+  return r.vias[0].pos;
+}
+
+}  // namespace
+
+TEST_CASE("return via cost: a side change takes the via site with a GND through via within 1.0 mm", "[route][return]") {
+  const geom::Point gnd{13'000'000, 7'600'000};  // every site of window B is 0.83-0.99 mm from it
+  const Files f("ret_site", board(two_sites(1, "S", 7.6)));
+  const auto l = load(f);
+  auto o = options();
+  o.no_track_layers = bits({1, 2, 3, 4});
+  // Off (the default): site A on the straight line, with no return in reach, as before.
+  const auto off = side_via(route::Router(l.lb.board, l.rules, o).run());
+  CHECK(in_a(off));
+  CHECK(dist(off, gnd) > 1.0 * MM);
+  // On: site B with its GND return, for 1.4 mm more track (the penalty is one via's 3 mm).
+  o.return_via_cost = 1;
+  const auto on = side_via(route::Router(l.lb.board, l.rules, o).run());
+  CHECK(in_b(on));
+  CHECK(dist(on, gnd) <= 1.0 * MM);
+  // An exempt net pays nothing: site A.
+  o.return_via_exempt = {"S"};
+  CHECK(in_a(side_via(route::Router(l.lb.board, l.rules, o).run())));
+  // Nor does a rail (PWR_*, one of the farm's POWER_CLASSES, the default skip list).
+  o.return_via_exempt.clear();
+  const Files g("ret_rail", board(two_sites(8, "VCC", 7.6)));
+  const auto lg = load(g);
+  CHECK(in_a(side_via(route::Router(lg.lb.board, lg.rules, o).run())));
+  // Without the skip list the rail takes site B like a signal.
+  o.return_via_skip_classes.clear();
+  CHECK(in_b(side_via(route::Router(lg.lb.board, lg.rules, o).run())));
+}
+
+TEST_CASE("return via cost: an HV_31_50 net's return reaches 1.25 mm (--return-via-radius-class)", "[route][return]") {
+  const geom::Point gnd{13'000'000, 7'900'000};  // every site of window B is 1.12-1.29 mm from it
+  const Files f("ret_hv", board(two_sites(9, "HV", 7.9)));
+  const auto l = load(f);
+  auto o = options();
+  o.no_track_layers = bits({1, 2, 3, 4});
+  o.return_via_cost = 1;
+  // At the default 1.0 mm neither site has a return: both pay, the shorter A wins.
+  CHECK(in_a(side_via(route::Router(l.lb.board, l.rules, o).run())));
+  // At the class's 1.25 mm site B has one.
+  o.return_via_radius_class = {{"HV_31_50*", 1'250'000}};
+  const auto hv = side_via(route::Router(l.lb.board, l.rules, o).run());
+  CHECK(in_b(hv));
+  CHECK(dist(hv, gnd) > 1.0 * MM);
+  CHECK(dist(hv, gnd) <= 1.25 * MM);
+  // The class entry does not reach a Default net: S keeps 1.0 mm and site A.
+  const Files g("ret_hv_s", board(two_sites(1, "S", 7.9)));
+  const auto lg = load(g);
+  CHECK(in_a(side_via(route::Router(lg.lb.board, lg.rules, o).run())));
 }

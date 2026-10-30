@@ -1121,6 +1121,17 @@ int main(int argc, char** argv) {
                     "Cost, in pitches per lattice step, of a critical net's track over a void of the adjacent reference plane: a split, a slot or an antipad field (default 0; 4 with --si-rules)")
                       ->check(CLI::NonNegativeNumber);
   route->add_flag("--split-hard", r_job.split_hard, "Close plane voids to critical nets instead of charging for them: a critical net with no way round a split stays unrouted");
+  double r_ret_radius_mm = 1.0;
+  std::vector<std::string> r_ret_class;
+  route->add_option("--return-via-cost", ropt.return_via_cost,
+                    "A through via that joins the top half of the copper to the bottom half costs this many vias more where no GND through via or PTH pad is within "
+                    "--return-via-radius, centre to centre. GND, nets of the power classes (PWR_*, HV_*_4A, HV_31_50_0A5, Power) and --return-via-exempt pay nothing "
+                    "(default 0: off)")
+      ->check(CLI::NonNegativeNumber);
+  route->add_option("--return-via-radius", r_ret_radius_mm, "With --return-via-cost: how far the GND return may be, mm (default 1.0)")->check(CLI::PositiveNumber);
+  route->add_option("--return-via-radius-class", r_ret_class,
+                    "With --return-via-cost: the radius of a net class as PATTERN=MM, e.g. 'HV_31_50*=1.25' (repeatable; the first match wins)");
+  route->add_option("--return-via-exempt", ropt.return_via_exempt, "With --return-via-cost: nets that pay nothing (KiCad wildcards, comma separated)")->delimiter(',');
   route->add_flag("--no-freeze", r_nofreeze, "With --view: the viewer does not hold the scene on a routing stall (it normally freezes on the stuck net, with the rejected paths and what rejected them; Space resumes)");
   route->add_option("--record", r_job.record, "Write the routing events (JSON lines, time-stamped) to a file for replay; zstd-compressed if FILE ends in .zst");
   route->add_option("--view-host", r_job.view_host,
@@ -1468,6 +1479,15 @@ int main(int argc, char** argv) {
       ropt.stagger = static_cast<tmk::Coord>(std::llround(r_stagger_mm * 1e6));
       ropt.stack_pitch = static_cast<tmk::Coord>(std::llround(r_stack_pitch_mm * 1e6));
       ropt.stack_through_pitch = static_cast<tmk::Coord>(std::llround(r_stack_through_pitch_mm * 1e6));
+      ropt.return_via_radius = static_cast<tmk::Coord>(std::llround(r_ret_radius_mm * 1e6));
+      for (const auto& e : r_ret_class) {
+        const auto eq = e.rfind('=');
+        char* end = nullptr;
+        const double mm = eq == std::string::npos ? 0 : std::strtod(e.c_str() + eq + 1, &end);
+        if (eq == 0 || eq == std::string::npos || end == e.c_str() + eq + 1 || *end != '\0' || !(mm > 0))
+          throw std::invalid_argument("--return-via-radius-class: '" + e + "' is not PATTERN=MM");
+        ropt.return_via_radius_class.emplace_back(e.substr(0, eq), static_cast<tmk::Coord>(std::llround(mm * 1e6)));
+      }
       if (neck_reach_mm >= 0) ropt.neck_reach = static_cast<tmk::Coord>(neck_reach_mm * 1e6);
       ropt.gpu_device = tmk::app::default_gpu_device(!r_nogpu);
       auto job = std::move(r_job);
