@@ -21,6 +21,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <unistd.h>
 #include <sstream>
 #include <deque>
 #include <set>
@@ -5304,6 +5305,13 @@ struct Router::Impl {
   // soft path lifting what that crosses in turn, at most `cap` lifted in all. Kept only when every one is routed;
   // otherwise all copper of the transaction goes and the lifted connections get their old copper back.
   long chain_ok = 0, chain_nopath = 0, chain_cap = 0, chain_victim = 0, chain_swap = 0;
+  // TM_DEBUG_LNS: a trace of each transaction (what each probe crossed, what came back strictly); read-only.
+  bool lns_dbg = std::getenv("TM_DEBUG_LNS") != nullptr;
+  std::string lns_trace;
+  std::string conn_label(int c) const {
+    const auto& cc = cs[static_cast<std::size_t>(c)].c;
+    return b.nets[static_cast<std::size_t>(cc.net)].name + " " + pad_label(cc.pad_a) + "->" + (cc.pad_b >= 0 ? pad_label(cc.pad_b) : std::string("zone"));
+  }
   std::vector<OldItem> swap_items;  // after a failed chain: old copper of the lifted connection whose way back crossed u
   // Marks the lattice cells along an old copper item, with their neighbours (a lattice path crossing the track need
   // not touch its centre line), in `avoid`.
@@ -5354,7 +5362,10 @@ struct Router::Impl {
       if (c != u || qi > 0) {  // the unrouted connection failed strictly already (but not after a swap)
         current = c;
         soft = false;
-        if (search_or_neck(cc, false, necked)) continue;
+        if (search_or_neck(cc, false, necked)) {
+          if (lns_dbg) lns_trace += " [" + b.nets[static_cast<std::size_t>(cc.net)].name + " strict ok]";
+          continue;
+        }
       }
       lns_probing = true;
       probe_hit = false;
@@ -5367,6 +5378,12 @@ struct Router::Impl {
       strict_pass = true;
       lns_probing = false;
       soft = false;
+      if (lns_dbg) {
+        lns_trace += " [" + b.nets[static_cast<std::size_t>(cc.net)].name + (probe_hit ? " probe crosses " + std::to_string(probe_victims.size()) + ":" : " probe no path (" + why + ")");
+        if (probe_hit)
+          for (int v : probe_victims) lns_trace += " " + b.nets[static_cast<std::size_t>(cs[static_cast<std::size_t>(v)].c.net)].name;
+        lns_trace += "]";
+      }
       if (!probe_hit) {
         ok = false;
         ++(c == u ? chain_nopath : chain_victim);
@@ -5411,6 +5428,7 @@ struct Router::Impl {
         cs[static_cast<std::size_t>(u)].why = "completion LNS: exact check rejected a probe path";
       }
     }
+    if (lns_dbg) lns_trace += " lifted " + std::to_string(orig.size()) + " queue " + std::to_string(queue.size());
     if (ok) {
       ++chain_ok;
       return true;
@@ -5423,6 +5441,34 @@ struct Router::Impl {
     return false;
   }
 
+  // TM_LNS_DUMP=PREFIX (debugging): the live routes as the completion LNS starts, in --state-out's format, to
+  // PREFIX.<pid>.<connections>; TM_LNS_RESUME=FILE starts a run from such a file straight into the completion LNS.
+  void lns_dump(const std::string& prefix) const {
+    const std::string path = prefix + "." + std::to_string(::getpid()) + "." + std::to_string(res.connections);
+    std::ofstream f(path, std::ios::trunc);
+    f << "S 0 " << res.routed << '\n';
+    for (const auto& st : cs) {
+      if (st.items.empty()) continue;
+      std::size_t nt = 0, nv = 0;
+      for (int item : st.items) ++(obs->copper().items[static_cast<std::size_t>(item)].kind == drc::ItemKind::Via ? nv : nt);
+      f << "R " << st.c.pad_a << ' ' << st.c.pad_b << ' ' << nt << ' ' << nv << '\n';
+      for (int item : st.items) {
+        const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+        if (it.kind == drc::ItemKind::Via) continue;
+        const auto& t = b.tracks[static_cast<std::size_t>(it.index)];
+        f << "T " << t.a.x << ' ' << t.a.y << ' ' << t.b.x << ' ' << t.b.y << ' ' << t.width << ' ' << t.layer << ' ' << t.net << '\n';
+      }
+      for (int item : st.items) {
+        const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+        if (it.kind != drc::ItemKind::Via) continue;
+        const auto& v = b.vias[static_cast<std::size_t>(it.index)];
+        f << "V " << v.pos.x << ' ' << v.pos.y << ' ' << v.size << ' ' << v.drill << ' ' << v.layer_top << ' ' << v.layer_bottom << ' ' << static_cast<int>(v.type) << ' '
+          << v.net << '\n';
+      }
+    }
+    std::fprintf(stderr, "lns: state written to %s\n", path.c_str());
+  }
+
   int lns_complete() {
     const double probe_soft = opt.lns_soft;
     const std::size_t lns_cap = static_cast<std::size_t>(std::max(1, opt.lns_cap));
@@ -5432,8 +5478,18 @@ struct Router::Impl {
     static const std::size_t caps[] = {8, 16, 24};
     int gained = 0, attempts = 0, level = 0;  // level: sweeps without gain so far raise the cap (x2 each) and widen probes
     std::size_t cap = lns_cap;
+    if (lns_dbg) std::fprintf(stderr, "lns start: %.1f s, %ld expansions, routed %d of %d\n", elapsed(), res.expansions, res.routed, res.connections);
+    if (const char* dump = std::getenv("TM_LNS_DUMP")) lns_dump(dump);
+    auto lns_t = [&]() { return std::make_tuple(elapsed(), res.expansions, obs->checks); };
+    auto lns_log = [&](const char* what, int uc, const std::tuple<double, long, long>& m0, bool ok) {
+      if (!lns_dbg) return;
+      std::fprintf(stderr, "lns %s %s: %s, %.1f s, %ld exp, %ld checks;%s\n", what, conn_label(uc).c_str(), ok ? "ok" : cs[static_cast<std::size_t>(uc)].why.c_str(),
+                   elapsed() - std::get<0>(m0), res.expansions - std::get<1>(m0), obs->checks - std::get<2>(m0), lns_trace.c_str());
+      lns_trace.clear();
+    };
     for (int sweep = 0; !out_of_budget(); ++sweep) {
       const int gained_before = gained;
+      if (lns_dbg) std::fprintf(stderr, "lns sweep %d level %d cap %zu: %.1f s, %ld expansions, routed %d\n", sweep, level, cap, elapsed(), res.expansions, res.routed);
       for (std::size_t ui = 0; ui < cs.size() && !out_of_budget(); ++ui) {
         auto& u = cs[ui];
         if (u.routed || u.dead) continue;
@@ -5449,7 +5505,9 @@ struct Router::Impl {
         // connection's old copper, so u's next path leaves it room; up to three tries.
         bool won = false;
         for (int t = 0; t < 3 && !out_of_budget(); ++t) {
+          const auto m0 = lns_t();
           won = lns_chain(uc, cap, probe_soft);
+          lns_log(t == 0 ? "chain" : "chain (swap retry)", uc, m0, won);
           if (won || swap_items.empty()) break;
           for (const auto& o : swap_items) mark_avoid(o);
         }
@@ -5488,11 +5546,19 @@ struct Router::Impl {
           for (int g : group) saved.push_back(lift_items(g));
           soft = false;
           current = uc;
+          const auto m0 = lns_t();
           bool ok = search_and_commit(u.c, false);
+          std::size_t k_fail = 0;
           for (std::size_t k = 0; ok && k < group.size(); ++k) {
             current = group[k];
             ok = search_and_commit(cs[static_cast<std::size_t>(group[k])].c, false);
+            k_fail = k;
           }
+          if (lns_dbg) {
+            lns_trace = " radius " + std::to_string(radii[r] / 1000) + " um, group " + std::to_string(group.size());
+            if (!ok) lns_trace += cs[static_cast<std::size_t>(uc)].items.empty() ? ", u failed" : ", failed at " + conn_label(group[k_fail]);
+          }
+          lns_log("region", uc, m0, ok);
           if (ok) {
             u.routed = true;
             ++res.routed;
@@ -6562,10 +6628,40 @@ struct Router::Impl {
     // cleared, rip cap raised, history halved, ties in the hardest-first order shuffled (avr_ledprojector stopped
     // at 43 of 120 s with every remaining attempt a nogood).
     bool lns_done = false;  // completion LNS ran: its state is final (no negotiation, no restarts)
-    if (opt.warm || !opt.warm_tracks.empty()) {  // start from earlier routes: those connections count as routed, the rest are pending
+    std::vector<ConnRoute> lns_resume;  // TM_LNS_RESUME (debugging): routes written by TM_LNS_DUMP; the run goes straight into the completion LNS
+    if (const char* rf = opt.lns_complete ? std::getenv("TM_LNS_RESUME") : nullptr) {
+      std::ifstream f(rf);
+      std::string tag;
+      while (f >> tag) {
+        if (tag == "S") {
+          int x = 0, y = 0;
+          f >> x >> y;
+        } else if (tag == "R") {
+          ConnRoute cr;
+          std::size_t nt = 0, nv = 0;
+          f >> cr.pad_a >> cr.pad_b >> nt >> nv;
+          for (std::size_t i = 0; i < nt && f >> tag; ++i) {
+            model::Track t;
+            f >> t.a.x >> t.a.y >> t.b.x >> t.b.y >> t.width >> t.layer >> t.net;
+            cr.tracks.push_back(t);
+          }
+          for (std::size_t i = 0; i < nv && f >> tag; ++i) {
+            model::Via v;
+            int ty = 0;
+            f >> v.pos.x >> v.pos.y >> v.size >> v.drill >> v.layer_top >> v.layer_bottom >> ty >> v.net;
+            v.type = static_cast<model::ViaType>(ty);
+            cr.vias.push_back(v);
+          }
+          lns_resume.push_back(std::move(cr));
+        }
+      }
+      if (lns_resume.empty()) std::fprintf(stderr, "lns: TM_LNS_RESUME %s holds no routes\n", rf);
+    }
+    if (opt.warm || !opt.warm_tracks.empty() || !lns_resume.empty()) {  // start from earlier routes: those connections count as routed, the rest are pending
       std::map<std::pair<int, int>, const ConnRoute*> by_pads;
       if (opt.warm)
         for (const auto& cr : *opt.warm) by_pads[{cr.pad_a, cr.pad_b}] = &cr;
+      for (const auto& cr : lns_resume) by_pads[{cr.pad_a, cr.pad_b}] = &cr;
       std::vector<ConnRoute> from_board;  // copper of a routed board: all of a net's tracks and vias go to its only connection
       if (!opt.warm_tracks.empty() || !opt.warm_vias.empty()) {
         std::map<NetId, int> per_net;
@@ -6706,6 +6802,17 @@ struct Router::Impl {
         if (!cs[i].routed) pending.push_back(static_cast<int>(i));
       snapshot();
       snapshot_unrouted();
+      if (!lns_resume.empty()) {
+        std::fprintf(stderr, "lns: resumed with %d of %d routed (%d routes taken over)\n", res.routed, res.connections, taken);
+        phase = WorkPhase::FirstPass;
+        lns_complete();
+        pending.clear();
+        lns_done = true;
+        if (res.routed > best_routed) {
+          snapshot();
+          snapshot_unrouted();
+        }
+      }
     }
     for (int restart = 0; restart <= opt.max_restarts + 40; ++restart) {
     if (restart > 0) {
@@ -6893,7 +7000,9 @@ struct Router::Impl {
           snapshot_unrouted();
         }
       }
-      if (std::getenv("TM_DEBUG_LNS")) std::fprintf(stderr, "end of pass %d: routed %d of %d, budget %d\n", pass, res.routed, res.connections, out_of_budget() ? 0 : 1);
+      if (std::getenv("TM_DEBUG_LNS"))
+        std::fprintf(stderr, "end of pass %d: routed %d of %d, budget %d, %.1f s, %ld expansions\n", pass, res.routed, res.connections, out_of_budget() ? 0 : 1, elapsed(),
+                     res.expansions);
       // Regional rebuild of what is still open, from the second pass on and then every second pass (doc 16 F4).
       if (opt.lns_open_trials > 0 && pass >= 1 && pass % 2 == 1 && res.routed < res.connections && !out_of_budget()) {
         const WorkPhase keep = phase;
