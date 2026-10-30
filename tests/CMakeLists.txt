@@ -137,3 +137,9 @@ set_tests_properties(critical_nets_cli PROPERTIES LABELS "route;integration" TIM
 # The board session an agent drives (doc 19, M18): both transports through the real binary, a hostile net name, replay, and equality with `route --variants 1`.
 add_test(NAME session_cli COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/session_cli.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/session_cli)
 set_tests_properties(session_cli PROPERTIES SKIP_RETURN_CODE 77 LABELS "integration;session" TIMEOUT 600)
+# --return-via-cost is bounded (0 to 1000, a multiple of the via cost): a larger value is a CLI error, the limit itself routes.
+set(RVC_ARGS route ${PROJECT_SOURCE_DIR}/tests/boards/plane_smd/plane_smd.kicad_pcb -o ${CMAKE_BINARY_DIR}/integration/rvc.kicad_pcb --work 10 --variants 1 --no-kb)
+add_test(NAME return_via_cost_too_big COMMAND tracemaker ${RVC_ARGS} --return-via-cost 1000.5)
+set_tests_properties(return_via_cost_too_big PROPERTIES PASS_REGULAR_EXPRESSION "--return-via-cost: Value 1000.5 not in range \\[0 - 1000\\]" LABELS "route" TIMEOUT 60)
+add_test(NAME return_via_cost_limit_ok COMMAND tracemaker ${RVC_ARGS} --return-via-cost 1000)
+set_tests_properties(return_via_cost_limit_ok PROPERTIES PASS_REGULAR_EXPRESSION "searches: [0-9]+ ok" FAIL_REGULAR_EXPRESSION "not in range" LABELS "route" TIMEOUT 60)

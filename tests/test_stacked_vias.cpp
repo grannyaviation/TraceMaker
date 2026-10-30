@@ -712,3 +712,37 @@ TEST_CASE("return via cost: an HV_31_50 net's return reaches 1.25 mm (--return-v
   const auto lg = load(g);
   CHECK(in_a(side_via(route::Router(lg.lb.board, lg.rules, o).run())));
 }
+
+TEST_CASE("return via cost: the LNS clean-up does not trade a covered side change for an uncovered one", "[route][return]") {
+  // Net B runs straight across window B at y = 6.7, so with S's via at B it detours; S is the shorter net and goes first.
+  // Without S, the clean-up (lns_vias) routes B straight through the window and S last: it takes site A, 1.4 mm shorter,
+  // and the group "improves" on length and vias alone. With the penalty the main pass chose the covered site B.
+  const geom::Point gnd{13'000'000, 7'600'000};
+  const Files f("ret_lns", board(two_sites(1, "S", 7.6) + pad_fp("N1", 1, 6.7, "F.Cu", 2, "B") + pad_fp("N2", 19, 6.7, "F.Cu", 2, "B")));
+  const auto l = load(f);
+  auto o = options();
+  o.no_track_layers = bits({1, 2, 3, 4});
+  o.optimize = true;
+  auto via_of_s = [&](const route::RouteResult& r) {
+    REQUIRE(r.routed == r.connections);
+    geom::Point s{};
+    int n = 0;
+    for (const auto& v : r.vias)
+      if (v.net == 1) {
+        s = v.pos;
+        ++n;
+      }
+    REQUIRE(n == 1);
+    return s;
+  };
+  // Without the cost the straight site A, as in the first test.
+  CHECK(in_a(via_of_s(route::Router(l.lb.board, l.rules, o).run())));
+  // On, the main pass takes the covered site B; the clean-up must keep it.
+  o.return_via_cost = 1;
+  o.optimize = false;
+  CHECK(in_b(via_of_s(route::Router(l.lb.board, l.rules, o).run())));
+  o.optimize = true;
+  const auto on = via_of_s(route::Router(l.lb.board, l.rules, o).run());
+  CHECK(in_b(on));
+  CHECK(dist(on, gnd) <= 1.0 * MM);
+}

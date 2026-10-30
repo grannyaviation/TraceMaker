@@ -5160,6 +5160,29 @@ struct Router::Impl {
   // 2.5 mm of a via (at most 8), remove them all, route them again with vias made dearer and other copper as a hard
   // obstacle, and keep the result only if every one routes and length + 2 mm per via goes down; otherwise restore
   // the old copper exactly. Unlike single-connection re-routes this can move a neighbour out of the way.
+  // --return-via-cost: the through vias of `items` that join the two halves of the copper (tracks of the connection on both at the via)
+  // with no return-net hole within the net's radius. The clean-up must not raise it (a trade of a covered site for an uncovered one).
+  // shortcut: arc tracks and via-in-pad endpoints are not looked at, add them when a farm board routes with arcs.
+  int uncovered_side_vias(const std::vector<int>& items) const {
+    int n = 0;
+    for (int item : items) {
+      const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+      if (it.kind != drc::ItemKind::Via) continue;
+      const auto& v = b.vias[static_cast<std::size_t>(it.index)];
+      const Coord r = ret_radius(v.net);
+      if (r <= 0 || v.type != model::ViaType::Through) continue;
+      bool top = false, bot = false;
+      for (int o : items) {
+        const auto& ot = obs->copper().items[static_cast<std::size_t>(o)];
+        if (ot.kind == drc::ItemKind::Via) continue;
+        const auto& t = b.tracks[static_cast<std::size_t>(ot.index)];
+        if (t.a != v.pos && t.b != v.pos) continue;
+        (t.layer < nl / 2 ? top : bot) = true;
+      }
+      if (top && bot && !obs->through_hole_within(v.pos, r, ret_net)) ++n;
+    }
+    return n;
+  }
   int lns_vias(int max_attempts) {
     via_cost_mult = 10.0;
     bypass_nogoods = true;
@@ -5212,10 +5235,12 @@ struct Router::Impl {
           group.push_back(o);
       }
       double before = 0;
+      int unc_before = 0;
       std::vector<std::vector<Old>> saved(group.size());
       for (std::size_t g = 0; g < group.size(); ++g) {
         auto& st = cs[static_cast<std::size_t>(group[g])];
         before += conn_cost(st.items);
+        if (opt.return_via_cost > 0) unc_before += uncovered_side_vias(st.items);
         for (int item : st.items) {
           const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
           saved[g].push_back({it.kind, it.index});
@@ -5240,7 +5265,10 @@ struct Router::Impl {
       double after = 0;
       if (ok)
         for (int c : group) after += conn_cost(cs[static_cast<std::size_t>(c)].items);
-      if (ok && after < before - 1e3) {
+      int unc_after = 0;
+      if (ok && opt.return_via_cost > 0)
+        for (int c : group) unc_after += uncovered_side_vias(cs[static_cast<std::size_t>(c)].items);
+      if (ok && after < before - 1e3 && unc_after <= unc_before) {
         ++improved;
         continue;
       }

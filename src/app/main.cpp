@@ -1126,8 +1126,8 @@ int main(int argc, char** argv) {
   route->add_option("--return-via-cost", ropt.return_via_cost,
                     "A through via that joins the top half of the copper to the bottom half costs this many vias more where no GND through via or PTH pad is within "
                     "--return-via-radius, centre to centre. GND, nets of the power classes (PWR_*, HV_*_4A, HV_31_50_0A5, Power) and --return-via-exempt pay nothing "
-                    "(default 0: off)")
-      ->check(CLI::NonNegativeNumber);
+                    "(0 to 1000; default 0: off)")
+      ->check(CLI::Range(0.0, 1000.0));
   route->add_option("--return-via-radius", r_ret_radius_mm, "With --return-via-cost: how far the GND return may be, mm (default 1.0)")->check(CLI::PositiveNumber);
   route->add_option("--return-via-radius-class", r_ret_class,
                     "With --return-via-cost: the radius of a net class as PATTERN=MM, e.g. 'HV_31_50*=1.25' (repeatable; the first match wins)");
