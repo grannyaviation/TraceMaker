@@ -957,6 +957,7 @@ struct Router::Impl {
   const std::vector<Escape>& escapes(int pad) {
     const std::int64_t ekey = static_cast<std::int64_t>(pad) * 4'000'000 + track_width(b.pads[static_cast<std::size_t>(pad)].net) / 1000;
     if (auto it = escape_cache.find(ekey); it != escape_cache.end()) return it->second;
+    const Obstacles::HardOff fixed_only(*obs);
     std::vector<Escape> out;
     const auto& p = b.pads[static_cast<std::size_t>(pad)];
     const NetId net = p.net;
@@ -1356,6 +1357,7 @@ struct Router::Impl {
   const std::vector<ViaDrop>& via_drops(int pad) {
     const std::int64_t dkey = static_cast<std::int64_t>(pad) * 4'000'000 + track_width(b.pads[static_cast<std::size_t>(pad)].net) / 1000;
     if (auto it = drop_cache.find(dkey); it != drop_cache.end()) return it->second;
+    const Obstacles::HardOff fixed_only(*obs);
     std::vector<ViaDrop> out;
     const auto& p = b.pads[static_cast<std::size_t>(pad)];
     const NetId net = p.net;
@@ -2581,6 +2583,7 @@ struct Router::Impl {
         }
         if (!placed) {
           // No direction fits even past routed copper: fixed copper closes this spot to the net's staggered stacks for good.
+          const Obstacles::HardOff fixed_only(*obs);
           if (std::none_of(dirs.begin(), dirs.end(), [&](const auto& u) { return fits(at_dir(u.first, u.second), true); }))
             learned_stack.insert({net, cell_key(lo, to_ix(A.x), to_iy(A.y))});
           commit_why = "no room for a staggered laser via";
@@ -2828,6 +2831,7 @@ struct Router::Impl {
   }
 
   void learn_block(const Connection& c, const auto& s, Coord width) {
+    const Obstacles::HardOff fixed_only(*obs);
     const int n = std::max<int>(1, static_cast<int>(std::hypot(static_cast<double>(s.b.x - s.a.x), static_cast<double>(s.b.y - s.a.y)) / static_cast<double>(pitch)));
     const auto& ia = obs->copper().items[static_cast<std::size_t>(pad_item[static_cast<std::size_t>(c.pad_a)])].box;
     const auto& ib = c.pad_b >= 0 ? obs->copper().items[static_cast<std::size_t>(pad_item[static_cast<std::size_t>(c.pad_b)])].box : ia;
@@ -5312,20 +5316,28 @@ struct Router::Impl {
     const auto& cc = cs[static_cast<std::size_t>(c)].c;
     return b.nets[static_cast<std::size_t>(cc.net)].name + " " + pad_label(cc.pad_a) + "->" + (cc.pad_b >= 0 ? pad_label(cc.pad_b) : std::string("zone"));
   }
-  std::vector<OldItem> swap_items;  // after a failed chain: old copper of the lifted connection whose way back crossed u
+  // After a failed chain: the old copper of the lifted connection whose way back crossed u (a swap) or, under --lns-protect, that the
+  // chain walled in. u's next try pays to run over it (mark_avoid); empty when the chain failed otherwise.
+  std::vector<OldItem> swap_items;
   // Marks the lattice cells along an old copper item, with their neighbours (a lattice path crossing the track need
   // not touch its centre line), in `avoid`.
   // `wide` (--lns-protect): the cells of the item's whole conflict zone (its half width plus 0.25 mm, about a clearance and half a
   // track), not just its centre line: a path walls in a pad by passing a via's clearance ring, which never touches the via's centre.
+  // A mark is 16 units, ~1.8 mm of track a cell at 0.055 mm pitch (hist_cost). The narrow mark (TM-5) is laid at every pitch step of
+  // a track, so the three cells across a track's centre line get it three times (48 units); a wide mark gives each cell of the zone
+  // its 16 units once, the same price all across the zone.
   void mark_avoid(const OldItem& o, bool wide = false) {
     int rr = 1;
+    std::unordered_set<std::int64_t> marked;  // wide: the zone's cells marked so far
     auto mark = [&](int layer, Point q) {
       const int gx = to_ix(q.x), gy = to_iy(q.y);
       for (int dy = -rr; dy <= rr; ++dy)
         for (int dx = -rr; dx <= rr; ++dx) {
           if (rr > 1 && dx * dx + dy * dy > rr * rr) continue;
-          auto& h = avoid[cell_key(layer, gx + dx, gy + dy)];
-          if (h < 60000) h = static_cast<std::uint16_t>(h + 16);  // 16 units: ~1.8 mm a cell at 0.055 mm pitch
+          const std::int64_t key = cell_key(layer, gx + dx, gy + dy);
+          if (wide && !marked.insert(key).second) continue;
+          auto& h = avoid[key];
+          if (h < 60000) h = static_cast<std::uint16_t>(h + 16);
         }
     };
     if (o.kind == drc::ItemKind::Via) {
@@ -5502,18 +5514,24 @@ struct Router::Impl {
     std::vector<std::uint8_t> clevel(opt.lns_escalate ? cs.size() : 0, 0), at_top(opt.lns_escalate ? cs.size() : 0, 0);
     int top_level = 0;
     if (lns_dbg) std::fprintf(stderr, "lns start: %.1f s, %ld expansions, routed %d of %d\n", elapsed(), res.expansions, res.routed, res.connections);
-    if (const char* e = std::getenv("TM_LNS_LEVEL")) {  // experiments: start at this escalation level
+    // The experiment knobs change the result: each one that is set says so in the log.
+    if (const char* e = std::getenv("TM_LNS_LEVEL")) {  // experiments: start at this escalation level (each connection's, with --lns-escalate)
       level = std::clamp(std::atoi(e), 0, 2);
       cap = lns_cap << level;
       probe_wide = level > 0;
+      std::fill(clevel.begin(), clevel.end(), static_cast<std::uint8_t>(level));
+      std::fprintf(stderr, "warning: TM_LNS_LEVEL=%s: the completion LNS starts at level %d (experiment)\n", e, level);
     }
     std::vector<std::string> only;  // experiments: TM_LNS_ONLY=a,b tries only the open connections whose label holds one of these
-    if (const char* e = std::getenv("TM_LNS_ONLY"))
+    if (const char* e = std::getenv("TM_LNS_ONLY")) {
       for (std::string t = e; !t.empty();) {
         const auto k = t.find(',');
         only.push_back(t.substr(0, k));
         t = k == std::string::npos ? std::string() : t.substr(k + 1);
       }
+      std::fprintf(stderr, "warning: TM_LNS_ONLY=%s: the completion LNS tries only these open connections (experiment)\n", e);
+    }
+    if (std::getenv("TM_LNS_PROTECT")) std::fprintf(stderr, "warning: TM_LNS_PROTECT is not read any more; --lns-protect protects the chain\n");
     if (const char* dump = std::getenv("TM_LNS_DUMP")) lns_dump(dump);
     auto lns_t = [&]() { return std::make_tuple(elapsed(), res.expansions, obs->checks); };
     auto lns_log = [&](const char* what, int uc, const std::tuple<double, long, long>& m0, bool ok) {
@@ -5524,8 +5542,16 @@ struct Router::Impl {
     };
     for (int sweep = 0; !out_of_budget(); ++sweep) {
       const int gained_before = gained;
-      ++res.lns_sweeps;
-      if (lns_dbg) std::fprintf(stderr, "lns sweep %d level %d cap %zu: %.1f s, %ld expansions, routed %d\n", sweep, level, cap, elapsed(), res.expansions, res.routed);
+      if (lns_dbg && opt.lns_escalate) {  // each open connection has its own level
+        int lo = 2, hi = 0;
+        for (std::size_t ui = 0; ui < cs.size(); ++ui)
+          if (!cs[ui].routed && !cs[ui].dead) lo = std::min<int>(lo, clevel[ui]), hi = std::max<int>(hi, clevel[ui]);
+        if (lo > hi) lo = hi;
+        std::fprintf(stderr, "lns sweep %d levels %d-%d cap %zu-%zu: %.1f s, %ld expansions, routed %d\n", sweep, lo, hi, lns_cap << lo, lns_cap << hi, elapsed(),
+                     res.expansions, res.routed);
+      } else if (lns_dbg) {
+        std::fprintf(stderr, "lns sweep %d level %d cap %zu: %.1f s, %ld expansions, routed %d\n", sweep, level, cap, elapsed(), res.expansions, res.routed);
+      }
       for (std::size_t ui = 0; ui < cs.size() && !out_of_budget(); ++ui) {
         auto& u = cs[ui];
         if (u.routed || u.dead) continue;
@@ -6719,6 +6745,7 @@ struct Router::Impl {
         }
       }
       if (lns_resume.empty()) std::fprintf(stderr, "lns: TM_LNS_RESUME %s holds no routes\n", rf);
+      else std::fprintf(stderr, "warning: TM_LNS_RESUME=%s: %zu routes taken over, the run starts in the completion LNS (debugging)\n", rf, lns_resume.size());
     }
     if (opt.warm || !opt.warm_tracks.empty() || !lns_resume.empty()) {  // start from earlier routes: those connections count as routed, the rest are pending
       std::map<std::pair<int, int>, const ConnRoute*> by_pads;

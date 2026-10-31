@@ -134,6 +134,19 @@ class Obstacles {
   bool rippable(int owner) const {
     return owner >= 0 && !(hard_owners_ && static_cast<std::size_t>(owner) < hard_owners_->size() && (*hard_owners_)[static_cast<std::size_t>(owner)]);
   }
+  // While one lives, the hard set is off. The router's fixed-copper caches (pin exits, via drops, learned blocks) keep their answers
+  // for the whole run, and protected copper is routed copper that a rolled-back chain takes away again.
+  class HardOff {
+   public:
+    explicit HardOff(const Obstacles& o) : o_(o), saved_(o.hard_owners_) { o.hard_owners_ = nullptr; }
+    ~HardOff() { o_.hard_owners_ = saved_; }
+    HardOff(const HardOff&) = delete;
+    HardOff& operator=(const HardOff&) = delete;
+
+   private:
+    const Obstacles& o_;
+    const std::vector<std::uint8_t>* saved_;
+  };
   // Reference path: test probes against every edge of a zone fill instead of the fill's edge index (the answers
   // are the same; tests/test_design_rules.cpp).
   void set_linear_zone_tests(bool on) { linear_zone_tests_ = on; }

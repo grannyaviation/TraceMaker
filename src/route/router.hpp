@@ -343,7 +343,7 @@ struct RouteResult {
   int necked = 0;               // connections routed at the neck-down width
   int restarts = 0;
   int lns_fixed = 0;            // open connections closed by the regional rebuild (doc 16 F4)
-  int lns_sweeps = 0, lns_last_gain_sweep = -1;  // completion LNS (--lns-complete): sweeps begun, and the last one that gained a connection
+  int lns_last_gain_sweep = -1;  // completion LNS (--lns-complete): the last sweep that gained a connection
   int tidied = 0;               // connections shortened by tidy sweeps
   int txn_tried = 0, txn_kept = 0;  // transactional negotiation: routes with victims tried, and kept
   int optimized = 0;
