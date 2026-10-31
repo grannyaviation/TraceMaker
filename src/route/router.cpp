@@ -5373,6 +5373,7 @@ struct Router::Impl {
           if (lns_protect_on) lns_hard[static_cast<std::size_t>(c)] = 1;
           continue;
         }
+        if (lns_dbg) lns_trace += " [" + b.nets[static_cast<std::size_t>(cc.net)].name + " strict: " + why + "]";
       }
       lns_probing = true;
       probe_hit = false;
