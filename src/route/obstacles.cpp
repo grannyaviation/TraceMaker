@@ -411,7 +411,7 @@ int Obstacles::coupling_state(Point a, Point b, int layer, Coord width, model::N
       hidden = std::any_of(o.shapes.begin(), o.shapes.end(), [&](const Shape& sh) { return geom::closer_than(line, sh, 1); });
     });
     if (hidden) continue;
-    if (ignore_routed && it.owner >= 0) {
+    if (ignore_routed && rippable(it.owner)) {
       state = 1;
       if (owners) owners->push_back(it.owner);
     } else {
@@ -488,7 +488,7 @@ int Obstacles::copper_state(const Shape& s, const drc::CopperItem& probe, int la
       else if (probe.kind == drc::ItemKind::Via && it.kind != drc::ItemKind::Zone) req = std::max(req, via_mask_ + 1'000);
     }
     if (item_closer(s, it, req)) {
-      if (ignore_routed && it.owner >= 0) {
+      if (ignore_routed && rippable(it.owner)) {
         state = 1;
         if (owners) owners->push_back(it.owner);
       } else {
@@ -535,7 +535,7 @@ int Obstacles::holes_edges_state(const Shape& s, const drc::CopperItem& probe, i
     }
     if (!hit) return;
     const int owner = h.item >= 0 ? cm_.items[static_cast<std::size_t>(h.item)].owner : -1;
-    if (ignore_routed && owner >= 0) {
+    if (ignore_routed && rippable(owner)) {
       state = 1;
       if (owners) owners->push_back(owner);
     } else {
@@ -552,7 +552,7 @@ int Obstacles::holes_edges_state(const Shape& s, const drc::CopperItem& probe, i
       if (it.removed || it.kind == drc::ItemKind::Zone || (it.net == net && net != 0) || !(it.layers & model::layer_bit(layer))) return;
       for (const auto& u : it.shapes)
         if (geom::closer_than(hole, u, hc)) {
-          if (ignore_routed && it.owner >= 0) {
+          if (ignore_routed && rippable(it.owner)) {
             state = 1;
             if (owners) owners->push_back(it.owner);
           } else {
@@ -679,7 +679,7 @@ int Obstacles::physical_copper_state(const Shape& s, drc::ItemKind kind, model::
     if (owner.removed || (is_routed ? !routed : !fixed) || !(owner.layers & model::layer_bit(layer))) return;
     const Coord req = re_->physical_hole_clearance(&owner, probe, layer);
     if (req <= 0 || !geom::closer_than(s, h.shape, req)) return;
-    if (is_routed && soft) {
+    if (is_routed && soft && rippable(owner.owner)) {
       state = 1;
       if (owners) owners->push_back(owner.owner);
     } else {
@@ -705,7 +705,7 @@ int Obstacles::physical_hole_state(const Shape& hole, model::NetId net, int laye
     const Coord req = re_->physical_hole_clearance(&probe, it, layer);
     if (req <= 0) return;
     if (item_closer(hole, it, req)) {
-      if (is_routed && soft) {
+      if (is_routed && soft && rippable(it.owner)) {
         state = 1;
         if (owners) owners->push_back(it.owner);
       } else {
@@ -798,7 +798,7 @@ int Obstacles::void_state(Point p, model::NetId net, model::LayerMask span, bool
     }
     if (!voids) return;
     const int owner = h.item >= 0 ? cm_.items[static_cast<std::size_t>(h.item)].owner : -1;
-    if (ignore_routed && owner >= 0) {
+    if (ignore_routed && rippable(owner)) {
       state = 1;
       if (owners) owners->push_back(owner);
     } else {
@@ -1105,7 +1105,7 @@ int Obstacles::routed_copper_part(const Shape& s, int layer, model::NetId net, d
     }
     for (const auto& u : it.shapes)
       if (geom::closer_than(s, u, req)) {
-        if (soft) {
+        if (soft && rippable(it.owner)) {
           state = 1;
           if (owners) owners->push_back(it.owner);
         } else {
@@ -1125,7 +1125,7 @@ int Obstacles::routed_via_holes_part(const Shape& s, model::LayerMask layers, mo
     const auto& it = cm_.items[static_cast<std::size_t>(id)];
     if (it.removed || it.kind != drc::ItemKind::Via || (it.net == net && net != 0) || !(it.layers & layers)) return;
     if (geom::closer_than_disk(s, it.pos, b_.vias[static_cast<std::size_t>(it.index)].drill / 2, hc)) {
-      if (soft) {
+      if (soft && rippable(it.owner)) {
         state = 1;
         if (owners) owners->push_back(it.owner);
       } else {
@@ -1145,7 +1145,7 @@ int Obstacles::routed_hole_copper_part(const Shape& h, int layer, model::NetId n
     if (it.removed || (it.net == net && net != 0) || !(it.layers & model::layer_bit(layer))) return;
     for (const auto& u : it.shapes)
       if (geom::closer_than(h, u, hc)) {
-        if (soft) {
+        if (soft && rippable(it.owner)) {
           state = 1;
           if (owners) owners->push_back(it.owner);
         } else {
@@ -1182,7 +1182,7 @@ int Obstacles::routed_hole_to_hole_part(const Shape& hole, model::LayerMask laye
     if (it.removed || it.kind != drc::ItemKind::Via || !(it.layers & layers)) return;
     const Coord h2h = via_hole_to_hole(hole.pts[0], hole.r, net, &it);
     if (geom::closer_than_disk(hole, it.pos, b_.vias[static_cast<std::size_t>(it.index)].drill / 2, h2h)) {
-      if (soft) {
+      if (soft && rippable(it.owner)) {
         state = 1;
         if (owners) owners->push_back(it.owner);
       } else {

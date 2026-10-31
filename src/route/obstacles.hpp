@@ -128,6 +128,12 @@ class Obstacles {
   // checks of one deliberate via in pad (the router's --via-in-pad).
   void set_vias_off_pads(bool on, Coord max_pad) { vias_off_pads_ = on; vias_off_pads_max_ = max_pad; }
   void set_pad_via_exempt(bool on) const { pad_via_exempt_ = on; }
+  // Routed connections whose copper counts as fixed in soft queries (a state of 2, not 1): the completion LNS's protected
+  // chain (--lns-protect). nullptr (the default): every routed connection is rippable.
+  void set_hard_owners(const std::vector<std::uint8_t>* hard) const { hard_owners_ = hard; }
+  bool rippable(int owner) const {
+    return owner >= 0 && !(hard_owners_ && static_cast<std::size_t>(owner) < hard_owners_->size() && (*hard_owners_)[static_cast<std::size_t>(owner)]);
+  }
   // Reference path: test probes against every edge of a zone fill instead of the fill's edge index (the answers
   // are the same; tests/test_design_rules.cpp).
   void set_linear_zone_tests(bool on) { linear_zone_tests_ = on; }
@@ -210,6 +216,7 @@ class Obstacles {
   bool vias_off_pads_ = false;
   Coord vias_off_pads_max_ = 2'000'000;
   mutable bool pad_via_exempt_ = false;
+  mutable const std::vector<std::uint8_t>* hard_owners_ = nullptr;
   bool via_keeps_off(const drc::CopperItem& it) const;
   std::vector<std::pair<geom::Shape, const model::Zone*>> keepouts_;
   std::vector<geom::Shape> mask_open_[2];  // solder-mask openings drawn as graphics (front, back)

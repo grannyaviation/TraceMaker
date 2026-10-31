@@ -5349,12 +5349,18 @@ struct Router::Impl {
     force_escapes = false;
     return ok;
   }
+  bool lns_protect_on = std::getenv("TM_LNS_PROTECT") != nullptr;  // experiment (TM-6): the chain's routed members are not lifted again
+  std::vector<std::uint8_t> lns_hard;  // protected chain: connections routed in the running transaction (fixed for its probes)
   bool lns_chain(int u, std::size_t cap, double probe_soft) {
     std::vector<int> queue{u};
     std::map<int, std::vector<OldItem>> orig;  // lifted connections' copper before the transaction
     bool ok = true;
     int u_lifts = 0;  // u's own new path lifted for a connection that can only come back across it
     swap_items.clear();
+    if (lns_protect_on) {
+      lns_hard.assign(cs.size(), 0);
+      obs->set_hard_owners(&lns_hard);
+    }
     for (std::size_t qi = 0; ok && qi < queue.size(); ++qi) {
       const int c = queue[qi];
       const auto& cc = cs[static_cast<std::size_t>(c)].c;
@@ -5364,6 +5370,7 @@ struct Router::Impl {
         soft = false;
         if (search_or_neck(cc, false, necked)) {
           if (lns_dbg) lns_trace += " [" + b.nets[static_cast<std::size_t>(cc.net)].name + " strict ok]";
+          if (lns_protect_on) lns_hard[static_cast<std::size_t>(c)] = 1;
           continue;
         }
       }
@@ -5422,6 +5429,7 @@ struct Router::Impl {
       if (necked) neck_on(probe_conn);
       const bool committed = commit(probe_conn, probe_path);
       if (necked) neck_off();
+      if (committed && lns_protect_on) lns_hard[static_cast<std::size_t>(c)] = 1;
       if (!committed) {
         ok = false;
         ++chain_victim;
@@ -5429,6 +5437,7 @@ struct Router::Impl {
       }
     }
     if (lns_dbg) lns_trace += " lifted " + std::to_string(orig.size()) + " queue " + std::to_string(queue.size());
+    if (lns_protect_on) obs->set_hard_owners(nullptr);
     if (ok) {
       ++chain_ok;
       return true;
@@ -5479,6 +5488,18 @@ struct Router::Impl {
     int gained = 0, attempts = 0, level = 0;  // level: sweeps without gain so far raise the cap (x2 each) and widen probes
     std::size_t cap = lns_cap;
     if (lns_dbg) std::fprintf(stderr, "lns start: %.1f s, %ld expansions, routed %d of %d\n", elapsed(), res.expansions, res.routed, res.connections);
+    if (const char* e = std::getenv("TM_LNS_LEVEL")) {  // experiments: start at this escalation level
+      level = std::clamp(std::atoi(e), 0, 2);
+      cap = lns_cap << level;
+      probe_wide = level > 0;
+    }
+    std::vector<std::string> only;  // experiments: TM_LNS_ONLY=a,b tries only the open connections whose label holds one of these
+    if (const char* e = std::getenv("TM_LNS_ONLY"))
+      for (std::string t = e; !t.empty();) {
+        const auto k = t.find(',');
+        only.push_back(t.substr(0, k));
+        t = k == std::string::npos ? std::string() : t.substr(k + 1);
+      }
     if (const char* dump = std::getenv("TM_LNS_DUMP")) lns_dump(dump);
     auto lns_t = [&]() { return std::make_tuple(elapsed(), res.expansions, obs->checks); };
     auto lns_log = [&](const char* what, int uc, const std::tuple<double, long, long>& m0, bool ok) {
@@ -5500,6 +5521,7 @@ struct Router::Impl {
           ++gained;
           continue;
         }
+        if (!only.empty() && std::none_of(only.begin(), only.end(), [&](const std::string& t) { return conn_label(uc).find(t) != std::string::npos; })) continue;
         ++attempts;
         // A swap (a lifted connection could only come back across u) is retried with u paying to cross that
         // connection's old copper, so u's next path leaves it room; up to three tries.
