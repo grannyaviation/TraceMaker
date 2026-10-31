@@ -5315,21 +5315,27 @@ struct Router::Impl {
   std::vector<OldItem> swap_items;  // after a failed chain: old copper of the lifted connection whose way back crossed u
   // Marks the lattice cells along an old copper item, with their neighbours (a lattice path crossing the track need
   // not touch its centre line), in `avoid`.
-  void mark_avoid(const OldItem& o) {
+  // `wide` (--lns-protect): the cells of the item's whole conflict zone (its half width plus 0.25 mm, about a clearance and half a
+  // track), not just its centre line: a path walls in a pad by passing a via's clearance ring, which never touches the via's centre.
+  void mark_avoid(const OldItem& o, bool wide = false) {
+    int rr = 1;
     auto mark = [&](int layer, Point q) {
       const int gx = to_ix(q.x), gy = to_iy(q.y);
-      for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
+      for (int dy = -rr; dy <= rr; ++dy)
+        for (int dx = -rr; dx <= rr; ++dx) {
+          if (rr > 1 && dx * dx + dy * dy > rr * rr) continue;
           auto& h = avoid[cell_key(layer, gx + dx, gy + dy)];
           if (h < 60000) h = static_cast<std::uint16_t>(h + 16);  // 16 units: ~1.8 mm a cell at 0.055 mm pitch
         }
     };
     if (o.kind == drc::ItemKind::Via) {
       const auto& v = b.vias[static_cast<std::size_t>(o.index)];
+      if (wide) rr = std::max<int>(1, static_cast<int>((v.size / 2 + 250'000) / pitch));
       for (int l = v.layer_top; l <= v.layer_bottom; ++l) mark(l, v.pos);
       return;
     }
     const auto& t = b.tracks[static_cast<std::size_t>(o.index)];
+    if (wide) rr = std::max<int>(1, static_cast<int>((t.width / 2 + 250'000) / pitch));
     const int n = std::max<int>(1, static_cast<int>(std::hypot(static_cast<double>(t.b.x - t.a.x), static_cast<double>(t.b.y - t.a.y)) / static_cast<double>(pitch)));
     for (int k = 0; k <= n; ++k) mark(t.layer, {t.a.x + (t.b.x - t.a.x) * k / n, t.a.y + (t.b.y - t.a.y) * k / n});
   }
@@ -5349,7 +5355,6 @@ struct Router::Impl {
     force_escapes = false;
     return ok;
   }
-  bool lns_protect_on = std::getenv("TM_LNS_PROTECT") != nullptr;  // experiment (TM-6): the chain's routed members are not lifted again
   std::vector<std::uint8_t> lns_hard;  // protected chain: connections routed in the running transaction (fixed for its probes)
   bool lns_chain(int u, std::size_t cap, double probe_soft) {
     std::vector<int> queue{u};
@@ -5357,6 +5362,7 @@ struct Router::Impl {
     bool ok = true;
     int u_lifts = 0;  // u's own new path lifted for a connection that can only come back across it
     swap_items.clear();
+    const bool lns_protect_on = opt.lns_protect;  // --lns-protect: the chain's routed members are not lifted again
     if (lns_protect_on) {
       lns_hard.assign(cs.size(), 0);
       obs->set_hard_owners(&lns_hard);
@@ -5395,6 +5401,9 @@ struct Router::Impl {
       if (!probe_hit) {
         ok = false;
         ++(c == u ? chain_nopath : chain_victim);
+        // Protected chain: the copper the transaction has laid walls c in. The caller tries again with u paying to run over c's
+        // old copper (as after a swap), so u's next path leaves c the corridor it had.
+        if (lns_protect_on && c != u) swap_items = orig[c];
         cs[static_cast<std::size_t>(u)].why = c == u ? "completion LNS: no path even across other connections (" + why + ")"
                                                      : "completion LNS: " + b.nets[static_cast<std::size_t>(cc.net)].name + ", lifted for it, found no way back (" + why + ")";
         break;
@@ -5488,6 +5497,10 @@ struct Router::Impl {
     static const std::size_t caps[] = {8, 16, 24};
     int gained = 0, attempts = 0, level = 0;  // level: sweeps without gain so far raise the cap (x2 each) and widen probes
     std::size_t cap = lns_cap;
+    // --lns-escalate: each open connection climbs its own level (0..2) after each sweep it failed in, instead of every one waiting
+    // for a sweep in which no connection was gained; the LNS ends after a sweep without gain once each open one failed at level 2.
+    std::vector<std::uint8_t> clevel(opt.lns_escalate ? cs.size() : 0, 0), at_top(opt.lns_escalate ? cs.size() : 0, 0);
+    int top_level = 0;
     if (lns_dbg) std::fprintf(stderr, "lns start: %.1f s, %ld expansions, routed %d of %d\n", elapsed(), res.expansions, res.routed, res.connections);
     if (const char* e = std::getenv("TM_LNS_LEVEL")) {  // experiments: start at this escalation level
       level = std::clamp(std::atoi(e), 0, 2);
@@ -5511,6 +5524,7 @@ struct Router::Impl {
     };
     for (int sweep = 0; !out_of_budget(); ++sweep) {
       const int gained_before = gained;
+      ++res.lns_sweeps;
       if (lns_dbg) std::fprintf(stderr, "lns sweep %d level %d cap %zu: %.1f s, %ld expansions, routed %d\n", sweep, level, cap, elapsed(), res.expansions, res.routed);
       for (std::size_t ui = 0; ui < cs.size() && !out_of_budget(); ++ui) {
         auto& u = cs[ui];
@@ -5522,8 +5536,18 @@ struct Router::Impl {
           ++gained;
           continue;
         }
-        if (!only.empty() && std::none_of(only.begin(), only.end(), [&](const std::string& t) { return conn_label(uc).find(t) != std::string::npos; })) continue;
+        if (!only.empty() && std::none_of(only.begin(), only.end(), [&](const std::string& t) { return conn_label(uc).find(t) != std::string::npos; })) {
+          if (opt.lns_escalate) at_top[ui] = 1;
+          continue;
+        }
         ++attempts;
+        if (opt.lns_escalate) {
+          const int lv = clevel[ui];
+          cap = lns_cap << lv;
+          probe_wide = lv > 0;
+          top_level = std::max(top_level, lv);
+          if (lns_dbg) std::fprintf(stderr, "lns %s at level %d (cap %zu)\n", conn_label(uc).c_str(), lv, cap);
+        }
         // A swap (a lifted connection could only come back across u) is retried with u paying to cross that
         // connection's old copper, so u's next path leaves it room; up to three tries.
         bool won = false;
@@ -5532,7 +5556,7 @@ struct Router::Impl {
           won = lns_chain(uc, cap, probe_soft);
           lns_log(t == 0 ? "chain" : "chain (swap retry)", uc, m0, won);
           if (won || swap_items.empty()) break;
-          for (const auto& o : swap_items) mark_avoid(o);
+          for (const auto& o : swap_items) mark_avoid(o, opt.lns_protect);
         }
         avoid.clear();
         if (won) {
@@ -5595,6 +5619,18 @@ struct Router::Impl {
             restore_items(group[k], saved[k]);
           }
         }
+        if (opt.lns_escalate && !u.routed) {
+          at_top[ui] = clevel[ui] == 2;
+          if (clevel[ui] < 2) ++clevel[ui];
+        }
+      }
+      if (gained > gained_before) res.lns_last_gain_sweep = sweep;
+      if (opt.lns_escalate) {
+        bool all_top = true;
+        for (std::size_t ui = 0; ui < cs.size(); ++ui)
+          if (!cs[ui].routed && !cs[ui].dead && !at_top[ui]) all_top = false;
+        if (gained == gained_before && all_top) break;
+        continue;
       }
       if (gained == gained_before) {
         if (level == 2) break;
@@ -5604,6 +5640,7 @@ struct Router::Impl {
       }
     }
     probe_wide = false;
+    if (opt.lns_escalate) cap = lns_cap << top_level;
     std::fprintf(stderr, "completion LNS: %d connections gained in %d attempts (chains: %ld kept, %ld no soft path, %ld over cap, %ld swaps, %ld lifted one failed; cap %zu)\n",
                  gained, attempts, chain_ok, chain_nopath, chain_cap, chain_swap, chain_victim, cap);
     int stray = 0;  // invariant: an unrouted connection owns no copper

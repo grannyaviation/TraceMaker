@@ -998,6 +998,12 @@ int main(int argc, char** argv) {
   route->add_option("--lns-soft", ropt.lns_soft, "Completion LNS: crossing cost factor of its probe searches (default 1)")->group("");
   route->add_option("--lns-cap", ropt.lns_cap, "Completion LNS: connections lifted per transaction at most (default 16)")->group("");
   route->add_option("--lns-u-lifts", ropt.lns_u_lifts, "Completion LNS: times the unrouted connection gives way to one it lifted (default 2)")->group("");
+  route->add_flag("--lns-protect", ropt.lns_protect,
+                  "Completion LNS: the connections a chain has routed are fixed for its later probes, so a lifted connection goes round them instead of "
+                  "swapping back (off: TM-5's chain)")->group("");
+  route->add_flag("--lns-escalate", ropt.lns_escalate,
+                  "Completion LNS: each open connection climbs its own level (cap x2, then x4, probes up to the whole board) after each sweep it "
+                  "failed in, instead of all waiting for a sweep without any gain")->group("");
   double neck_reach_mm = -1, class_clearance_cap_mm = 0, class_via_cap_mm = 0;
   route->add_option("--class-via-cap-mm", class_via_cap_mm, "Experiments: lower net-class via diameters above this to it, in memory only")->group("");
   route->add_option("--class-clearance-cap-mm", class_clearance_cap_mm, "Experiments: lower net-class clearances above this to it, in memory only")->group("");

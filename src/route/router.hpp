@@ -192,6 +192,8 @@ struct RouterOptions {
   double lns_soft = 1.0;        // completion LNS: crossing cost factor of the probe searches (higher: fewer connections lifted)
   int lns_cap = 16;             // completion LNS: connections lifted per transaction at most
   int lns_u_lifts = 2;          // completion LNS: times the unrouted connection gives way to one it lifted
+  bool lns_protect = false;     // completion LNS (TM-6): a chain's routed members are fixed for its later probes, so a lifted connection goes round them instead of swapping back
+  bool lns_escalate = false;    // completion LNS (TM-6): each open connection climbs its own level (cap x2, x4, wide probes) after each sweep it failed in
   Coord neck_reach = 2'000'000;  // neck-down of net classes wider than 0.3 mm: only this close to an end pad (0 = whole path)
   double soft_growth = 0.0;     // crossing cost grows by this fraction of soft_cost_mm per negotiation pass (PathFinder, doc 16)
   double soft_cost_mm = 1.0;    // base cost of crossing another net's routed copper (before history)
@@ -341,6 +343,7 @@ struct RouteResult {
   int necked = 0;               // connections routed at the neck-down width
   int restarts = 0;
   int lns_fixed = 0;            // open connections closed by the regional rebuild (doc 16 F4)
+  int lns_sweeps = 0, lns_last_gain_sweep = -1;  // completion LNS (--lns-complete): sweeps begun, and the last one that gained a connection
   int tidied = 0;               // connections shortened by tidy sweeps
   int txn_tried = 0, txn_kept = 0;  // transactional negotiation: routes with victims tried, and kept
   int optimized = 0;
