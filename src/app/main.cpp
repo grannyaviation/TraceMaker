@@ -1003,7 +1003,7 @@ int main(int argc, char** argv) {
                   "swapping back (off: TM-5's chain)")->group("");
   route->add_flag("--lns-escalate", ropt.lns_escalate,
                   "Completion LNS: each open connection climbs its own level (cap x2, then x4, probes up to the whole board) after each sweep it "
-                  "failed in, instead of all waiting for a sweep without any gain")->group("");
+                  "failed in, instead of all waiting for a sweep without any gain; chain retries and the regional fallback run at the top level only")->group("");
   double neck_reach_mm = -1, class_clearance_cap_mm = 0, class_via_cap_mm = 0;
   route->add_option("--class-via-cap-mm", class_via_cap_mm, "Experiments: lower net-class via diameters above this to it, in memory only")->group("");
   route->add_option("--class-clearance-cap-mm", class_clearance_cap_mm, "Experiments: lower net-class clearances above this to it, in memory only")->group("");

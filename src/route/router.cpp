@@ -5551,7 +5551,10 @@ struct Router::Impl {
         // A swap (a lifted connection could only come back across u) is retried with u paying to cross that
         // connection's old copper, so u's next path leaves it room; up to three tries.
         bool won = false;
-        for (int t = 0; t < 3 && !out_of_budget(); ++t) {
+        // --lns-escalate: below the top level only the first chain runs; its retries and the regional fallback (on the GraNNy board
+        // 0 of 42 kept under --lns-protect, and 60 % of the LNS's time) wait for level 2, so every open connection gets there.
+        const bool last = !opt.lns_escalate || clevel[ui] == 2;
+        for (int t = 0; t < (last ? 3 : 1) && !out_of_budget(); ++t) {
           const auto m0 = lns_t();
           won = lns_chain(uc, cap, probe_soft);
           lns_log(t == 0 ? "chain" : "chain (swap retry)", uc, m0, won);
@@ -5568,7 +5571,7 @@ struct Router::Impl {
         }
         const Point pa = b.pads[static_cast<std::size_t>(u.c.pad_a)].pos;
         const Point pb = u.c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(u.c.pad_b)].pos : pa;
-        for (std::size_t r = 0; r < std::size(radii) && !u.routed && !out_of_budget(); ++r) {
+        for (std::size_t r = 0; r < std::size(radii) && last && !u.routed && !out_of_budget(); ++r) {
           std::vector<int> group;
           auto take = [&](const geom::Box& box) {
             std::vector<int> ids;
