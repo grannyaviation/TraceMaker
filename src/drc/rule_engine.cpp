@@ -675,15 +675,9 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
                               " mm) round every hole, not only where the rule applies (the DRC checks it as written)");
         }
       }
-      if (k.type == "hole_to_hole" && k.min && c.valid && rule.severity != "ignore" && *k.min > router_h2h_) {
-        router_h2h_ = *k.min;
-        if (c.cond || !rule.layer.empty()) {
-          char mm[32];
-          std::snprintf(mm, sizeof mm, "%.3f", static_cast<double>(*k.min) / 1e6);
-          warnings_.push_back("rule '" + rule.name + "': the router keeps its hole to hole distance (" + mm +
-                              " mm) round every new via's hole, not only where the rule applies (the DRC checks it as written)");
-        }
-      }
+      // granny: no "kept round every hole" warning. The router's via checks apply a hole_to_hole rule per pair of holes, with the
+      // probe's net and via type (via_hole_to_hole, af0cbe3, TM-1); only the diff-pair via offset keeps this maximum everywhere.
+      if (k.type == "hole_to_hole" && k.min && c.valid && rule.severity != "ignore" && *k.min > router_h2h_) router_h2h_ = *k.min;
       // Exact checks only where the cache could judge differently. Rules that are not applied (unreadable
       // conditions) and constraints the router does not read per point (sizes, silk, text, length, and KiCad's own
       // tuning-profile width and gap rules, doc 05 §58) are the same either way (D139). granny: the router reads
@@ -804,12 +798,11 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
     for (const auto& k : c.rule->constraints)
       if (k.type == "edge_clearance" && k.min) ec = *k.min;
     if (ec <= router_edge_) continue;
-    bool hits = !c.cond || c.positional, all = !c.cond;  // `all`: it holds for every track and via of every net, on every layer
+    bool hits = !c.cond || c.positional;
     const int nl = b_.copper_count();
     const model::LayerMask span = nl >= 64 ? ~model::LayerMask{0} : (model::LayerMask{1} << nl) - 1;
     CopperItem probe;
     if (c.cond && !c.positional) {
-      all = true;
       for (const ItemKind kind : {ItemKind::Track, ItemKind::Via})
         for (std::size_t n = 0; n < b_.nets.size(); ++n)
           for (int l = 0; l < nl; ++l) {
@@ -819,17 +812,11 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
             EvalCtx ctx{this, &probe, nullptr, l};
             const bool h = layer_matches(c.rule->layer, l) && c.cond->eval(ctx);
             hits = hits || h;
-            all = all && h;
           }
     }
-    if (!hits) continue;
-    router_edge_ = ec;
-    if (!all || !c.rule->layer.empty()) {
-      char mm[32];
-      std::snprintf(mm, sizeof mm, "%.3f", static_cast<double>(ec) / 1e6);
-      warnings_.push_back("rule '" + c.rule->name + "': the router keeps its edge clearance (" + mm +
-                          " mm) for every new track and via, not only where the rule applies (the DRC checks it as written)");
-    }
+    // granny: no "kept for every track and via" warning. The router's edge check applies an edge_clearance rule per probe
+    // (Obstacles::edge_blocked, TM-1); only non-plated holes, which KiCad counts as edges, keep this maximum for every probe.
+    if (hits) router_edge_ = ec;
   }
   max_clearance_ = std::max({max_clearance_, router_h2h_, router_edge_});
   max_clearance_ += std::max<Coord>(r_.via_clearance_extra, 0);

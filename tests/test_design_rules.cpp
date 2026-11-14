@@ -1447,7 +1447,9 @@ TEST_CASE("Rules the cache judges as the exact check does keep the per-class cac
     const auto rules = io::read_design_rules(f.pcb.string());
     return route::Obstacles(lb.board, rules).needs_exact_routing();
   };
-  CHECK_FALSE(exact("fab_limits", kFabLimits));
+  // granny: the "Hole to hole" rule tells nets apart (A.Net, read since D168) and the router reads hole_to_hole per point with the
+  // probe's net (af0cbe3), so the cache's stand-in net could judge it differently: exact.
+  CHECK(exact("fab_limits", kFabLimits));
   CHECK_FALSE(exact("class_clearance", "(version 1)\n(rule \"c\" (condition \"A.NetClass == 'Default'\") (constraint clearance (min 0.3mm)))\n"));
   // Nets of one class told apart: the cache's stand-in net would be judged for all of them.
   CHECK(exact("net_clearance", "(version 1)\n(rule \"c\" (condition \"A.NetName == 'SIG'\") (constraint clearance (min 0.3mm)))\n"));
@@ -1514,12 +1516,13 @@ TEST_CASE("custom hole_to_hole and edge_clearance rules: the router keeps them, 
   obstacles_with("h2h_net", "(version 1)\n(rule \"h2h\" (constraint hole_to_hole (min 1mm)) (condition \"A.Net != B.Net\"))\n",
                  [&](const route::Obstacles& obs) {
                    CHECK(obs.rules().router_hole_to_hole() == 1'000'000);
-                   CHECK(warned(obs, "rule 'h2h': the router keeps its hole to hole distance (1.000 mm)"));
+                   // granny: the via checks apply the rule per pair of holes (via_hole_to_hole), so no "kept round every hole" warning
+                   CHECK_FALSE(warned(obs, "the router keeps its hole to hole distance"));
                    CHECK_FALSE(warned(obs, "does not evaluate"));
                    CHECK(obs.via_state(p, d, drill, 1, 0, false) == 2);
                    CHECK(obs.fixed_via_code(p, d, drill, 0, 1) == route::Obstacles::kBlocked);  // cached path agrees
                    CHECK(obs.via_state({10'000'000, 4'600'000}, d, drill, 1, 0, false) == 0);   // 1.05 mm
-                   CHECK_FALSE(obs.needs_exact_routing());
+                   CHECK(obs.needs_exact_routing());  // granny: a net-telling hole_to_hole rule is read per point (af0cbe3)
                  });
   // A 0.25 mm track 0.675 mm from the outline: legal at the board's 0.5 mm, not under a 1 mm rule for tracks.
   const geom::Point a{2'000'000, 800'000}, b{6'000'000, 800'000};
@@ -1531,7 +1534,8 @@ TEST_CASE("custom hole_to_hole and edge_clearance rules: the router keeps them, 
   obstacles_with("edge_track", "(version 1)\n(rule \"tracks\" (constraint edge_clearance (min 1mm)) (condition \"A.Net == 1 || A.Net == 99\"))\n",
                  [&](const route::Obstacles& obs) {
                    CHECK(obs.rules().router_edge_clearance() == 1'000'000);
-                   CHECK(warned(obs, "rule 'tracks': the router keeps its edge clearance (1.000 mm)"));
+                   // granny: edge_blocked applies the rule per probe, so no "kept for every track and via" warning
+                   CHECK_FALSE(warned(obs, "the router keeps its edge clearance"));
                    CHECK(obs.segment_state(a, b, 0, 250'000, 1, false) == 2);
                    CHECK(obs.fixed_code({4'000'000, 800'000}, 0, 125'000, 0, 1) == route::Obstacles::kBlocked);
                  });
