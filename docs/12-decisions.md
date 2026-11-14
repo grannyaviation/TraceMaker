@@ -170,6 +170,33 @@ Records D1–D131 were converted from the rows of this table on 2026-10-21; thei
 | [D151](decisions/D151.md) | Clearances resolved in KiCad's order; copper graphics compared as KiCad compares their nets | accepted |
 | [D152](decisions/D152.md) | Delay tuning rips the routed connections a meander needs and routes them again | accepted |
 | [D154](decisions/D154.md) | Late reachability proof on long strict searches, and speed-ups that keep the output | accepted |
+| [D155](decisions/D155.md) | Completing hard boards: proof-triggered pin rescue first | accepted |
+| [D156](decisions/D156.md) | Last-mile repairs developed on one board: via shove, fan-out hold, negotiation bounds | accepted |
+| [D157](decisions/D157.md) | Fan-out heads: the designer's escapes laid before routing | accepted |
+| [D158](decisions/D158.md) | Small cost-to-go fields on the CPU | accepted |
+| [D159](decisions/D159.md) | Thin tracks, real vias: the cut test of a routed topology | accepted |
+| [D160](decisions/D160.md) | Relax rescue by default: a plain run that leaves connections open is routed again with relax | accepted |
+| [D161](decisions/D161.md) | Why a connection is open: an escape proof for the pins of open connections | accepted |
+| [D162](decisions/D162.md) | The realizer on by default: the legaliser's last hand-over solved as a QP | accepted |
+| [D163](decisions/D163.md) | Two rescue passes by default: relax from the plain routes, then from nothing | accepted |
+| [D165](decisions/D165.md) | Live page of every process and bench run | accepted |
+| [D166](decisions/D166.md) | Halving gives way to rounds and warm starts | accepted |
+| [D167](decisions/D167.md) | physical_clearance between copper of any net in the router and the DRC | accepted |
+| [D168](decisions/D168.md) | The router keeps custom hole_to_hole and edge_clearance rules at one board-wide value | accepted |
+| [D169](decisions/D169.md) | Obstacle caches are keyed by class values and bounded in memory | accepted |
+| [D170](decisions/D170.md) | Type-only rule conditions are tabled; the pair phase can be given a budget share | accepted |
+| [D171](decisions/D171.md) | Decoupling caps without a real input position are spread over their IC's supply pins | accepted |
+| [D172](decisions/D172.md) | Repair windows lift the unlocked copper near open connections | accepted |
+| [D173](decisions/D173.md) | Tuned nets stay tuned: the clean-up tunes the best state, after-route stages keep length and skew | accepted |
+| [D174](decisions/D174.md) | Per-layer preferred directions by name and a 45-degree penalty | accepted |
+| [D175](decisions/D175.md) | Coupled pairs: leg reach, protected halves, a re-coupling allowance and pad exits | accepted |
+| [D176](decisions/D176.md) | Kookabus boards as a private fixture set; unused pins are not critical nets | accepted |
+| [D177](decisions/D177.md) | Run report: what the outside review of D3 found, fixed | accepted |
+| [D178](decisions/D178.md) | Placement advice: proposed placements as routability-loop seeds and ECO candidates | accepted |
+| [D179](decisions/D179.md) | Pad-to-plane bound pays a via off the plane layer; causes fills zones as route does | accepted |
+| [D180](decisions/D180.md) | Session daemon and the KiCad action that routes selected nets through it | accepted |
+| [D181](decisions/D181.md) | --txn 1 stays off by default after the tier A-D run | accepted |
+| [D182](decisions/D182.md) | Benchmark harness stops a board at 4 x --time + 120 s | accepted |
 <!-- END decision index -->
 
 ## Risks

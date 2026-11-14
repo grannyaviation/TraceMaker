@@ -35,8 +35,14 @@ class RuleEngine {
   RuleEngine(const model::Board& b, const model::DesignRules& r);
   ~RuleEngine();
 
-  // Required copper-to-copper clearance between two items on a copper layer.
-  Coord clearance(const CopperItem& a, const CopperItem& b, int layer) const;
+  // Required copper-to-copper clearance between two items on a copper layer (with the router's via_clearance_extra when
+  // either item is a via).
+  Coord clearance(const CopperItem& a, const CopperItem& b, int layer) const {
+    const Coord c = clearance_rules(a, b, layer);
+    return r_.via_clearance_extra > 0 && (a.kind == ItemKind::Via || b.kind == ItemKind::Via) ? c + r_.via_clearance_extra : c;
+  }
+  // The clearance the board's rules give, as KiCad's DRC evaluates them.
+  Coord clearance_rules(const CopperItem& a, const CopperItem& b, int layer) const;
   // Required clearance between a hole and a copper item.
   Coord hole_clearance(const CopperItem* hole_owner, const CopperItem& other, int layer) const;
   Coord hole_to_hole(const CopperItem* a, const CopperItem* b) const;
@@ -105,18 +111,34 @@ class RuleEngine {
   // Hole-to-copper clearance on `layer`, any net; -1 when no rule matches (KiCad: hole_clearance).
   Coord physical_hole_clearance(const CopperItem* hole_owner, const CopperItem& other, int layer) const;
   bool any_physical_hole_clearance() const { return max_physical_hole_ > 0; }
-  // True when a physical_hole_clearance rule holds between a via of `net` and a track of the same net: the
-  // tracks that end in a via touch its hole, so every via of that net would break the rule.
-  bool via_hole_rule_hits_own_tracks(model::NetId net) const;
+  // Copper-to-copper clearance on `layer` whatever the nets, same net included; -1 when no rule matches or the last one that
+  // does has severity ignore (KiCad: physical_clearance, reported as clearance). `rule` receives the rule that applies.
+  Coord physical_clearance(const CopperItem& a, const CopperItem& b, int layer, const model::CustomRule** rule = nullptr) const;
+  bool any_physical_clearance() const { return max_physical_ > 0; }
+  Coord max_physical_clearance() const { return max_physical_; }
+  // True when a physical_hole_clearance or physical_clearance rule holds between a via of `net` and a track of the same net:
+  // the tracks that end in a via touch it and its hole, so every via of that net would break the rule.
+  bool via_rule_hits_own_tracks(model::NetId net) const;
   Coord max_physical_hole_clearance() const { return max_physical_hole_; }
   // Hole-to-copper clearance the router keeps between a hole and other nets' copper: the board minimum raised to
   // every applied custom hole_clearance rule. The router's checks and caches have no per-pair hole rule, so a rule
   // with a condition or a layer is kept everywhere (conservative, rule 6; a warning says so). The DRC stays exact
   // (hole_clearance above).
   Coord router_hole_clearance() const { return router_hole_; }
+  // Hole-to-hole distance the router keeps round a new via's hole, and the copper-to-edge clearance of new tracks and vias: the board
+  // minimums raised to every applied custom hole_to_hole rule, and to every edge_clearance rule that can hold for a track or via (issue
+  // #52). As with hole clearance, a rule with a condition or a layer is kept everywhere, with a warning; the DRC stays exact.
+  Coord router_hole_to_hole() const { return router_h2h_; }
+  Coord router_edge_clearance() const { return router_edge_; }
   // Custom rules that the per-class obstacle cache cannot represent require exact per-point checks.
   bool needs_exact_routing() const { return needs_exact_; }
+  // Some applied rule's condition reads a net class by name (NetClass, hasNetclass, hasExactNetclass): two classes with the same
+  // values may then be judged differently, so the router's obstacle caches stay per class (issue #54).
+  bool class_names_seen() const { return class_names_seen_; }
   const std::vector<std::string>& warnings() const { return warnings_; }
+  // Reference path for the per-kind tables of conditions that read only the items' types (issue #53): off, every custom_min
+  // evaluates the condition itself. The answers are the same (test "[drc][rules]" kind tables).
+  void use_kind_tables(bool on) { kind_tables_ = on; }
 
  private:
   // Keyword bits of a rule's disallow constraints.
@@ -124,29 +146,39 @@ class RuleEngine {
     kTrack = 1, kVia = 2, kThroughVia = 4, kMicroVia = 8, kBlindVia = 16, kBuriedVia = 32, kPad = 64, kZone = 128, kGraphic = 256,
     kRouted = kTrack | kVia | kThroughVia | kMicroVia | kBlindVia | kBuriedVia,
   };
+  static constexpr int kKinds = 6;  // ItemKind values
+  static_assert(static_cast<int>(ItemKind::Graphic) == kKinds - 1);
   struct Compiled {
     const model::CustomRule* rule;
     std::unique_ptr<Condition> cond;  // null = always
     bool valid = true;
     bool positional = false;  // position, size, footprint or pad condition: evaluated per item, not per net
     std::uint16_t words = 0;  // disallow keywords
+    // The condition reads only A.Type and B.Type: its value by (kind of A, kind of B or absent), index kind_slot(a, b).
+    bool kind_only = false;
+    std::array<std::uint8_t, kKinds * (kKinds + 1)> by_kind{};
   };
+  static std::size_t kind_slot(const CopperItem* a, const CopperItem* b) {
+    return static_cast<std::size_t>(static_cast<int>(a->kind) * (kKinds + 1) + (b ? static_cast<int>(b->kind) : kKinds));
+  }
   bool words_match(std::uint16_t words, const CopperItem& it, const model::ViaType* via_type, bool span) const;
   // Item type, layer and condition all match a disallow constraint.
   bool disallow_hit(const Compiled& c, const CopperItem& it, int layer, const model::ViaType* via_type = nullptr, bool span = false) const;
   // Constraint types with a min that custom_min resolves (names in kMinTypes, rule_engine.cpp).
   enum Min { Clearance, HoleClearance, HoleToHole, EdgeClearance, TrackWidth, ViaDiameter, AnnularWidth, HoleSize,
-             PhysicalHoleClearance, MinCount };
+             PhysicalHoleClearance, PhysicalClearance, MinCount };
   // A valid rule's last constraint of one Min type: custom_min asks for one type per clearance query of the
   // router, so it walks only these instead of every rule's constraint names.
   struct MinRule {
+    const Compiled* src;     // the rule: its kind table (upstream D170) and the CustomRule custom_min reports
     const Condition* cond;   // null = always
     Coord min;
     model::LayerMask layers;  // copper layers the rule's layer selector admits
     std::vector<char> by_class;  // by index in DesignRules::classes: can the condition hold with A in it? empty: yes
   };
   // Value of the last matching custom constraint of `type` (min field), trying (a,b) and (b,a).
-  std::optional<Coord> custom_min(Min type, const CopperItem* a, const CopperItem* b, int layer) const;
+  std::optional<Coord> custom_min(Min type, const CopperItem* a, const CopperItem* b, int layer,
+                                  const model::CustomRule** rule = nullptr) const;
   bool layer_matches(const std::string& sel, int layer) const;
   bool micro_via(const CopperItem& it) const;  // a board via or router probe of type Micro
 
@@ -171,8 +203,13 @@ class RuleEngine {
   bool any_custom_clearance_ = false;
   bool zone_overrides_ = false;
   bool needs_exact_ = false;
+  bool class_names_seen_ = false;
+  bool kind_tables_ = true;
   Coord max_physical_hole_ = 0;
+  Coord max_physical_ = 0;
   Coord router_hole_ = 0;
+  Coord router_h2h_ = 0;
+  Coord router_edge_ = 0;
   friend class Condition;
 };
 

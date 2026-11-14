@@ -17,22 +17,27 @@
 #include "app/defects.hpp"
 #include "app/inspect.hpp"
 #include "advice/advice.hpp"
+#include "analysis/escape_proof.hpp"
 #include "analysis/return_path.hpp"
 #include "app/route_job.hpp"
 #include "app/tui.hpp"
+#include "core/live.hpp"
 #include "core/rng.hpp"
 #include "crules/engine.hpp"
 #include "drc/drc.hpp"
 #include "drc/refill.hpp"
 #include "io/kicad/project_reader.hpp"
 #include "io/srj/srj.hpp"
+#include "route/layer_limits.hpp"
 #include "route/router.hpp"
+#include "session/daemon.hpp"
 #include "session/session.hpp"
 #include "session/transport.hpp"
 #include "server/messages.hpp"
 #include "server/viewer_server.hpp"
 #include "learn/knowledge_base.hpp"
 #include "passes/style.hpp"
+#include "route/cut_test.hpp"
 #include "route/diff_pair.hpp"
 #include "route/escape.hpp"
 #include "route/escape_flow.hpp"
@@ -233,6 +238,88 @@ int cmd_layers(const std::string& in, int count, const std::string& out) {
     if (const fs::path src = fs::path(in).replace_extension(ext); fs::exists(src)) fs::copy_file(src, fs::path(out).replace_extension(ext), fs::copy_options::overwrite_existing);
   std::printf("%s: %d -> %d copper layers, written to %s\n", in.c_str(), had, count, out.c_str());
   for (const auto& n : notes) std::printf("  %s\n", n.c_str());
+  return 0;
+}
+
+// Pins that cannot get out past the board's fixed copper (doc 20 §2.4): every pad of a net with more than one pad, or the named
+// ones, flood-filled for a way out for a track of its net class.
+int cmd_walled(const std::string& path, const std::vector<std::string>& pins, bool soft_zones, bool via_in_pad, const std::string& json_out) {
+  const auto lb = tmk::io::read_board_file(path);
+  const auto rules = tmk::io::read_design_rules(path);
+  const auto& b = lb.board;
+  tmk::analysis::EscapeOptions eo;
+  eo.soft = soft_zones;
+  eo.via_in_pad = via_in_pad;
+  const tmk::analysis::EscapeAnalyser ea(b, rules, eo);
+  std::vector<int> net_pads(b.nets.size(), 0);
+  for (const auto& p : b.pads)
+    if (p.net > 0 && static_cast<std::size_t>(p.net) < net_pads.size()) ++net_pads[static_cast<std::size_t>(p.net)];
+  nlohmann::json out{{"board", path}, {"walled_in", nlohmann::json::array()}, {"soft_only", nlohmann::json::array()}, {"class_only", nlohmann::json::array()}};
+  int analysed = 0;
+  for (std::size_t i = 0; i < b.pads.size(); ++i) {
+    const auto& p = b.pads[i];
+    const std::string label = tmk::analysis::pad_label(b, static_cast<int>(i));
+    if (!pins.empty() ? std::find(pins.begin(), pins.end(), label) == pins.end() : (p.net <= 0 || net_pads[static_cast<std::size_t>(p.net)] < 2)) continue;
+    const auto e = ea.run(static_cast<int>(i));
+    if (!e.analysed) continue;
+    ++analysed;
+    const bool class_only = !e.enclosed && (e.neck_width > 0 || e.small_via_fits);
+    if (!e.enclosed && !e.soft_only && !class_only) {
+      if (!pins.empty()) std::printf("  %s\n", e.text.c_str());
+      continue;
+    }
+    std::printf("  %s\n", e.text.c_str());
+    out[e.enclosed ? "walled_in" : e.soft_only ? "soft_only" : "class_only"].push_back(
+        {{"pin", label}, {"walls", e.walls}, {"neck_mm", tmk::nm_to_mm(e.neck_width)}, {"via_in_pad_fits", e.via_in_pad_fits}, {"text", e.text}});
+  }
+  out["pins"] = analysed;
+  std::printf("%s: %d pins, %zu walled in by fixed copper, %zu only for their class's track or via, %zu only by zone fills or copper graphics\n", path.c_str(), analysed,
+              out["walled_in"].size(), out["class_only"].size(), out["soft_only"].size());
+  if (!json_out.empty()) std::ofstream(json_out) << out.dump(1) << "\n";
+  return 0;
+}
+
+// Cut test of a routed board (doc 05 §67): over-full cuts prove that this topology cannot meet the rules, a via without room that
+// it cannot be fixed by moving the via inside its cell.
+int cmd_cuts(const std::string& path, const std::string& rules_from, double clearance_mm, double max_gap_mm, const std::string& json_out) {
+  const auto lb = tmk::io::read_board_file(path);
+  auto rules = tmk::io::read_design_rules(rules_from.empty() ? path : rules_from);
+  if (clearance_mm >= 0) {  // judge against another clearance (every class and the board minimum)
+    for (auto& c : rules.classes) c.clearance = tmk::mm_to_nm(clearance_mm);
+    rules.minimums.clearance = tmk::mm_to_nm(clearance_mm);
+  }
+  tmk::route::CutTestOptions opt;
+  opt.max_gap = tmk::mm_to_nm(max_gap_mm);
+  const auto r = tmk::route::cut_test(lb.board, rules, opt);
+  const auto& b = lb.board;
+  auto net = [&](tmk::model::NetId n) { return n > 0 && static_cast<std::size_t>(n) < b.nets.size() ? b.nets[static_cast<std::size_t>(n)].name : std::string(); };
+  auto feat = [&](const tmk::route::CutFeature& f) {
+    nlohmann::json j{{"kind", f.via ? "via" : "pad"}, {"x_mm", tmk::nm_to_mm(f.pos.x)}, {"y_mm", tmk::nm_to_mm(f.pos.y)}, {"net", net(f.net)}};
+    if (!f.via) {
+      const auto& p = b.pads[static_cast<std::size_t>(f.index)];
+      if (p.footprint >= 0) j["pad"] = b.footprints[static_cast<std::size_t>(p.footprint)].reference + "." + p.number;
+    }
+    return j;
+  };
+  nlohmann::json out{{"board", path}, {"cuts", r.cuts}, {"crossings_cancelled", r.crossings_cancelled}, {"s_star", r.s_star}};
+  out["overfull"] = nlohmann::json::array();
+  for (const auto& c : r.overfull) {
+    nlohmann::json w = nlohmann::json::array();
+    for (auto n : c.wires) w.push_back(net(n));
+    out["overfull"].push_back({{"layer", b.copper_name(c.layer)}, {"a", feat(c.a)}, {"b", feat(c.b)}, {"gap_mm", tmk::nm_to_mm(c.gap)},
+                               {"need_mm", tmk::nm_to_mm(c.need)}, {"wires", w}});
+  }
+  out["vias_without_room"] = nlohmann::json::array();
+  for (int vi : r.vias_without_room) {
+    const auto& v = b.vias[static_cast<std::size_t>(vi)];
+    out["vias_without_room"].push_back({{"x_mm", tmk::nm_to_mm(v.pos.x)}, {"y_mm", tmk::nm_to_mm(v.pos.y)}, {"net", net(v.net)}});
+  }
+  int pad_pad_empty = 0;
+  for (const auto& c : r.overfull) pad_pad_empty += !c.a.via && !c.b.via && c.wires.empty();
+  std::printf("%s: %d cuts, %zu over-full (%d between two pads with no wire: the board's own), %zu vias without room, s* %.3f\n", path.c_str(), r.cuts,
+              r.overfull.size(), pad_pad_empty, r.vias_without_room.size(), r.s_star);
+  for (const auto& v : out["vias_without_room"]) std::printf("  via without room: %s at (%.3f, %.3f)\n", v["net"].get<std::string>().c_str(), v["x_mm"].get<double>(), v["y_mm"].get<double>());
+  if (!json_out.empty()) std::ofstream(json_out) << out.dump(1) << "\n";
   return 0;
 }
 
@@ -544,7 +631,7 @@ int cmd_escape(const std::string& path, const std::string& json_path, bool flow,
              !obs.track_disallowed(tmk::geom::Shape::point(p, width(n) / 2), l, width(n), n);
     };
     in.via_free = [&](tmk::geom::Point p, tmk::model::NetId n) {
-      return re.via_allowed(n) && !re.via_hole_rule_hits_own_tracks(n) && ok(obs.fixed_via_code(p, via_d(n), via_drill(n), 0, n), n) &&
+      return re.via_allowed(n) && !re.via_rule_hits_own_tracks(n) && ok(obs.fixed_via_code(p, via_d(n), via_drill(n), 0, n), n) &&
              !obs.via_disallowed(p, via_d(n), n, 0, b.copper_count() - 1, tmk::model::ViaType::Through);
     };
     in.layers = b.copper_count();
@@ -828,7 +915,7 @@ int cmd_srj_export(const std::string& board, const std::string& problem, const s
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int run_main(int argc, char** argv) {
   CLI::App app{"TraceMaker: placement-aware PCB autorouter for KiCad"};
   app.require_subcommand(1);
   auto* version = app.add_subcommand("version", "Print the version");
@@ -912,6 +999,9 @@ int main(int argc, char** argv) {
                     "Deterministic work budget in search expansions per router (e.g. 50000000); with the default portfolio every "
                     "variant gets the whole budget, so a run does up to --variants times this work");
   route->add_option("--pitch-um", r_pitch_um, "Lattice pitch in micrometres (default: automatic)");
+  route->add_option("--pitch-scale", ropt.pitch_scale_all, "Experiment: multiply the automatic lattice pitch by this on every board and variant")
+      ->check(CLI::Range(0.1, 4.0))
+      ->group("");
   std::string r_guide;
   route->add_option("--guide", r_guide, "Preferred paths per connection (JSON, Simple Route JSON coordinates in mm; doc 16 F1)")->group("");
   route->add_option("--guide-pen", ropt.guide_pen, "Guide: pitches per lattice step off the guide")->group("");
@@ -919,15 +1009,24 @@ int main(int argc, char** argv) {
   route->add_option("--via-cost-mm", ropt.via_cost_mm, "Cost of a via as equivalent track length");
   route->add_option("--order", ropt.order, "Connection order: 0 shortest first, 1 longest first, 2 jittered, 3 deep package pins first")->group("");
   route->add_option("--seed", ropt.seed);
-  route->add_option("--only-net", ropt.only_net, "Debugging: route only this net")->group("");
-  route->add_option("--skip-net", ropt.skip_nets, "Experiments: leave this net unrouted (repeatable)")->group("");
   route->add_flag("!--no-strict-first", ropt.strict_first, "Negotiate from the first pass (no strict-only pass)")->group("");
   route->add_option("--polish", ropt.polish_fraction, "Reserve this share of the budget (0-0.9) to rebuild the open connections of the best state")->group("");
   route->add_option("--polish-trials", ropt.polish_trials, "Polish: seeded orders tried per open connection")->group("");
   route->add_option("--lns-open", ropt.lns_open_trials, "Regional rebuild of open connections: orders tried per open connection (0 = off)")->group("");
   route->add_option("--lns-open-radius-mm", ropt.lns_open_radius_mm, "Regional rebuild: radius around the open pin")->group("");
+  route->add_option("--rescue", ropt.rescue_radii_mm, "Pin rescue: comma-separated radii in mm around a pin proved boxed in (empty = off)")->delimiter(',')->group("");
+  route->add_option("--rescue-orders", ropt.rescue_orders, "Pin rescue: orders tried per radius")->group("");
+  route->add_option("--rescue-victims", ropt.rescue_victims, "Pin rescue: most connections lifted at one radius")->group("");
+  route->add_option("--rescue-cap", ropt.rescue_cap, "Pin rescue: expansion cap per search")->group("");
+  route->add_option("--rescue-per-conn", ropt.rescue_per_conn, "Pin rescue: rescues per connection per run")->group("");
+  route->add_flag("--rescue-in-loop", ropt.rescue_in_loop, "Pin rescue also in the main loop, not only in the end-game retry")->group("");
+  route->add_option("--endgame", ropt.endgame_frac, "End-game retry of the open connections, with this share of the budget as its own allowance (0 = off)")->group("");
+  route->add_option("--endgame-cap", ropt.endgame_cap, "End-game retry: expansion cap per search")->group("");
+  route->add_option("--plane-fallback-mm", ropt.plane_fallback_mm, "With --plane-informed: radius of the nearby-pad fallback for pads that cannot reach their plane")->group("");
+  route->add_flag("--plane-informed,!--no-plane-informed", ropt.plane_informed, "Pad-to-plane searches: a distance lower bound and the late reachability proof")->group("");
   route->add_flag("--layer-assign", ropt.layer_assign, "Prefer per connection the layer with the fewest crossings (two-layer boards; doc 16 F2)");
-  route->add_option("--layer-dir-pen", ropt.layer_dir_pen, "Cost (pitches per step) of orthogonal steps against the layer's preferred direction (even layers horizontal, odd vertical)")->group("");
+  route->add_option("--layer-dir-pen", ropt.layer_dir_pen,
+                    "Cost (pitches per step) of orthogonal steps against the layer's preferred direction (by default even layers horizontal, odd vertical; automatic 0.3 on breakout boards and with --layer-dir)");
   route->add_flag("--layer-dir-swap", ropt.layer_dir_swap, "Preferred directions the other way round (even layers vertical)")->group("");
   route->add_option("--package-pen", ropt.package_pen, "Extra cost (pitches per step) of tracks on the pad layer inside a ball-grid package: escapes take a via early")->group("");
   route->add_flag("--crowded-source", ropt.crowded_source,
@@ -953,6 +1052,7 @@ int main(int argc, char** argv) {
   route->add_option("--breakout-portfolio", ropt.breakout_portfolio, "1 (default): a ball-grid breakout board gets the breakout portfolio with --variants > 1; 0: the designed variants")->group("");
   std::string r_warm_pcb;
   route->add_option("--legalize-subdivide", ropt.legalize_subdivide_mm, "With --legalize or --relax: cut route tracks into pieces of at most this length (mm) so a long track can bend where its neighbours are too close, not only move as a whole; straight pieces are merged again (default 0 = off)")->group("");
+  route->add_flag("--ramp-cut-prune", ropt.cut_prune, "Legalisation: first drop the saved routes the cut test proves cannot be legalised: vias with no room, enough wires through over-full cuts between pads (doc 05 §67)")->group("");
   route->add_flag("--legalize", ropt.legalize, "Warm start: move the vertices of the saved routes until the clearances hold (gridless compaction), then keep what is legal")->group("");
   route->add_option("--warm-pcb", r_warm_pcb, "Start from the tracks and vias of this routed board (e.g. a relaxed-clearance solution after legalisation); what is not legal under the input's rules is dropped and routed again")->group("");
   route->add_option("--state-out", ropt.state_out, "Portfolio: write the best routes after every round to this file so the run can be resumed")->group("");
@@ -963,6 +1063,8 @@ int main(int argc, char** argv) {
   route->add_option("--ramp-from", ropt.ramp_from_mm, "Portfolio: clearance continuation, start at this clearance (mm) and raise it stage by stage to the board's, warm-starting each stage")->group("");
   route->add_option("--ramp-step", ropt.ramp_step_mm, "Clearance added per ramp stage (mm)")->group("");
   route->add_option("--ramp-cycle", ropt.ramp_cycle, "Ramp: after --ramp-stall rounds without gain under the board's rules, go back this many stages and climb again")->group("");
+  route->add_flag("--ramp-vias-fixed", ropt.ramp_via_fixed, "Ramp/relax: a new via keeps the board's clearance to fixed copper (pads, the board's own copper); to routed tracks the lowered one (doc 20 §2.6)")->group("");
+  route->add_flag("--ramp-vias-real", ropt.ramp_via_real, "Ramp/relax: lowered clearances apply to tracks only; vias keep the board's clearance to everything")->group("");
   route->add_flag("--ramp-late", ropt.ramp_late, "Ramp: begin under the board's rules and climb from the ramp only after --ramp-stall rounds without gain (with --ramp-cycle)")->group("");
   route->add_option("--ramp-fresh", ropt.ramp_fresh, "Ramp: every n-th breathing cycle starts afresh from the loosest stage instead of from the best state")->group("");
   route->add_option("--ramp-stall", ropt.ramp_stall, "Ramp: rounds without gain at the final stage before going back")->group("");
@@ -976,6 +1078,21 @@ int main(int argc, char** argv) {
   route->add_option("--soft-growth", ropt.soft_growth, "Crossing cost growth per negotiation pass (fraction of --soft-cost-mm)")->group("");
   route->add_option("--soft-cost-mm", ropt.soft_cost_mm, "Base cost of crossing another net's copper in negotiation")->group("");
   route->add_option("--soft-attempts", ropt.soft_attempts, "Window sizes tried by negotiated searches (1-4)")->group("");
+  route->add_flag("--via-shove", ropt.via_shove, "A boxed-in connection moves nearby vias of other nets a little (with the tracks that end at them), checked exactly, and tries again; put back unless it then routes")->group("");
+  route->add_option("--via-shove-mm", ropt.via_shove_mm, "Via shove: vias within this distance of the stuck pads (mm)")->group("");
+  route->add_option("--via-shove-step", ropt.via_shove_step_mm, "Via shove: ring spacing of the positions tried (mm)")->group("");
+  route->add_option("--via-shove-rings", ropt.via_shove_rings, "Via shove: rings of 16 positions")->group("");
+  route->add_option("--via-shove-share", ropt.via_shove_share, "Via shove: stop once it has spent this share of the work budget")->group("");
+  route->add_option("--via-shove-trials", ropt.via_shove_trials, "Via shove: routing attempts per stuck connection")->group("");
+  route->add_flag("--via-retry", ropt.via_retry, "A search that stopped at its expansion cap is searched again at once, strictly, with cheap vias and its busiest layer dearer (D153)")->group("");
+  route->add_flag("--escape-all", ropt.escape_all, "Escape plan in every portfolio variant (by default in two of the designed eight)")->group("");
+  route->add_option("--pin-via-pen", ropt.pin_via_pen_mm, "Extra cost (mm of track) of a via in another net's dense-package pin fan-out region; 0 = off")->group("");
+  route->add_option("--pin-via-mm", ropt.pin_via_mm, "Fan-out region for --pin-via-pen: this far past the pin's copper (mm)")->group("");
+  route->add_flag("--window-escalate", ropt.window_escalate, "A search stopped by the edge of its last window gets one whole-board window")->group("");
+  route->add_flag("--pass-bound", ropt.pass_bound, "A negotiation pass routes only the connections queued at its start; connections it rips wait for the next pass (at its higher crossing cost)")->group("");
+  route->add_option("--neg-strict-cap", ropt.neg_strict_cap, "Expansion limit of the strict searches in negotiation passes (0 = the usual limit)")->group("");
+  route->add_option("--long-weight", ropt.long_weight, "Weighted A* factor for negotiated searches of long connections (see --long-weight-mm); 0 = off")->group("");
+  route->add_option("--long-weight-mm", ropt.long_weight_mm, "Connections at least this long (mm) get --long-weight")->group("");
   route->add_option("--heuristic-weight", ropt.heuristic_weight, "Weighted A* factor (1.0 = optimal searches)");
   route->add_flag("!--no-rip-up", ropt.rip_up, "Disable negotiated rip-up and reroute");
   route->add_flag("--micro-vias", ropt.micro_vias, "Use micro vias (outer layer to the next) where a through via is blocked (only on boards that allow them)");
@@ -987,9 +1104,21 @@ int main(int argc, char** argv) {
   route->add_option("--stack-through-pitch", r_stack_through_pitch_mm, "Plane voids: a laser via and another net's through via keep this far apart (mm, centre to centre; 0 = off)");
   route->add_option("--no-stack-classes", ropt.no_stack_classes, "With --stacked-vias: net classes (KiCad wildcards, comma separated, e.g. 'PWR_*,HV_31_50_4A') whose nets change layer on through vias only, F.Cu-In2 included: rails take no laser via")->delimiter(',');
   route->add_flag("--diff-pairs", ropt.diff_pairs, "Route differential pairs (KiCad P/N or +/- names) as coupled pairs first (doc 05 §15)");
+  route->add_option("--pair-share", ropt.pair_share, "Coupled pair searches stop after this share of the work budget (else of --time); the pairs left are routed as single connections (0 = no limit)")->check(CLI::Range(0.0, 1.0));
   double r_pair_skew_mm = 0;
   route->add_flag("--pair-twists,!--no-pair-twists", ropt.pair_twists, "Coupled pairs may swap sides at a layer change, for pairs whose pin order is mirrored between the ends (default on; only with pair routing)");
   route->add_option("--pair-skew-mm", r_pair_skew_mm, "Intra-pair skew limit for coupled pairs: meanders on the shorter half (0 = custom skew rules only)");
+  double r_pair_leg_mm = 2.5;
+  route->add_option("--pair-leg-mm", r_pair_leg_mm, "Coupled pairs: longest reach of the uncoupled legs from the pads to the coupled section (default 2.5)")
+      ->check(CLI::Range(0.6, 50.0));
+  route->add_flag("--protect-coupled", ropt.protect_coupled, "Coupled pairs: negotiation never rips a half of a coupled pair (the route that would fails instead)");
+  route->add_option("--recouple-work", ropt.recouple_work, "Coupled pairs: work units the clean-up re-coupling of split pairs may spend past the budget (default 2000000, 0 = none)")
+      ->check(CLI::NonNegativeNumber);
+  double r_pair_retry_leg_mm = 0;
+  route->add_option("--pair-retry-leg-mm", r_pair_retry_leg_mm,
+                    "Coupled pairs: a pair that finds no coupled path is tried again with legs of up to this reach and pad exits (0 = no retry)")
+      ->check(CLI::Range(0.0, 50.0));
+  route->add_flag("--pair-pad-exits", ropt.pair_pad_exits, "Coupled pairs: legs may leave an end pad straight out in any of 8 directions before turning to the pair");
   route->add_flag("--global", ropt.global_route, "Global routing first: detailed search follows coarse corridors");
   route->add_flag("--global-confine", ropt.global_confine, "With --global: confine each connection's first search to its corridor (experimental)")->group("");
   route->add_flag("--global-corridor-only", ropt.global_strict_corridor_only, "With --global-confine: a corridor failure goes straight to negotiation (experimental)")->group("");
@@ -1015,14 +1144,18 @@ int main(int argc, char** argv) {
   route->add_option("--global-congestion-pen", ropt.global_congestion_pen, "Congestion cost, pitches per step per eighth above the threshold")->group("");
   route->add_flag("--escape-plan,!--no-escape-plan", ropt.escape_plan, "Reserve escape corridors for the pins of dense packages (QFP, BGA) before routing");
   route->add_option("--escape-length", ropt.escape_length_mm, "Escape plan: perimeter corridors run this far (mm) past the package edge, as far as no fixed copper is in the way (default 2): bundles of parallel straight escapes")->group("");
+  route->add_option("--fanout-heads", ropt.fanout_heads_mm, "Before routing, each perimeter pin of a dense four-sided package gets the first part of its route, this far (mm) past the package: straight, or in staggered 45-degree bundles toward the destinations, whichever a side has room for; fixed copper of the pin's net during routing, not written out (0 = off)")->group("");
+  route->add_option("--fanout-heads-min-pins", ropt.fanout_heads_min_pins, "With --fanout-heads: perimeter pins a package needs (default 24)")->group("");
+  route->add_flag("--fanout-hold", ropt.fanout_hold, "Escape plan: through the strict first pass, each open pin's straight corridor is held by a placeholder track of its net, so other nets route round it; released once the pin is routed and before negotiation")->group("");
   route->add_flag("--escape-stubs", ropt.escape_stubs, "Escape plan: a pin offers the end of its straight corridor (see --escape-length) as a start point, one exact off-lattice segment at a discount: parallel escapes at the pad pitch")->group("");
   route->add_flag("--soft-mask-graphics", ropt.soft_mask_graphics, "Solder-mask openings drawn as footprint graphics (solder jumpers, a MEMS microphone's pad group) do not keep tracks and vias out; KiCad flags what then lies in them (judgement)")->group("");
-  route->add_flag("--soft-copper-graphics", ropt.soft_copper_graphics, "Board copper graphics (polygons on a copper layer, e.g. an EasyEDA import's pours) take the net of the one net whose pads, tracks or vias they touch: that net may touch them, no other (default: net-less copper nothing may touch)")->group("");
+  route->add_flag("--soft-copper-graphics", ropt.soft_copper_graphics, "Board copper graphics (polygons on a copper layer, e.g. an EasyEDA import's pours) take the net of the one net whose pads, tracks or vias they touch: that net may touch them, no other (default: net-less copper nothing may touch)");
   route->add_flag("--via-drops", ropt.via_drops, "Pins of dense packages may drop to a via a little way out, off the lattice, then go on on the other layer (short pin-to-via drops)")->group("");
   route->add_flag("--bundle-escape", ropt.bundle_escape, "Bundle (river) escapes: the connections that leave one side of a dense package for one side of another part are placed first as a block of parallel straight lanes in pin order, peeling off at their pads; the router may not rip the lanes (doc 05 section 50)")->group("");
   route->add_flag("--package-tunnels", ropt.package_tunnels, "A connection between two perimeter pins of one dense package on one net gets a stub and a via at each pin and its run on the other layer between them (the core rail's tunnel under the package), placed before the search (doc 05 section 52)")->group("");
   route->add_flag("--supply-first", ropt.supply_first, "Route first, and protect from ripping, the nets with two or more perimeter pins on one dense package and no pour (supply and core nets)(doc 05 section 51)")->group("");
   route->add_option("--bundle-min", ropt.bundle_min_lanes, "With --bundle-escape: connections needed in a group to form a bundle (default 3)")->group("");
+  route->add_option("--escape-via-keep", ropt.escape_via_keep_mm, "Escape plan: no other net's via where its copper would cover an open pin's corridor, this far (mm) past the pad edge (0 = off)")->group("");
   route->add_flag("--escape-persist", ropt.escape_persist, "Escape plan: a ripped-up connection gets its pins' corridors back, and a corridor is kept while the net has other open connections at that package")->group("");
   route->add_flag("--radial-supply", ropt.radial_supply, "Spanning tree: a net with 3+ pins on one dense package gets no edge between two of those pins (each goes to a capacitor or via: radial supply pins)")->group("");
   route->add_option("--radial-penalty", ropt.radial_penalty_mm, "With --radial-supply: what such an edge costs in the spanning tree (mm, default 10)")->group("");
@@ -1032,12 +1165,13 @@ int main(int argc, char** argv) {
   bool r_reroute = false;
   route->add_flag("--reroute", r_reroute, "Remove every unlocked track and via first and route the whole board again");
   route->add_flag("--fine-variant,!--no-fine-variant", ropt.fine_variant, "Portfolio: one variant routes small boards at half the lattice pitch (default on)")->group("");
-  route->add_flag("--halving", ropt.halving, "With more --variants than --threads: successive halving over all the variants instead of running only the first ones");
+  route->add_flag("--halving", ropt.halving, "With more --variants than --threads: successive halving over all the variants instead of running only the first ones; not with --relax, rounds or a warm start (including the relax rescue), which then run all the variants");
   route->add_flag("--cut-report", ropt.cut_report, "Report straight lines across the board that more nets must cross than tracks fit (proof that the placement cannot be routed)");
   route->add_flag("--escape-report", ropt.escape_report, "Report the pins of deep BGA arrays per ring and how many were connected");
   route->add_flag("!--fast-bends", ropt.bend_states, "Approximate bend costs (1 state per lattice point instead of 9)");
   bool r_nogpu = false;
   route->add_flag("--no-gpu", r_nogpu, "Compute cost-to-go fields on the CPU instead of the GPU (same results)");
+  route->add_option("--gpu-field-min-cells", ropt.gpu_field_min_cells, "Fields with fewer lattice cells than this are computed on the CPU (same results)")->group("");
   route->add_flag("--reach-verify", ropt.reach_verify, "Test: check every unreachable verdict with the full A*")->group("");
   route->add_option("--reach-check", ropt.reach_check, "Reachability check before strict searches: 0 off, 1 likely failures, 2 all")->group("");
   route->add_option("--reach-after", ropt.reach_after, "Late reachability proof: a strict search open after this many expansions floods from both ends (0 off; default 100000)")->group("");
@@ -1051,6 +1185,33 @@ int main(int argc, char** argv) {
   route->add_flag("--keep-vias-off-pads", ropt.vias_off_pads, "Vias keep clear of SMD pads narrower than --vias-off-pads-below (via-in-pad excepted)");
   route->add_option("--vias-off-pads-below", ropt.vias_off_pads_below_mm, "Pad width (mm) below which --keep-vias-off-pads applies (default 2)");
   tmk::app::RouteJob r_job;
+  route->add_flag("!--no-rescue", r_job.rescue,
+                  "Do not route again with --relax when connections are left open (by default the rescue runs, each pass on a budget of its own, "
+                  "--time and --work again, and a result is kept only if it is better; doc 05 §68, §71)");
+  route->add_flag("!--no-why-open", r_job.why_open,
+                  "Do not check the pins of open connections for a way out (by default each is flood-filled against the board's fixed copper, and "
+                  "a pin walled in on every layer with no room for a via is reported as unconnectable as placed; doc 20 §2.4)");
+  route->add_option("--only-net", r_job.only_nets,
+                    "Route only the nets that match one of these patterns (KiCad wildcards such as '/I2S_*', or regular expressions; repeatable or "
+                    "comma separated); the other nets are left unrouted and their copper stays (staged routing)")
+      ->delimiter(',')->allow_extra_args(false);
+  route->add_option("--skip-net", r_job.skip_nets,
+                    "Leave the nets that match these patterns unrouted (KiCad wildcards or regular expressions; repeatable or comma separated)")
+      ->delimiter(',')->allow_extra_args(false);
+  route->add_option("--repair", r_job.repair,
+                    "Repair windows for connections still open at the end: the unlocked copper near each is lifted (a window that grows on each "
+                    "failure) and routed again; an attempt is kept only if no joined pads come apart and fewer connections are open. auto (default): "
+                    "only on a board that came with unlocked tracks or vias; on: also on a board routed from nothing; off (doc 05 §75)")
+      ->check(CLI::IsMember({"auto", "on", "off"}));
+  route->add_option("--repair-window-mm", r_job.repair_opt.radii_mm, "Repair: window radii round each end of an open connection, tried in turn (default 1,2,4)")
+      ->delimiter(',')->allow_extra_args(false);
+  route->add_option("--repair-work", r_job.repair_opt.step_work, "Repair: work budget of each attempt in search expansions (default 3000000)");
+  route->add_option("--repair-branches", r_job.repair_opt.max_branches, "Repair: a window that would lift more branches (the tracks and vias of one net between two pads or junctions) stops growing (default 64)");
+  route->add_option("--repair-conns", r_job.repair_opt.max_conns, "Repair: open connections tried at most (default 64)");
+  route->add_option("--rescue-mode", r_job.rescue_mode,
+                    "How the rescue routes again with relax: warm (from the plain run's routes), fresh (from nothing) or both (warm, then fresh "
+                    "while connections are open; each pass on its own budget, kept only if better; default both; doc 05 §71)")
+      ->check(CLI::IsMember({"warm", "fresh", "both"}));
   route->add_option("--no-neck-nets", ropt.no_neck_nets, "Comma-separated nets that are never narrowed below their class width nor given the small neck-down via (power nets of a rule-relaxed routing)")->delimiter(',');
   route->add_flag("--first-nets-ordered", ropt.first_nets_ordered, "Route the --first-nets in the order of the list (e.g. the pins of a package round its perimeter), not in the router's own order");
   route->add_option("--first-nets", ropt.first_nets, "Comma-separated nets routed first, also after restarts; other nets do not rip them (e.g. crystal lines)")->delimiter(',');
@@ -1066,6 +1227,10 @@ int main(int argc, char** argv) {
   bool r_nokb = false;
   route->add_option("--kb", r_kb, "Knowledge base file (failure memory across runs)");
   route->add_flag("--no-kb", r_nokb, "Do not read or update the knowledge base");
+  route->add_option("--class-cache-mb", ropt.class_cache_mb,
+                    "Memory bound of each router's fixed-obstacle caches, in MB (0 = none; default 2048). Past it the oldest are freed and "
+                    "computed again: more time, and the result may differ from an unbounded run (still deterministic)")
+      ->check(CLI::NonNegativeNumber);
   route->add_option("--threads", r_threads,
                     "Threads for the portfolio (differently configured routers, best kept). Without --variants it is also the portfolio "
                     "size, except with --work, where all variants run and the output is identical for any thread count");
@@ -1076,6 +1241,10 @@ int main(int argc, char** argv) {
   route->add_option("--no-tracks-on", r_job.no_tracks_on, "Copper layers that get no new tracks, e.g. In1.Cu,In2.Cu (vias still pass through and reach zone fills there)")
       ->delimiter(',');
   route->add_option("--layer-cost", r_job.layer_costs, "Track cost per layer as LAYER=FACTOR, e.g. In1.Cu=4,In2.Cu=4 (1 = normal, at most 1000)")->delimiter(',');
+  route->add_option("--layer-dir", r_job.layer_dir, "Preferred direction per copper layer as LAYER=h|v|none, e.g. F.Cu=v,B.Cu=h (replaces the even/odd rule; strength --layer-dir-pen, 0.3 if not given)")
+      ->delimiter(',');
+  route->add_option("--layer-diag-pen", r_job.layer_diag_pen, "Extra cost (pitches per step) of 45-degree steps, as LAYER=PITCHES entries or one value for every layer, e.g. F.Cu=0.3")
+      ->delimiter(',');
   bool r_no_fill_planes = false;
   route->add_flag("--no-fill-planes", r_no_fill_planes,
                   "Leave zones that have no fill unfilled while routing (default: fill them in memory and route with --soft-zones, so plane "
@@ -1276,6 +1445,15 @@ int main(int argc, char** argv) {
   advice_cmd->add_option("board", ac_board)->required()->check(CLI::ExistingFile);
   advice_cmd->add_option("advice", ac_advice, "Advice file (JSON)")->required()->check(CLI::ExistingFile);
   advice_cmd->add_option("--json", ac_json, "Write what each hint became as JSON");
+  tmk::session::DaemonOptions dm_opt;
+  bool dm_print_socket = false;
+  auto* daemon_cmd = app.add_subcommand("daemon", "Hold board sessions between clients (the KiCad plugin's \"route selected nets\") on a Unix socket, JSON lines (doc 19 §10)");
+  daemon_cmd->add_option("--socket", dm_opt.socket, "Socket path (default $XDG_RUNTIME_DIR/tracemaker/daemon.sock, else /tmp/tracemaker-UID/daemon.sock)");
+  daemon_cmd->add_option("--idle-exit", dm_opt.idle_exit_s, "Exit after this many seconds without a client (0 = never)")->default_val(1800)->check(CLI::NonNegativeNumber);
+  daemon_cmd->add_option("--max-sessions", dm_opt.max_sessions, "Sessions held at once; the least recently used is closed beyond this")->default_val(4)->check(CLI::Range(1, 64));
+  daemon_cmd->add_option("--threads", dm_opt.threads, "Portfolio threads of a route call with several variants (the result does not depend on it)")->default_val(4);
+  daemon_cmd->add_flag("--gpu", dm_opt.use_gpu, "Cost-to-go fields on the GPU (default: the CPU reference; same results)");
+  daemon_cmd->add_flag("--print-socket", dm_print_socket, "Print the default socket path and exit");
   auto* session_cmd = app.add_subcommand("session", "Serve a board session to an agent over MCP (stdin/stdout) or JSON lines: list open connections, route with hints, rip, undo, save (doc 19)");
   std::string se_board, se_out, se_log, se_replay, se_host, se_token;
   std::uint64_t se_seed = 1;
@@ -1314,6 +1492,25 @@ int main(int argc, char** argv) {
   causes_cmd->add_option("--threads", ca_opt.threads, "Nets classified at once (the result does not depend on it; default 8)")->check(CLI::Range(1, 256));
   causes_cmd->add_option("--seed", ca_opt.seed, "Router seed (default 1)");
   causes_cmd->add_flag("--baseline-only", ca_opt.baseline_only, "Only the run on the board as it is (for a copy with more layers)");
+  causes_cmd->add_flag("--soft-zones", ca_opt.soft_zones, "Zone fills do not block other nets (as route --soft-zones)");
+  causes_cmd->add_flag("!--no-fill-planes", ca_opt.fill_planes, "Do not fill zones that have no fill (route fills them in memory and routes soft)");
+  auto* cuts_cmd = app.add_subcommand("cuts", "Cut test of a routed board's topology: cuts between pads and vias that cannot hold their wires, vias with no room in their cell (doc 05 §67)");
+  std::string cu_board, cu_rules, cu_json;
+  double cu_clearance = -1, cu_max_gap = 2.0;
+  cuts_cmd->add_option("board", cu_board, "A routed board")->required()->check(CLI::ExistingFile);
+  cuts_cmd->add_option("--json", cu_json, "Write the over-full cuts and the vias without room as JSON");
+  cuts_cmd->add_option("--rules-from", cu_rules, "Read the design rules beside this board instead")->check(CLI::ExistingFile);
+  cuts_cmd->add_option("--clearance", cu_clearance, "Judge against this clearance (mm) instead of the board's")->check(CLI::NonNegativeNumber);
+  cuts_cmd->add_option("--max-gap", cu_max_gap, "Check cuts up to this gap (mm, default 2)")->check(CLI::PositiveNumber);
+  auto* walled_cmd = app.add_subcommand("walled", "Pins no track can leave past the board's fixed copper on any layer, with no room for a via (doc 20 §2.4)");
+  std::string wa_board, wa_json;
+  std::vector<std::string> wa_pins;
+  bool wa_soft = false, wa_vip = false;
+  walled_cmd->add_option("board", wa_board, "A board")->required()->check(CLI::ExistingFile);
+  walled_cmd->add_option("--pin", wa_pins, "Only these pins (REF.NUM; repeatable); by default every pad of a net with more than one pad");
+  walled_cmd->add_option("--json", wa_json, "Write the walled-in pins as JSON");
+  walled_cmd->add_flag("--soft-zones", wa_soft, "Zone fills of other nets, and net-less copper graphics on the pin, are no walls (route --soft-zones, --soft-copper-graphics)");
+  walled_cmd->add_flag("--via-in-pad", wa_vip, "A via may sit in the pin's own pad (route --via-in-pad)");
   auto* layers_cmd = app.add_subcommand("layers", "Write a copy of a board with another copper layer count (inner layers added, or empty ones removed; doc 05 §53)");
   std::string ly_in, ly_out;
   int ly_count = 0;
@@ -1437,6 +1634,13 @@ int main(int argc, char** argv) {
     if (*pairs_cmd) return cmd_pairs(pr_board, pr_extra, pr_json);
     if (*buses_cmd) return cmd_buses(bu_board, bu_specs, bu_detect, bu_skew, bu_json);
     if (*advice_cmd) return cmd_advice_check(ac_board, ac_advice, ac_json);
+    if (*daemon_cmd) {
+      if (dm_print_socket) {
+        std::printf("%s\n", (dm_opt.socket.empty() ? tmk::session::default_socket_path() : dm_opt.socket).c_str());
+        return 0;
+      }
+      return tmk::session::run_daemon(dm_opt);
+    }
     if (*session_cmd) return cmd_session(se_board, se_out, se_seed, se_limit, se_threads, se_gpu, se_log, se_jsonl, se_replay, se_view, se_port, se_host, se_token, se_insecure);
     if (*rp_cmd) {
       for (const auto& r : rp_refs) {
@@ -1450,6 +1654,8 @@ int main(int argc, char** argv) {
     if (*fc_cmd) return cmd_footprint_check(fc_board, fc_refs, fc_trusted, fc_trust_all, fc_opt, fc_all, fc_strict, fc_json, fc_view, fc_port, fc_host, fc_token, fc_insecure);
     if (*style_cmd) return cmd_style(sty_board, sty_json, sty_conn);
     if (*layers_cmd) return cmd_layers(ly_in, ly_count, ly_out);
+    if (*walled_cmd) return cmd_walled(wa_board, wa_pins, wa_soft, wa_vip, wa_json);
+    if (*cuts_cmd) return cmd_cuts(cu_board, cu_rules, cu_clearance, cu_max_gap, cu_json);
     if (*causes_cmd) {
       const auto j = tmk::app::classify_open_connections(ca_board, ca_opt, true);
       if (!ca_json.empty()) std::ofstream(ca_json) << j.dump(1) << "\n";
@@ -1464,6 +1670,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (*route) {
+      tmk::route::check_layer_dir_specs(r_job.layer_dir, r_job.layer_diag_pen);  // a typo stops the run before the board is read
       ropt.pitch = static_cast<tmk::Coord>(r_pitch_um * 1000.0);
       if (!r_guide.empty()) {
         // [{"a":[x,y],"b":[x,y],"segs":[[x1,y1,x2,y2,layer],...],"vias":[[x,y],...]}]: Simple Route JSON millimetres, y up.
@@ -1495,6 +1702,8 @@ int main(int argc, char** argv) {
         ropt.return_via_radius_class.emplace_back(e.substr(0, eq), static_cast<tmk::Coord>(std::llround(mm * 1e6)));
       }
       if (neck_reach_mm >= 0) ropt.neck_reach = static_cast<tmk::Coord>(neck_reach_mm * 1e6);
+      ropt.pair_leg_max = static_cast<tmk::Coord>(std::llround(r_pair_leg_mm * 1e6));
+      ropt.pair_retry_leg = static_cast<tmk::Coord>(std::llround(r_pair_retry_leg_mm * 1e6));
       ropt.gpu_device = tmk::app::default_gpu_device(!r_nogpu);
       auto job = std::move(r_job);
       job.in = r_in;
@@ -1556,4 +1765,11 @@ int main(int argc, char** argv) {
     return 1;
   }
   return 1;
+}
+
+int main(int argc, char** argv) {
+  tmk::live::start(argc, argv);  // the live page (core/live.hpp); TM_LIVE=0 turns it off
+  const int code = run_main(argc, argv);
+  tmk::live::finish(code);
+  return code;
 }

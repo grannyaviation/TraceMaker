@@ -129,6 +129,7 @@ gates of §5.
 | `quick` | the 30 PCBench tier-A boards of `--limit 30 --seed 1` | `--set quick --work 1000000 --route-args "--variants 1"` (≈ 30 s with `--jobs 4`) | every routing change |
 | `mid` | 11 large, hard PCBench boards | `--set mid --work 20000000` | changes to search, plans or rip-up, which can move results at 20 M while `quick` stays identical |
 | `planes` | 7 KiCad demos with zone fills plus `tests/boards/plane_smd`, routing stripped | `bench/prepare_demos.py --set planes`, then `--fixtures build/demos --set planes --work 3000000 --refill`, once plain and once with `--route-args=--soft-zones` | changes to zones, planes and plane targets |
+| `kookabus` | the 6 Kookabus boards with layouts (KiCad 10, custom clearance rules), routing stripped; **private repository**, never committed (D176) | `scripts/fetch_fixtures.sh kookabus` (needs read access to `DingoOz/kookabus`), `bench/prepare_demos.py --out build/kookabus --set kookabus`, then `--fixtures build/kookabus --set kookabus --work 3000000 --refill --route-args=--soft-zones` | changes for the Kookabus boards, `--si-rules`, custom rules; not runnable in CI |
 
 **Comparing.** `bench/compare_runs.py BEFORE AFTER [--expect-identical]` lists every board whose routed output
 differs or got worse, the clean-pass and completion totals and router seconds, and exits 1 if a gate fails.
@@ -479,3 +480,39 @@ The 33 boards of tiers B, C and D that the 0.9.0 run left open (`bench/sets/pcbe
   `--relax` arms. Records and caveats: `bench/records/m17/README.md`.
 
 Quick tier with the release binary: 30 of 30 routed boards byte-identical to main's.
+
+**Re-run with D159 (2026-10-30, doc 05 §67).** Much of relax's loss was its legaliser modelling rotated, oval and rounded pads as bounding
+boxes of sharp rectangles. Same set, same settings, against the base of that day (16,166 routed, 2 clean): relax with the old pads
+15,683 (−483, 3 clean); with the pads as they are 15,925 (−241, **5 clean**). The better of base and relax per board gives 16,208 and five
+clean boards (`bench/records/d159-thin-cut`).
+
+**With the relax rescue by default (D160, doc 05 §68).** The same set routed with the default options, so a board left open is
+routed again with relax and the better result kept: 16,208 routed (+42 against the plain run), 8 boards better and none worse, five
+clean, no DRC error added, 73 % more CPU (`bench/records/d160-rescue`).
+
+### 11.4 `--txn 1` at equal wall time on tiers A-D (2026-11-13)
+
+What §11.3 left open. Both arms ran at the same time on the same machine (`bench/run.py --tier X --limit 40/40/30/40 --time 120
+--threads 8 --jobs 3`, one seed), the second with `--route-args=--txn 1`, so every portfolio variant used transactions. KiCad-judged.
+"Judged in both arms" leaves out the boards where either arm hit the harness's stop (3 × 120 s + 60 s) and has no result.
+
+| tier | boards run | judged in both arms | clean, base → `--txn 1` | routed on those boards | harness timeouts, base / `--txn 1` |
+|---|---:|---:|---:|---:|---:|
+| A | 40 | 40 | 40 → 40 | 2,637 → 2,637 / 2,637 | 0 / 0 |
+| B | 40 | 33 | 30 → 30 | 3,972 → 3,987 / 4,029 | 4 / 5 |
+| C | 30 | 20 | 16 → 16 | 5,981 → 5,995 / 6,025 | 7 / 9 |
+| D | 22 | 15 | 9 → 8 | 10,035 → 10,040 / 10,246 | 6 / 6 |
+| all | 132 | 108 | **95 → 94** | 22,625 → 22,659 / 22,937 | 17 / 20 |
+
+- No board becomes clean. One board is lost: `m2-electronics_m2fc` is clean in the base and leaves one connection open with `--txn 1`
+  (and runs 412 s against 120 s). Routed connections on the boards both arms finished: +34 of 22,937, mostly on boards that stay open
+  (`poncho_fpga_fpga-dongle` +15, `zx-sizif-512-ext_sizif512ext` +14, `Aleste-520EX_aleste` +8).
+- `--txn 1` hit the harness's stop on 20 boards and the base on 17. Not an engine overrun: a board left open gets `--time` for the plain
+  portfolio and again for each of the two relax rescue passes (D160, D163), so 3 × 120 s before the post-route stages, while the harness
+  stopped it at 3 × 120 + 60 s (`fifogfx_c64cart` alone on an idle machine: 400 s). The harness now allows 4 × `--time` + 120 s (D182).
+  A board times out only if it was left open (the rescue ran). Two boards clean in the base timed out with `--txn 1` only
+  (`Hardware_Playground_serial_gw_ATMEGA328P`, `mechkeys_58r-mxalps`), so `--txn 1` very probably lost them too: not in the table, which counts
+  boards judged in both arms.
+- Tier A: all 40 clean in both, 33 of 40 boards byte-identical, route CPU −5.7 %.
+- **Decision (D181):** `--txn 1` stays where D100 put it (breakout boards only). The gain is a few connections on boards that stay open, the
+  cost is one clean board and more overruns. Records: `bench/records/m17/README.md` §5.

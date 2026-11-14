@@ -2,7 +2,7 @@ find_package(Catch2 3 REQUIRED)
 include(Catch)
 
 find_package(nlohmann_json 3 REQUIRED)
-add_executable(tm_tests test_units.cpp test_rng.cpp test_gpu.cpp test_sexpr.cpp test_kicad_io.cpp test_rules.cpp test_netlist.cpp test_geom.cpp test_escape.cpp test_diff_pair.cpp test_plane_smd.cpp test_design_rules.cpp test_rule_geometry.cpp test_rule_layer_context.cpp test_layer_limits.cpp test_soft_zones.cpp test_refill.cpp test_work_profile.cpp test_txn.cpp test_bus.cpp test_passes.cpp test_srj.cpp test_tui.cpp test_advice.cpp test_stall.cpp test_return_path.cpp test_footprint_check.cpp test_critical.cpp test_session.cpp test_kicad_measured_shapes.cpp test_from_copper.cpp test_via_spacing.cpp test_span_holes.cpp test_report.cpp test_stacked_vias.cpp test_pour.cpp test_causes.cpp test_tuning_profiles.cpp test_length.cpp test_coupling.cpp test_flashing.cpp test_lns.cpp)
+add_executable(tm_tests test_units.cpp test_rng.cpp test_gpu.cpp test_sexpr.cpp test_kicad_io.cpp test_rules.cpp test_netlist.cpp test_geom.cpp test_escape.cpp test_diff_pair.cpp test_plane_smd.cpp test_design_rules.cpp test_rule_geometry.cpp test_rule_layer_context.cpp test_layer_limits.cpp test_layer_dir.cpp test_soft_zones.cpp test_refill.cpp test_work_profile.cpp test_txn.cpp test_bus.cpp test_passes.cpp test_srj.cpp test_tui.cpp test_advice.cpp test_stall.cpp test_return_path.cpp test_footprint_check.cpp test_critical.cpp test_session.cpp test_kicad_measured_shapes.cpp test_from_copper.cpp test_via_spacing.cpp test_span_holes.cpp test_report.cpp test_stacked_vias.cpp test_pour.cpp test_causes.cpp test_tuning_profiles.cpp test_length.cpp test_coupling.cpp test_flashing.cpp test_lns.cpp test_last_mile.cpp test_cut_test.cpp test_escape_proof.cpp test_repair.cpp)
 target_link_libraries(tm_tests PRIVATE tm::core tm::gpu tm::sexpr tm::model tm::io tm::geom tm::drc tm::route tm::passes tm::app_route tm::advice tm::session tm::analysis tm::crules tm::app_tui tm::report nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
 target_compile_definitions(tm_tests PRIVATE TM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 tm_set_warnings(tm_tests)
@@ -123,7 +123,7 @@ add_test(NAME advisor_scripts COMMAND python3 ${PROJECT_SOURCE_DIR}/advisors/tes
 set_tests_properties(advisor_scripts PROPERTIES LABELS "python;integration" TIMEOUT 120)
 
 # The viewer's stall latch and its drawing (issue #8), under Node without a browser; skipped where node is missing or too old to strip types (22.6+).
-add_test(NAME viewer_stall COMMAND sh -c "node --experimental-strip-types -e 0 >/dev/null 2>&1 || exit 77; cd '${PROJECT_SOURCE_DIR}/viewer' && node --experimental-strip-types --no-warnings --test src/stall.test.ts src/stall_draw.test.ts src/returnpath_draw.test.ts src/footprintcheck_draw.test.ts")
+add_test(NAME viewer_stall COMMAND sh -c "node --experimental-strip-types -e 0 >/dev/null 2>&1 || exit 77; cd '${PROJECT_SOURCE_DIR}/viewer' && node --experimental-strip-types --no-warnings --test src/stall.test.ts src/stall_draw.test.ts src/returnpath_draw.test.ts src/footprintcheck_draw.test.ts src/burndown.test.ts")
 set_tests_properties(viewer_stall PROPERTIES SKIP_RETURN_CODE 77 LABELS "viewer;integration" TIMEOUT 120)
 
 # The reference-return audit (issue #7) through the command line; the board part needs the KiCad demo fixtures and skips without them.
@@ -143,3 +143,8 @@ add_test(NAME return_via_cost_too_big COMMAND tracemaker ${RVC_ARGS} --return-vi
 set_tests_properties(return_via_cost_too_big PROPERTIES PASS_REGULAR_EXPRESSION "--return-via-cost: Value 1000.5 not in range \\[0 - 1000\\]" LABELS "route" TIMEOUT 60)
 add_test(NAME return_via_cost_limit_ok COMMAND tracemaker ${RVC_ARGS} --return-via-cost 1000)
 set_tests_properties(return_via_cost_limit_ok PROPERTIES PASS_REGULAR_EXPRESSION "searches: [0-9]+ ok" FAIL_REGULAR_EXPRESSION "not in range" LABELS "route" TIMEOUT 60)
+# The session daemon (doc 19 §10): socket permissions, reuse by fingerprint, diff, undo, bad requests, shutdown.
+add_test(NAME daemon_cli COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/daemon_cli.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/daemon_cli)
+set_tests_properties(daemon_cli PROPERTIES LABELS "integration;session" TIMEOUT 600)
+add_test(NAME live_status COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/live_status.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/live_status)
+set_tests_properties(live_status PROPERTIES LABELS "integration" TIMEOUT 120)

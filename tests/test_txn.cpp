@@ -178,6 +178,24 @@ TEST_CASE("clearance ramp: loose stages first, the result is legal under the boa
   CHECK(errors(l.board, l.rules, one.best) == 0);
 }
 
+// The round that keeps what is legal after a relaxed last round has a zero time limit by design; that must not mark a
+// work-budgeted run as stopped by the clock (the run report and summary would say the result depends on machine speed).
+TEST_CASE("clearance ramp ending relaxed: the legalising round does not mark the run time-limited", "[route][txn]") {
+  const auto l = load_problem();
+  const double board_mm = nm_to_mm(std::max(l.rules.classes.front().clearance, l.rules.minimums.clearance));
+  route::RouterOptions o = options();
+  o.round_work = 300000;
+  o.rounds = 1;  // the only round is relaxed, so the legalising round runs
+  o.ramp_from_mm = board_mm - 0.04;
+  o.ramp_step_mm = 0.02;
+  o.ramp_rounds = 1;
+  o.time_limit_s = 3600;
+  const auto r = route::route_portfolio(l.board, l.rules, o, 2, {}, 1);
+  CHECK(r.best.routed > 0);
+  CHECK_FALSE(r.best.time_limited);
+  CHECK(errors(l.board, l.rules, r.best) == 0);
+}
+
 TEST_CASE("clearance ramp with breathing: still legal under the board's rules and the same at any thread count", "[route][txn]") {
   const auto l = load_problem();
   const double board_mm = nm_to_mm(std::max(l.rules.classes.front().clearance, l.rules.minimums.clearance));
@@ -347,6 +365,112 @@ TEST_CASE("legalisation with subdivision: a straight track between fixed ends be
   for (std::size_t k = 0; k < cut[0].tracks.size(); ++k) CHECK(cut[0].tracks[k].a == again[0].tracks[k].a);
 }
 
+// A 1.0 x 0.3 mm pad at 45 degrees is a rotated rectangle to the legaliser, not its 0.92 mm bounding box (D159): a track past the box's
+// corner is left alone (as the box it was pushed), and a track 0.07 mm from the pad's long side is pushed off it until the DRC is clean
+// (as the box, whose corners are far from it, it was not seen). An oval is an oval, not its rectangle.
+TEST_CASE("legalisation: a rotated pad is a rotated rectangle and an oval an oval, not their bounding boxes", "[route][legalize]") {
+  json p;
+  p["layerCount"] = 2;
+  p["minTraceWidth"] = 0.12;
+  p["bounds"] = {{"minX", -2.0}, {"maxX", 12.0}, {"minY", -4.0}, {"maxY", 4.0}};
+  json obstacles = json::array(), connections = json::array();
+  const double ys[4] = {-2.0, -2.0, 2.0, 2.0}, xs[4] = {0.0, 10.0, 0.0, 10.0};
+  for (int i = 0; i < 4; ++i) {
+    const std::string id = "p" + std::to_string(i);
+    obstacles.push_back({{"type", "rect"}, {"layers", {"top"}}, {"center", {{"x", xs[i]}, {"y", ys[i]}}}, {"width", 0.5}, {"height", 0.5},
+                         {"connectedTo", {id}}, {"obstacleId", "pad_" + id}, {"componentId", "c"}});
+  }
+  for (int c = 0; c < 2; ++c)
+    connections.push_back({{"name", "c" + std::to_string(c)},
+                           {"pointsToConnect",
+                            {{{"x", xs[2 * c]}, {"y", ys[2 * c]}, {"layer", "top"}, {"pointId", "p" + std::to_string(2 * c)}},
+                             {{"x", xs[2 * c + 1]}, {"y", ys[2 * c + 1]}, {"layer", "top"}, {"pointId", "p" + std::to_string(2 * c + 1)}}}},
+                           {"rootConnectionName", "c" + std::to_string(c)}});
+  p["obstacles"] = obstacles;
+  p["connections"] = connections;
+  const auto files = io::srj_to_kicad(io::read_srj(p.dump()));
+  const fs::path dir = fs::temp_directory_path() / ("tm_leg_rot_test_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  std::ofstream(dir / "b.kicad_pcb") << files.pcb;
+  std::ofstream(dir / "b.kicad_pro") << files.pro;
+  if (!files.dru.empty()) std::ofstream(dir / "b.kicad_dru") << files.dru;
+  auto b = io::read_board_file((dir / "b.kicad_pcb").string()).board;
+  const auto rules = io::read_design_rules((dir / "b.kicad_pcb").string());
+  fs::remove_all(dir);
+  REQUIRE(b.pads.size() == 4);
+  model::Pad rot = b.pads[2];
+  rot.pos = {mm_to_nm(5), 0};
+  rot.size_x = mm_to_nm(1.0);
+  rot.size_y = mm_to_nm(0.3);
+  rot.angle = 45;
+  rot.shape = model::PadShape::Rect;
+  b.pads.push_back(rot);
+  // The pad's long axis u and its normal n on the board (geom::rotate's convention); a free track of the other net runs along u at
+  // distance `off` from the pad's centre.
+  const double r2 = std::sqrt(0.5);
+  auto run = [&](double off) {
+    std::vector<route::ConnRoute> routes(1);
+    model::Track t;
+    t.a = {mm_to_nm(5 + off * r2 - 0.8 * r2), mm_to_nm(off * r2 + 0.8 * r2)};
+    t.b = {mm_to_nm(5 + off * r2 + 0.8 * r2), mm_to_nm(off * r2 - 0.8 * r2)};
+    t.width = mm_to_nm(0.12);
+    t.layer = 0;
+    t.net = b.pads[0].net;
+    routes[0].tracks = {t};
+    return routes;
+  };
+  auto drc_errors = [&](const std::vector<route::ConnRoute>& routes) {
+    route::RouteResult res;
+    for (const auto& cr : routes) res.tracks.insert(res.tracks.end(), cr.tracks.begin(), cr.tracks.end());
+    return errors(b, rules, res);
+  };
+  // Past the bounding box's corner, 0.49 mm from the pad: legal, and nothing moves.
+  auto far = run(0.70);
+  CHECK(drc_errors(far) == 0);
+  const auto rf = route::legalize_routes(b, rules, far);
+  CHECK(rf.pairs_before == 0);
+  CHECK(rf.moved == 0);
+  ::setenv("TM_LEGALIZE_BBOX_PADS", "1", 1);  // the bounding box sees the corner 0.05 mm from the track
+  auto far_box = run(0.70);
+  const auto rb = route::legalize_routes(b, rules, far_box);
+  ::unsetenv("TM_LEGALIZE_BBOX_PADS");
+  CHECK(rb.pairs_before > 0);
+  // 0.07 mm from the long side (the rule asks 0.1): pushed off it, and clean.
+  auto near = run(0.28);
+  CHECK(drc_errors(near) > 0);
+  const auto rn = route::legalize_routes(b, rules, near);
+  CHECK(rn.pairs_before > 0);
+  CHECK(rn.pairs_after == 0);
+  CHECK(drc_errors(near) == 0);
+  // An oval (1.5 x 0.6 mm, half-circle ends) is not its rectangle: a track end 0.1 mm off the rectangle's corner is 0.22 mm from the oval.
+  model::Pad oval = b.pads[2];
+  oval.pos = {mm_to_nm(5), mm_to_nm(2.5)};
+  oval.size_x = mm_to_nm(1.5);
+  oval.size_y = mm_to_nm(0.6);
+  oval.angle = 0;
+  oval.shape = model::PadShape::Oval;
+  b.pads.push_back(oval);
+  auto corner = [&] {
+    std::vector<route::ConnRoute> routes(1);
+    model::Track t;
+    t.a = {mm_to_nm(5.82), mm_to_nm(2.87)};
+    t.b = {mm_to_nm(6.82), mm_to_nm(3.87)};
+    t.width = mm_to_nm(0.12);
+    t.layer = 0;
+    t.net = b.pads[0].net;
+    routes[0].tracks = {t};
+    return routes;
+  };
+  auto by_oval = corner();
+  CHECK(drc_errors(by_oval) == 0);
+  CHECK(route::legalize_routes(b, rules, by_oval).pairs_before == 0);
+  ::setenv("TM_LEGALIZE_BBOX_PADS", "1", 1);
+  auto by_rect = corner();
+  const auto ro = route::legalize_routes(b, rules, by_rect);
+  ::unsetenv("TM_LEGALIZE_BBOX_PADS");
+  CHECK(ro.pairs_before > 0);
+}
+
 TEST_CASE("relax late: plain rounds first, stages afresh when they stall; legal and the same at any thread count", "[route][txn]") {
   const auto l = load_problem();
   route::RouterOptions o = options();
@@ -363,4 +487,27 @@ TEST_CASE("relax late: plain rounds first, stages afresh when they stall; legal 
   CHECK(one.best.tracks.size() == two.best.tracks.size());
   CHECK(one.best.routed > 0);
   CHECK(errors(l.board, l.rules, one.best) == 0);
+}
+
+// Issue #63: halving restarts every rung from nothing, so with rounds it used to return before them and drop --relax without a word.
+// Rounds now win: halving plus relax is relax over all the variants.
+TEST_CASE("halving gives way to relax: the same copper as relax alone", "[route][txn]") {
+  const auto l = load_problem();
+  route::RouterOptions o = options();
+  o.relax = true;
+  o.round_work = 60000;
+  o.rounds = 4;
+  o.ramp_rounds = 1;
+  const auto relax = route::route_portfolio(l.board, l.rules, o, 4, {}, 2);
+  o.halving = true;
+  const auto both = route::route_portfolio(l.board, l.rules, o, 4, {}, 2);
+  CHECK(both.indices == relax.indices);
+  CHECK(both.routed == relax.routed);
+  REQUIRE(both.best.tracks.size() == relax.best.tracks.size());
+  for (std::size_t i = 0; i < both.best.tracks.size(); ++i) {
+    CHECK(both.best.tracks[i].a == relax.best.tracks[i].a);
+    CHECK(both.best.tracks[i].b == relax.best.tracks[i].b);
+  }
+  CHECK(both.best.vias.size() == relax.best.vias.size());
+  CHECK(errors(l.board, l.rules, both.best) == 0);
 }

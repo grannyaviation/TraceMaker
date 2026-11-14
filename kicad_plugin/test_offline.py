@@ -39,3 +39,77 @@ kw = route_kwargs(["--time", "30", "--threads", "4", "--no-kb", "--no-gpu", "--v
 assert kw == {"time_s": 30.0, "threads": 4, "kb": False, "gpu": False, "view": True, "work": 5000}, kw
 assert route_kwargs([]) == {}
 print("OK: TRACEMAKER_ARGS mapping")
+
+# The repair's lifted copper ("removed" in --emit-items, doc 05 §73) is found on the open board by geometry, layer and net.
+from types import SimpleNamespace as NS  # noqa: E402
+
+from tracemaker_route import removed_items  # noqa: E402
+
+
+class Track(NS):
+    pass
+
+
+class LiftBoard(FakeBoard):
+    def __init__(self, tracks, vias):
+        self.tracks, self.vias = tracks, vias
+
+    def get_tracks(self):
+        return self.tracks
+
+    def get_vias(self):
+        return self.vias
+
+
+def pt(x, y):
+    return NS(x=x, y=y)
+
+
+fcu = FakeBoard().get_layer_by_name("F.Cu")
+keep = Track(start=pt(0, 0), end=pt(5, 0), layer=fcu, net=NS(name="A"), locked=False)
+lift = Track(start=pt(1, 1), end=pt(2, 2), layer=fcu, net=NS(name="B"), locked=False)
+locked = Track(start=pt(1, 1), end=pt(2, 2), layer=fcu, net=NS(name="B"), locked=True)
+via = NS(position=pt(3, 3), net=NS(name="B"), locked=False)
+board = LiftBoard([keep, locked, lift], [via])
+gone = {"removed": {"tracks": [{"start": [2, 2], "end": [1, 1], "layer": "F.Cu", "net": "B"}], "vias": [{"position": [3, 3], "net": "B"}]}}
+found, missing = removed_items(board, gone)
+assert found == [lift, via] and missing == 0, (found, missing)
+found, missing = removed_items(board, {"removed": {"tracks": [{"start": [9, 9], "end": [1, 1], "layer": "F.Cu", "net": "B"}]}})
+assert found == [] and missing == 1
+assert removed_items(board, {"tracks": []}) == ([], 0)
+print("OK: lifted copper matched on the open board")
+
+# "Route selected nets" (tracemaker_route_nets.py): the nets of a selection, and a fingerprint that ignores item order but not content.
+from tracemaker_route_nets import fingerprint, selected_nets  # noqa: E402
+
+
+class SelBoard:
+    def __init__(self, sel, tracks=(), vias=(), fps=(), zones=()):
+        self.sel, self.t, self.v, self.f, self.z = sel, list(tracks), list(vias), list(fps), list(zones)
+
+    def get_selection(self):
+        return self.sel
+
+    def get_tracks(self):
+        return self.t
+
+    def get_vias(self):
+        return self.v
+
+    def get_footprints(self):
+        return self.f
+
+    def get_zones(self):
+        return self.z
+
+
+pad_a = NS(net=NS(name="A"))
+fp = NS(net=None, definition=NS(pads=[NS(net=NS(name="C")), NS(net=NS(name="")), NS(net=NS(name="B"))]))
+assert selected_nets(SelBoard([pad_a, fp, NS(net=NS(name="A"))])) == ["A", "B", "C"]
+assert selected_nets(SelBoard([NS()])) == []
+t1, t2 = Track(start=pt(0, 0), end=pt(1, 0)), Track(start=pt(0, 0), end=pt(2, 0))
+f12 = fingerprint(SelBoard([], tracks=[t1, t2]))
+assert f12 == fingerprint(SelBoard([], tracks=[t2, t1]))
+assert f12 != fingerprint(SelBoard([], tracks=[t1]))
+assert f12 != fingerprint(SelBoard([], vias=[t1, t2]))  # a via is not a track
+print("OK: selected nets and board fingerprint")

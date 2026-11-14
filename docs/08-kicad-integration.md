@@ -126,10 +126,10 @@ planning, the ramp) still take the class clearance floored at the board minimum;
 
 - Every rule TraceMaker cannot interpret is reported as a warning with its location, and the router uses
   the most conservative interpretation (for example, the largest clearance that could apply).
-- Phase 1 custom-rule conditions: `A.NetClass`, `A.NetName`, `A.Type`, `A.Layer`, `A.insideArea(...)`,
-  `A.intersectsArea(...)`, `A.isPlated()`, `A.Pad_Type`, `A.Reference`, boolean `&& || !`. Others later.
-- The router also enforces `disallow track/via` by net and layer, and `physical_hole_clearance` between holes
-  and copper of any net (doc 05 §27). Positional `disallow` rules are warned and left to the DRC.
+- Phase 1 custom-rule conditions: `A.NetClass`, `A.NetName`, `A.Net`, `A.Type`, `A.Layer`, `A.insideArea(...)`,
+  `A.intersectsArea(...)`, `A.isPlated()`, `A.Pad_Type`, `A.Pad_Number`, `A.Pin_Name`, `A.Reference`, boolean `&& || !`. Others later.
+- The router also enforces `disallow track/via` by net and layer, `physical_hole_clearance` between holes
+  and copper of any net, and `physical_clearance` between copper of any net, and custom `hole_to_hole` and `edge_clearance` rules (doc 05 §27). Positional `disallow` rules are warned and left to the DRC.
 
 ## 5. IPC plugin (`kicad_plugin/`)
 
@@ -195,7 +195,8 @@ kicad-cli pcb drc --format json --severity-all --all-track-errors --exit-code-vi
   again (`route --reroute`; locked copper, arcs and zones stay); `TRACEMAKER_PLACE=<mode>` runs `tracemaker-place`
   first and moves the footprints with `update_items` (side changes are not applied; when parts move, the old
   copper is routed again and the zones are refilled); `TRACEMAKER_REFILL=1` refills the zones. Removal, moves and
-  new copper are one commit. KiCad records a zone refill as a step of its own, so with a refill the result takes
+  new copper are one commit. Without `--reroute`, copper that the repair windows lifted (doc 05 §75, D172) comes in the
+  items file under `removed` and is removed in the same commit; if one of those items is not on the open board, nothing is changed. KiCad records a zone refill as a step of its own, so with a refill the result takes
   two undos; that is why refill is off unless footprints moved. Not built: a long-running `tracemakerd` (each run
   starts the engine afresh). The plugin is tested offline against kicad-python 0.8 (`test_offline.py`).
 - **Round trip in a running KiCad GUI** (`scripts/kicad_gui_roundtrip.py`, KiCad 10.0.6): pcbnew from the Docker

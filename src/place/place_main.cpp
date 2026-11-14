@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // tracemaker-place: component placement for a .kicad_pcb (design doc 04).
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -19,6 +20,7 @@
 #include "place/groups.hpp"
 #include "place/legality.hpp"
 #include "place/lower_bound.hpp"
+#include "place/place_advice.hpp"
 #include "place/placer.hpp"
 #include "place/routable.hpp"
 #include "place/tidy.hpp"
@@ -326,12 +328,13 @@ place::RouteFn make_route_fn(const std::string& in, const model::DesignRules& ru
 struct LoopCli {
   std::string in, out, json_path;
   place::PlaceOptions o;
-  bool move_connectors = false, no_fallback = false, no_decap_affinity = false, scratch = false;
+  bool move_connectors = false, no_fallback = false, no_decap_affinity = false, decap_spread = false, scratch = false;
   bool repair_input = false;            // --repair-input (D75): compare against the input's minimal repair
   std::string component_rules = "soft";  // --component-rules (doc 15; soft by default, D52)
   std::string rules_override;           // --rules-override (doc 15 §6.3)
   bool edge_attraction = false;         // --edge-attraction (doc 15 CONN-01)
   int decap_weight = place::kSignalWeight;
+  double decap_standoff_mm = 2.0;
   int crules_weight_pct = 100;
   bool crules_two_stage = true;
   double clearance_mm = -1;
@@ -346,6 +349,7 @@ struct LoopCli {
   std::string low;         // --low
   std::string groups;      // --groups
   std::vector<std::string> skip_nets;  // --skip-net
+  std::string advice;      // --place-advice: proposed placements and moves (doc 17 stage 4)
 };
 
 // --component-rules (doc 15 §3.5, P1): detect component categories and add their proximity rules as objective-only
@@ -393,6 +397,8 @@ int run_loop_mode(const LoopCli& c) {
   eo.fix_edge_connectors = !c.move_connectors;
   eo.scratch = c.scratch;
   eo.decap_affinity = !c.no_decap_affinity;
+  eo.decap_spread = c.decap_spread;
+  eo.decap_standoff = static_cast<Coord>(std::llround(c.decap_standoff_mm * 1e6));
   eo.decap_weight = c.decap_weight;
   eo.crules_weight_pct = c.crules_weight_pct;
   eo.crules_two_stage = c.crules_two_stage;
@@ -455,6 +461,15 @@ int run_loop_mode(const LoopCli& c) {
     log(msg);
     notes.push_back(msg);
   }
+  // Placement advice (doc 17 stage 4): read strictly, before any route, so a bad file costs nothing.
+  place::PlaceAdvice advice;
+  if (!c.advice.empty()) {
+    advice = place::read_place_advice(c.advice, P);
+    log("placement advice " + c.advice + ": " + std::to_string(advice.seeds.size()) + " seed(s), " + std::to_string(advice.eco.size()) + " ECO move(s)" +
+        (advice.note.empty() ? "" : "; note: " + advice.note));
+    if (c.scratch && !advice.seeds.empty()) log("placement advice: seeds are applied to the input pile and must be legal on their own");
+  }
+  nlohmann::json advice_report = nlohmann::json::array();
   if (c.o.mode == "eco") {
     input_eval = route(base);
     ++routes;
@@ -467,6 +482,7 @@ int run_loop_mode(const LoopCli& c) {
     e.alpha_cross_mm = c.o.alpha_cross_mm;
     e.via_mm = c.o.flip ? c.o.via_mm : 0;
     e.log = log;
+    e.advised = &advice.eco;
     const place::EcoResult er = place::eco_place(P, base, input_eval, e, route);
     routes += er.routes;
     // ECO checks each move, not existing conflicts.
@@ -522,6 +538,21 @@ int run_loop_mode(const LoopCli& c) {
     }
     add_seed("full", "full", 0);
     add_seed("full+rudy", "full", c.beta);
+    // Advised seeds: the proposal applied to the base; kept by the loop only if it routes more than every other seed.
+    for (const auto& as : advice.seeds) {
+      const std::string label = "advice: " + as.name;
+      const place::Placement t = place::apply_seed(base, as);
+      const place::Metrics m = place::measure(P, t, &input);
+      const bool absolute = repair || c.scratch;
+      if (absolute ? m.overlaps > 0 || m.outside > 0 : m.new_overlaps > 0 || m.new_outside > 0) {
+        const std::string why = std::to_string(absolute ? m.overlaps : m.new_overlaps) + " overlap(s), " +
+                                std::to_string(absolute ? m.outside : m.new_outside) + " outside";
+        notes.push_back(label + ": not legal, skipped (" + why + ")");
+        advice_report.push_back({{"seed", as.name}, {"legal", false}, {"why", why}});
+        continue;
+      }
+      seeds.push_back(place::Candidate{label, t, {}, 0});
+    }
     if (seeds.empty() && !illegal.empty()) {
       notes.push_back("no legal placement was found: the output is the full-mode result with its conflicts");
       seeds.push_back(illegal.front());
@@ -537,6 +568,7 @@ int run_loop_mode(const LoopCli& c) {
     // Only with --repair-input are seeds with conflicts shut out (the unrepairable input excepted).
     lo.absolute_seed_legality = repair;
     lo.accept_first_seed_conflicts = !base_legal;
+    lo.advised_eco = &advice.eco;
     if (!c.record.empty()) {
       lo.place.trace = [&rec](const std::string& key, const place::Placement& x, double t) {
         if (key.ends_with("|input")) rec.phase("re-placing around unrouted connections: " + key.substr(0, key.find('|')));
@@ -550,6 +582,9 @@ int run_loop_mode(const LoopCli& c) {
     if (best.pl.pos.empty())
       best = place::Candidate{base_label, base, {}, place::total_hpwl(P, base), base_legal};  // nothing routed
     tried = res.tried;
+    for (const auto& t : tried)
+      if (t.label.starts_with("advice: "))
+        advice_report.push_back({{"seed", t.label.substr(8)}, {"legal", true}, {"unrouted", t.eval.unrouted()}, {"kept", t.label == best.label}});
     routes = res.routes;
     rounds = res.rounds;
     if (c.scratch) {
@@ -632,6 +667,7 @@ int run_loop_mode(const LoopCli& c) {
     j["tried"] = tj;
     j["verify"] = verify;
     for (auto& [k, v] : extra.items()) j[k] = v;
+    if (!c.advice.empty()) j["advice"] = {{"file", c.advice}, {"seeds", advice_report}, {"eco_moves", advice.eco.size()}, {"kept", best.label.find("advice: ") != std::string::npos}};
     std::ofstream(c.json_path) << j.dump(2) << "\n";
   }
   return r.legal ? 0 : 2;
@@ -644,10 +680,11 @@ int main(int argc, char** argv) {
   CLI::App app{"TraceMaker placer: quadratic + SimPL global placement, legalisation and annealing"};
   std::string in, out, json_path;
   place::PlaceOptions o;
-  bool move_connectors = false, no_decap_affinity = false, scratch = false, repair_input = false;
+  bool move_connectors = false, no_decap_affinity = false, decap_spread = false, scratch = false, repair_input = false;
   std::string component_rules = "soft", rules_override;  // D52
   bool edge_attraction = false;
   int decap_weight = place::kSignalWeight;
+  double decap_standoff_mm = 2.0;
   int crules_weight_pct = 100;
   bool crules_two_stage = true;
   double clearance_mm = -1;
@@ -671,6 +708,13 @@ int main(int argc, char** argv) {
                                                "replaced, as the baseline and fallback, by its minimal repair (only the conflicting parts moved "
                                                "to the nearest legal spot). Off by default: the placement model is stricter than KiCad's DRC");
   app.add_flag("--no-decap-affinity", no_decap_affinity, "Do not tie decoupling capacitors to their IC's supply pins");
+  app.add_flag("--decap-spread", decap_spread,
+               "Decoupling capacitors whose input position is a pile (--scratch, or beside the board) are spread over their IC's "
+               "supply pins instead of tied to the pin nearest the pile (D171; off by default)");
+  app.add_option("--decap-standoff-mm", decap_standoff_mm,
+                 "With --decap-spread: a capacitor tied to an IC with 48 or more pads is pulled to a point this far outside the IC's "
+                 "body, straight out from its pin, keeping the band next to the pin rows for escapes (0 = onto the pin; default 2)")
+      ->check(CLI::Range(0.0, 20.0));
   app.add_option("--component-rules", component_rules,
                  "Component-aware layout rules (doc 15): off, report (detect and list only), soft (proximity pseudo-nets: crystal, ESD, regulator caps, generalised decoupling); default soft (D52)")
       ->check(CLI::IsMember({"off", "report", "soft", "on"}));
@@ -731,6 +775,9 @@ int main(int argc, char** argv) {
                  "routable/eco: route the winner and the input again with this budget; keep the winner only if not worse "
                  "(default 4 x --route-check, 0 = off)");
   app.add_option("--record", lc.record, "routable: write the placement timelapse (JSONL: header, then one frame per stage)");
+  app.add_option("--place-advice", lc.advice,
+                 "routable/eco: placement advice file (JSON: seeds = proposed placements, eco = proposed moves; doc 17 stage 4), each kept only if it routes more")
+      ->check(CLI::ExistingFile);
   app.add_option("--loop-time", lc.loop_time_s,
                  "routable: wall-time stop in seconds; checked between seeds and routes, keeps the best placement so far (0 = none)");
   CLI11_PARSE(app, argc, argv);
@@ -763,6 +810,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (!lc.advice.empty() && o.mode != "routable" && o.mode != "eco") {
+    std::fprintf(stderr, "error: --place-advice needs --mode routable or eco (each proposal is routed and kept only if it routes more)\n");
+    return 1;
+  }
   if (o.mode == "routable" || o.mode == "eco") {
     if (tidy) std::fprintf(stderr, "warning: --tidy applies to full, refine and auto; ignored in %s\n", o.mode.c_str());
     lc.in = in;
@@ -773,6 +824,8 @@ int main(int argc, char** argv) {
     lc.scratch = scratch;
     lc.repair_input = repair_input;
     lc.no_decap_affinity = no_decap_affinity;
+    lc.decap_spread = decap_spread;
+    lc.decap_standoff_mm = decap_standoff_mm;
     lc.component_rules = component_rules;
     lc.rules_override = rules_override;
     lc.edge_attraction = edge_attraction;
@@ -814,7 +867,7 @@ int main(int argc, char** argv) {
                         " --threads " + std::to_string(o.threads) + " --effort " + std::to_string(o.effort) + " --route-check " +
                         std::to_string(route_check) + " --route-threads " + std::to_string(route_threads) + " --json '" + c.json + "'" +
                         (move_connectors ? " --move-connectors" : "") + (scratch ? " --scratch" : "") +
-                        (no_decap_affinity ? " --no-decap-affinity" : "") + " --component-rules " + component_rules + " --decap-weight " + std::to_string(decap_weight) +
+                        (no_decap_affinity ? " --no-decap-affinity" : "") + (decap_spread ? " --decap-spread" : "") + " --decap-standoff-mm " + std::to_string(decap_standoff_mm) + " --component-rules " + component_rules + " --decap-weight " + std::to_string(decap_weight) +
                         " --crules-weight " + std::to_string(crules_weight_pct) + (crules_two_stage ? "" : " --no-crules-two-stage") + (rules_override.empty() ? "" : " --rules-override '" + rules_override + "'") + (edge_attraction ? " --edge-attraction" : "") +
                         (o.flip ? " --flip --flip-via-mm " + std::to_string(o.via_mm) + " --flip-rate " + std::to_string(o.flip_rate) + (keep_side.empty() ? "" : " --keep-side '" + keep_side + "'") : "") +
                         (tidy ? " --tidy --tidy-grid " + std::to_string(tidy_grid_mm) + " --tidy-align " + std::to_string(tidy_align_mm) : "") +
@@ -862,6 +915,8 @@ int main(int argc, char** argv) {
     eo.fix_edge_connectors = !move_connectors;
     eo.scratch = scratch;
     eo.decap_affinity = !no_decap_affinity;
+    eo.decap_spread = decap_spread;
+    eo.decap_standoff = static_cast<Coord>(std::llround(decap_standoff_mm * 1e6));
     eo.decap_weight = decap_weight;
     eo.crules_weight_pct = crules_weight_pct;
     eo.crules_two_stage = crules_two_stage;

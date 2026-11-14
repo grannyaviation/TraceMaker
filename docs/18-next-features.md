@@ -10,6 +10,7 @@ code: []
 > not an independent second corpus; and the paper was read in full (§1). The rest of this note is as written on 2026-10-14.**
 > **Update (2026-10-24): D3, the run report, was built (§9, D136).**
 > **Update (2026-10-27): C3, pours and the layer-count advisor, was built (§10, D138).**
+> **Update (2026-11-08): A3, the Kookabus boards, is a private fixture set (§19, D176); §7's open question is answered.**
 > **Status (2026-10-15): adopted as the roadmap's M17–M21 on the owner's answers in §7 (decision D118). Nothing here is built.** The
 > candidates keep the numbers they have in §4; §5 is the order that the answers gave. This note changes no code. Evidence tags: **[R]** checked in this repository (file or doc named), **[W]** from a web source (vendor
 > claims are marked as self-reported), **[A]** my estimate or assumption.
@@ -188,6 +189,17 @@ portfolio, finished in 128 s on 2026-10-27 after D137's GPU back-off (the stall 
 re-run under `--time 3600` (72 s, not time-limited). Found on the way: under load the default 120 s time limit, not the work budget, ended
 some runs, and their results moved between runs; the summary now says so (`time_limited`) and the report warns.
 
+Outside review (2026-11-08, [D177](decisions/D177.md)). A separate AI agent, with no part in writing the code, read the eight boards'
+reports, summaries and logs and the how-to (`bench/records/m20-run-report/outside-review.md`); it is not a human review. Every number
+matched its JSON field and the log. It found seven wrong statements: congestion described as "fixed copper encloses a pad" while the
+run's exact proof (`why_open`) said no pin was walled in, and that proof left out; two USB pins of RoyalBlue called unescapable although
+routed (the package analysis's 40 µm lattice; now confirmed pin by pin with the exact proof); starved thermal reliefs missing; the relax
+rescue's legalising round explained as "the run ended"; a rescued run's work reported as 0 (the work of a run of rounds is now summed over
+its rounds); the narrower-via hint left in the log; an SI sentence claiming checks that did not run. All seven are fixed, and most of the
+misleading and unclear points (README §4 lists each finding and what was done). The routed copper is unchanged (byte-identical to `main`
+057ee82 on the boards compared). The task stays open for a human designer's read of the fixed reports: the AI review checked the reports
+against their data, which a person reading them to decide what to do next may still find wanting.
+
 ## 10. C3 built: generated pours and the layer-count advisor (2026-10-27)
 
 `route --pour auto|NET@LAYER` adds a ground (or named) pour to a board without zones and routes with soft zones;
@@ -305,3 +317,86 @@ Gate (doc 18 §4 B2):
   board has delay rules of its own.
 - The measurement itself: KiCad's QA board to 0.01 ps; 325 of 329 nets on four demo boards to under 1 µm. Four branched power nets
   differ, where 10.0.6 depends on pointer order.
+
+## 18. Finishing the last connections: research and plan (2026-10-29, M22)
+
+The user asked what would take hard boards to 100 % routed. They had seen vias placed too close to footprint pins, connections that would
+route with two vias and a run on another layer, and paths that must first go the other way. A research round read the literature (escape
+routing, pin access, multi-layer search, negotiation), the source of Freerouting, tscircuit's capacity autorouter and KiCad's PNS router.
+It also measured 349 open connections on seven failing boards of the 0.12.1 release run, each routed alone on a copy of its final board
+(decision [D155](decisions/D155.md); report, notes and the `viastudy` harness in `bench/records/m22-research`).
+
+What the boards say:
+
+| What the open connection needed to route alone | Connections (of 349) |
+|---|--:|
+| Nothing: it routes on the final board, most with 0-2 vias (never attempted, ripped and not re-routed, or tried only while boxed in) | 139 |
+| More search: the whole-board window or more work (long detours, median 4-12 vias) | about 15 more |
+| Other nets' copper within 2 mm of its pins removed (mostly tracks; vias alone rescue 46 of 288) | 144 more |
+| Enclosed even with the whole board, any number of vias and every option | about 52 |
+
+The search is not blind to layers: a via is possible at every lattice point and the cost-to-go field prices vias on every layer. What it
+lacks is a reflex. When it proves a pin boxed in, it moves on instead of clearing the space around the pin, and four of the seven boards
+never reached negotiation. Freerouting's recent gains come from the same place (`LastMileBlockerRipup`, `RetryNeighbourhood`: foreign copper
+ripped around open pins in a radius growing from 1.5 to 12 mm). None of the open routers prices other nets' vias in a footprint's escape
+region during the main route; on these boards that would help CoreOne and kitspace_d20 only.
+
+Plan (M22), in order. Each change sits behind an option, off until measured:
+
+| # | Change | Evidence | Effort |
+|--:|---|---|:--:|
+| 1 | **Proof-triggered pin rescue**: a pin proved boxed in by routed copper gets its neighbours within ~2 mm ripped, is routed first, and the victims are re-routed, as a transaction; on failure a seeded victim order and a radius growing toward ~12 mm | copper near pins rescues 155 of 288; 229 of 526 open boxed in with no negotiation; `--lns-open` never got budget | M |
+| 2 | **Leave nothing unattempted**: when the main loop ends, retry every ripped-not-re-routed and never-attempted connection on the current copper | 139 of 349 route alone on the final board | S |
+| 3 | **Whole-board attempt for window misses** (never for proved enclosures) | whole-board window rescues 78; "no path in window" 133 of 526 | S |
+| 4 | **Informed pad-to-plane searches**: a lower bound to the net's fill, the late proof, planning to nearby same-net copper; `causes` fills zones as `route` does | pad-to-plane search floods to its 3 M cap (PoE switch C115.2, C123.2: 1.2 mm stubs) | S-M |
+| 5 | **D153 via retry only after budget misses**, against an equal-budget control | enclosure proofs do not depend on prices | S |
+| 6 | **Escape plan in more variants, then a via-only cost in dense pins' outward cones** | CoreOne vias 0.31 mm from open pins against 0.65 mm from routed ones | S, then M |
+| 7 | **A tight via state and off-lattice via sites** | the via margin has no tight fallback; neck-down vias carried 5 of CoreOne's 10 via rescues | M |
+| 8 | **Research: a via-site and layer planner** for dense packages and buses (pin access points, via exclusion, crossing and layer planning) | PAO, Bayless 2016, Haas 2026; start only if package fan-out is still the largest class | L |
+
+The user's "widen and randomise the last traces" is item 1's escalation: what widens is the radius and the order of what is ripped around
+one proved-stuck pin, seeded, not the search's cost weights (those were measured and lost, doc 16 §11).
+
+Gate: at least 15 % fewer open connections on `pcbench-bd-fail` at 10 M work, judged by KiCad; no clean board lost; `quick` and `mid`
+byte-identical with the options off.
+
+Items 1 and 2 (and part of 4) were built and measured on 2026-10-29: at the same budget, plain routing beat them (7,193 against
+7,185 routed on ten failing boards; doc 05 §63). They stay as options, off.
+
+The rest of the plan was developed on one board, `mini_mass_prog_bench_prog_rig`, and then measured on the ten (2026-10-30, D156,
+doc 05 §64):
+
+- Item 7, as a via shove that moves other nets' vias near a boxed-in pin: mini_mass 986 → 987.
+- Items 3, 5 and 6 were also built.
+
+With `--via-shove --escape-all` the ten boards route 7,197, against 7,175 for the base and 7,193 for the base at 22 M. Open
+connections fall 3.5 %, short of the 15 % gate. The whole-board window (item 3) and the via penalty (item 6) lost, and stay off.
+Item 8 remains: on mini_mass the open pins are boxed in by their neighbours' tracks.
+
+Item 8 was then built as fan-out heads (D157, doc 05 §65): before routing, the pins of a dense four-sided package get the first
+millimetres of their routes as the designer lays them, straight or in staggered 45-degree bundles. mini_mass goes from 986 to 989
+(the designer's own heads give 990). On the ten boards it nets zero (7,175, as the base) and stays off. On CoreOne even the designer's own heads do not help (785
+against 787), so a better rule for the heads was not pursued.
+
+Item 4 was finished on 2026-11-13 (D179, doc 05 §78): the bound pays a via off the plane's layer and `causes` fills zones as `route`
+does. On the 33 gate boards at 10 M work `--plane-informed` gives byte-identical boards to the base.
+
+State of M22: all eight items are built and off by default. The best arm,
+`--via-shove --escape-all`, cuts open connections by 3.5 % against the 15 % gate. Every repair so far lands within a few connections
+of the base given about 10 % more work, so more search per second is the stronger lever.
+
+## 19. A3 done: the Kookabus boards (2026-11-08, M21)
+
+The Kookabus files are in the private repository `DingoOz/kookabus` (no licence), so §7's "may they go in the repository" is answered with
+a fetch script, not a copy: `scripts/fetch_fixtures.sh kookabus` clones it at a pinned commit into `bench/data/kookabus` and
+`bench/sets/kookabus.txt` names the six boards with a layout (decision [D176](decisions/D176.md), records `bench/records/m21-a3`). They are
+2-layer boards (one 4-layer: the motor driver Kookabus-06) for I2C, power, motor and LoRa, with custom clearance rules and **no tuning
+profile, length, skew, delay or impedance rule**, as §8 feared: B1 and B2 have nothing to act on here, and M21's gate is met only
+vacuously. The SI audit finds Kelvin current-sense pairs and one crystal; it also marked a charge-only USB-C socket's unused D+/D- pins
+(single-pad nets) as critical, which D176 fixes (a critical net needs two pads).
+
+At 3 M work with `--refill`, 1 of 6 boards is clean (Kookabus-03) and completion is 85-100 %, with no routing error added, against six
+DRC-clean designer layouts; `--si-rules` changes almost nothing and `--diff-pairs` costs completion on three boards (Kookabus-06's sense
+pairs coupled 95.9 %, the designer's 42.6 %). What these boards need is completion (M22), not high speed. The one real high-speed Kookabus
+design, the CSI-2 vision board Kookabus-05, has no layout yet; it is the board to revisit B1/B2 on.
+

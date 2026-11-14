@@ -2,12 +2,14 @@
 #include "route/legalize.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <string>
 #include <tuple>
 
 namespace tmk::route {
@@ -15,7 +17,10 @@ namespace tmk::route {
 namespace {
 
 struct PadI {
-  double cx, cy, hx, hy;  // centre and half sizes (a circle: hx = hy = radius)
+  double cx, cy, hx, hy;  // centre and half sizes of the inner rectangle in the pad's own frame (a circle: hx = hy = radius)
+  double rr = 0;          // the pad is that rectangle grown by rr (the corner radius of a rounded rectangle, half the width of an oval)
+  double ca = 1, sa = 0;  // the pad's rotation: its frame's x axis is (ca, sa) on the board, its y axis (-sa, ca)
+  double bx, by;          // half sizes of its bounding box on the board
   bool circle;
   model::LayerMask layers;
   model::NetId net;
@@ -59,6 +64,7 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
   LegalizeOptions opt = opt_in;
   if (const char* e = std::getenv("TM_LEGALIZE_SWEEPS")) opt.sweeps = std::atoi(e);  // experiments
   if (const char* e = std::getenv("TM_LEGALIZE_BOX")) opt.box_mm = std::atof(e);
+  if (const char* e = std::getenv("TM_LEGALIZE_REALIZE"); e && opt.realize_iters > 0) opt.realize_iters = std::atoi(e);  // a caller's 0 stays 0
   // --- clearance of a pair of nets ------------------------------------------------------------------------------------
   std::vector<double> net_clr(board.nets.size(), 0);
   for (std::size_t n = 0; n < board.nets.size(); ++n)
@@ -70,21 +76,41 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
     return std::max({ca, cb, min_clr});
   };
   const double margin = opt.margin_mm;
-  const double hole_gap = nm_to_mm(rules.minimums.hole_to_hole);
+  const double via_extra = nm_to_mm(std::max<Coord>(rules.via_clearance_extra, 0));  // a ramp stage that keeps vias at the board's clearance
+  const double hole_gap = nm_to_mm(opt.hole_to_hole >= 0 ? opt.hole_to_hole : rules.minimums.hole_to_hole);
 
   // --- items ---------------------------------------------------------------------------------------------------------
+  const bool bbox_pads = [] {
+    const char* e = std::getenv("TM_LEGALIZE_BBOX_PADS");
+    return e && e[0] == '1';
+  }();
   std::vector<PadI> pads;
   for (const auto& p : board.pads) {
     if (p.copper == 0) continue;
     PadI pi{};
-    pi.cx = nm_to_mm(p.pos.x);
-    pi.cy = nm_to_mm(p.pos.y);
+    const geom::Point centre = p.pos + geom::rotate(p.drill_offset, p.angle);  // the copper's centre (an offset pad's is not its hole's)
+    pi.cx = nm_to_mm(centre.x);
+    pi.cy = nm_to_mm(centre.y);
     const double sx = nm_to_mm(p.size_x), sy = nm_to_mm(p.size_y);
     const double ang = p.angle * 3.14159265358979323846 / 180.0;
     const double ca = std::fabs(std::cos(ang)), sa = std::fabs(std::sin(ang));
-    pi.circle = p.shape == model::PadShape::Circle && std::fabs(sx - sy) < 1e-9;
-    pi.hx = pi.circle ? sx / 2 : (ca * sx + sa * sy) / 2;  // bounding box of the rotated pad: never smaller than the pad
-    pi.hy = pi.circle ? sx / 2 : (sa * sx + ca * sy) / 2;
+    pi.circle = (p.shape == model::PadShape::Circle || p.shape == model::PadShape::Oval) && std::fabs(sx - sy) < 1e-9;
+    pi.bx = pi.circle ? sx / 2 : (ca * sx + sa * sy) / 2;  // bounding box of the rotated pad
+    pi.by = pi.circle ? sx / 2 : (sa * sx + ca * sy) / 2;
+    // A pad is a rectangle in its own frame, turned by its angle and grown by its corner radius, so a pad at 45 or 60 degrees, an oval and a rounded
+    // rectangle are what they are (D159: as the bounding box of a sharp rectangle, rotated pads were up to 0.2 mm too large and the legaliser pushed
+    // tracks that were legal). Chamfered, trapezoid and custom pads stay rectangles. TM_LEGALIZE_BBOX_PADS=1 keeps the bounding box (experiments).
+    if (!pi.circle && !bbox_pads) {
+      if (p.shape == model::PadShape::Oval) pi.rr = std::min(sx, sy) / 2;
+      else if (p.shape == model::PadShape::RoundRect) pi.rr = std::clamp(p.roundrect_ratio, 0.0, 0.5) * std::min(sx, sy);
+      pi.hx = sx / 2 - pi.rr;
+      pi.hy = sy / 2 - pi.rr;
+      pi.ca = std::cos(ang);  // geom::rotate's convention: the pad's x axis is (cos, -sin) on the board
+      pi.sa = -std::sin(ang);
+    } else {
+      pi.hx = pi.bx;
+      pi.hy = pi.by;
+    }
     pi.layers = p.copper;
     pi.net = p.net;
     pi.clearance = p.clearance >= 0 ? nm_to_mm(p.clearance) : -1;
@@ -190,7 +216,7 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
     for (std::size_t k = 0; k < pads.size(); ++k) {
       const auto& p = pads[k];
       if (p.net != node_net[i] || p.net == 0) continue;
-      if (std::fabs(px[i] - p.cx) <= p.hx + 1e-3 && std::fabs(py[i] - p.cy) <= p.hy + 1e-3) {
+      if (std::fabs(px[i] - p.cx) <= p.bx + 1e-3 && std::fabs(py[i] - p.cy) <= p.by + 1e-3) {
         own_pad[i] = static_cast<int>(k);
         break;
       }
@@ -203,7 +229,7 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
   // Board outline.
   std::vector<std::pair<double, double>> outline;
   for (const auto& p : opt.outline) outline.emplace_back(nm_to_mm(p.x), nm_to_mm(p.y));
-  const double edge = opt.edge_mm + nm_to_mm(rules.minimums.copper_edge_clearance);
+  const double edge = opt.edge_mm + nm_to_mm(opt.edge_clearance >= 0 ? opt.edge_clearance : rules.minimums.copper_edge_clearance);
   auto inside_outline = [&](double x, double y, double m) {
     if (outline.size() < 3) return true;
     bool in = false;
@@ -247,8 +273,8 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
     put({'v', static_cast<int>(i)}, x - r, y - r, x + r, y + r);
   }
   for (std::size_t i = 0; i < pads.size(); ++i)
-    put({'p', static_cast<int>(i)}, pads[i].cx - pads[i].hx - reach / 2, pads[i].cy - pads[i].hy - reach / 2, pads[i].cx + pads[i].hx + reach / 2,
-        pads[i].cy + pads[i].hy + reach / 2);
+    put({'p', static_cast<int>(i)}, pads[i].cx - pads[i].bx - reach / 2, pads[i].cy - pads[i].by - reach / 2, pads[i].cx + pads[i].bx + reach / 2,
+        pads[i].cy + pads[i].by + reach / 2);
 
   std::vector<Con> cons;
   std::set<std::tuple<char, int, char, int>> seen;
@@ -275,12 +301,12 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
           const auto& s = segs[static_cast<std::size_t>(p.idx)];
           const auto& v = vias[static_cast<std::size_t>(q.idx)];
           if (s.net == v.net || !layer_in(s.layer, v.top, v.bottom)) continue;
-          add_seg_point(v.node, s, clearance(s.net, v.net) + margin + s.w / 2 + v.r);
+          add_seg_point(v.node, s, clearance(s.net, v.net) + via_extra + margin + s.w / 2 + v.r);
         } else if (p.type == 'v' && q.type == 'v') {
           const auto& v = vias[static_cast<std::size_t>(p.idx)];
           const auto& w = vias[static_cast<std::size_t>(q.idx)];
           if (v.net == w.net) continue;
-          const double req = std::max(clearance(v.net, w.net) + v.r + w.r, v.drill / 2 + w.drill / 2 + hole_gap) + margin;
+          const double req = std::max(clearance(v.net, w.net) + via_extra + v.r + w.r, v.drill / 2 + w.drill / 2 + hole_gap) + margin;
           cons.push_back({Kind::PointPoint, v.node, w.node, -1, 0, 0, req});
         } else if (p.type == 'p' && q.type == 's') {
           const auto& pd = pads[static_cast<std::size_t>(p.idx)];
@@ -292,8 +318,12 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
           if (pd.circle) {
             cons.push_back({Kind::CornerSeg, -1, s.a, s.b, pd.cx, pd.cy, req + pd.hx});
           } else {
-            for (const auto [sx, sy] : {std::pair{-1.0, -1.0}, {1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}})
-              cons.push_back({Kind::CornerSeg, -1, s.a, s.b, pd.cx + sx * pd.hx, pd.cy + sy * pd.hy, req});
+            // The closest points of a segment and a convex pad: an end of the segment (PointPad) or a corner of the inner rectangle.
+            for (const auto [sx, sy] : {std::pair{-1.0, -1.0}, {1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}}) {
+              if ((sy > 0 && pd.hy < 1e-9) || (sx > 0 && pd.hx < 1e-9)) continue;  // an oval's inner rectangle is a line: two corners
+              const double lx = sx * pd.hx, ly = sy * pd.hy;
+              cons.push_back({Kind::CornerSeg, -1, s.a, s.b, pd.cx + pd.ca * lx - pd.sa * ly, pd.cy + pd.sa * lx + pd.ca * ly, req + pd.rr});
+            }
           }
         } else if (p.type == 'p' && q.type == 'v') {
           const auto& pd = pads[static_cast<std::size_t>(p.idx)];
@@ -302,7 +332,7 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
           bool shared = false;
           for (int l = v.top; l <= v.bottom && !shared; ++l) shared = (pd.layers & model::layer_bit(l)) != 0;
           if (!shared) continue;
-          cons.push_back({Kind::PointPad, v.node, -1, p.idx, 0, 0, std::max(clearance(v.net, pd.net), pd.clearance) + margin + v.r});
+          cons.push_back({Kind::PointPad, v.node, -1, p.idx, 0, 0, std::max(clearance(v.net, pd.net), pd.clearance) + via_extra + margin + v.r});
         }
       }
   }
@@ -334,10 +364,10 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
     hiy[i] = py[i] + opt.box_mm;
     if (own_pad[i] >= 0 && !fixed[i]) {  // stays inside its own pad
       const auto& p = pads[static_cast<std::size_t>(own_pad[i])];
-      lox[i] = std::max(lox[i], std::min(p.cx - p.hx + 0.01, px[i]));
-      hix[i] = std::min(hix[i], std::max(p.cx + p.hx - 0.01, px[i]));
-      loy[i] = std::max(loy[i], std::min(p.cy - p.hy + 0.01, py[i]));
-      hiy[i] = std::min(hiy[i], std::max(p.cy + p.hy - 0.01, py[i]));
+      lox[i] = std::max(lox[i], std::min(p.cx - p.bx + 0.01, px[i]));
+      hix[i] = std::min(hix[i], std::max(p.cx + p.bx - 0.01, px[i]));
+      loy[i] = std::max(loy[i], std::min(p.cy - p.by + 0.01, py[i]));
+      hiy[i] = std::min(hiy[i], std::max(p.cy + p.by - 0.01, py[i]));
     }
     if (fixed[i]) lox[i] = hix[i] = px[i], loy[i] = hiy[i] = py[i];
   }
@@ -377,12 +407,15 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
           g = {d - pd.hx, ex / d, ey / d, 0};
           return true;
         }
-        const double qx = std::clamp(px[p], pd.cx - pd.hx, pd.cx + pd.hx), qy = std::clamp(py[p], pd.cy - pd.hy, pd.cy + pd.hy);
-        ex = px[p] - qx;
-        ey = py[p] - qy;
+        // In the pad's frame: the nearest point of the rectangle, and the offset to it turned back onto the board.
+        const double dx = px[p] - pd.cx, dy = py[p] - pd.cy;
+        const double lx = pd.ca * dx + pd.sa * dy, ly = -pd.sa * dx + pd.ca * dy;
+        const double fx = lx - std::clamp(lx, -pd.hx, pd.hx), fy = ly - std::clamp(ly, -pd.hy, pd.hy);
+        ex = pd.ca * fx - pd.sa * fy;
+        ey = pd.sa * fx + pd.ca * fy;
         d = std::hypot(ex, ey);
         if (d < 1e-9) return false;
-        g = {d, ex / d, ey / d, 0};
+        g = {d - pd.rr, ex / d, ey / d, 0};
         return true;
       }
       case Kind::CornerSeg: {
@@ -453,7 +486,173 @@ LegalizeResult legalize_routes(const model::Board& board, const model::DesignRul
     res.sweeps_used = sweep + 1;
     if (worst <= margin) break;  // everything within the margin of its target: the next sweeps would only chase it
   }
+  // --- realizer (doc 20 §2.3) ------------------------------------------------------------------------------------------
+  // The sweeps chase one pair at a time. Where a bundle of tracks has to shift together they stall (poncho's last hand-over: 71 pairs,
+  // the same after 3000 sweeps). The realizer moves everything at once: sequential quadratic programming. Each round linearises the
+  // constraints within kNear of their target and solves the elastic QP  min 1/2 |d|^2 + kM sum s  s.t.  g_i + a_i.d + s_i >= 0, s >= 0,
+  // d within the node's box and the trust region rho, by dual coordinate ascent (Hildreth 1957: one multiplier per row in [0, kM], the
+  // box kept by clipping). A round is kept if it leaves fewer pairs, or as many less deep; otherwise rho halves. Rows in a fixed order:
+  // deterministic.
+  if (opt.realize_iters > 0) {
+    auto tally = [&] {
+      std::pair<int, double> t{0, 0.0};
+      for (const auto& c : cons) {
+        Geo g{};
+        if (eval(c, g) && g.d < c.req - margin - 1e-9) {
+          ++t.first;
+          t.second = std::max(t.second, c.req - margin - g.d);
+        }
+      }
+      return t;
+    };
+    auto cur = tally();
+    if (cur.first > 0) {
+      res.pairs_projected = cur.first;
+      constexpr double kNear = 0.05, kM = 1.0, kRhoMin = 1e-4;
+      constexpr int kPasses = 200;
+      struct Term {
+        int node;
+        double gx, gy;
+      };
+      struct Row {
+        double g;
+        int first, count;
+      };
+      std::vector<Row> rows;
+      std::vector<Term> terms;
+      std::vector<double> dx(n, 0), dy(n, 0), dlo_x(n), dhi_x(n), dlo_y(n), dhi_y(n), lam;
+      std::vector<std::uint8_t> touched(n, 0);
+      std::vector<int> nodes_in;
+      double rho = 0.05;
+      for (int it = 0; it < opt.realize_iters && cur.first > 0; ++it) {
+        rows.clear();
+        terms.clear();
+        for (const auto& c : cons) {
+          Geo g{};
+          if (!eval(c, g) || g.d - c.req >= kNear) continue;
+          const int first = static_cast<int>(terms.size());
+          auto add = [&](int i, double gx, double gy) {
+            if (i >= 0 && !fixed[static_cast<std::size_t>(i)] && (gx != 0 || gy != 0)) terms.push_back({i, gx, gy});
+          };
+          switch (c.kind) {  // gradients of the distance (the segment parameter t held: the envelope theorem)
+            case Kind::PointSeg:
+              add(c.a, g.nx, g.ny);
+              add(c.b, -(1 - g.t) * g.nx, -(1 - g.t) * g.ny);
+              add(c.c, -g.t * g.nx, -g.t * g.ny);
+              break;
+            case Kind::PointPoint:
+              add(c.a, g.nx, g.ny);
+              add(c.b, -g.nx, -g.ny);
+              break;
+            case Kind::PointPad:
+              add(c.a, g.nx, g.ny);
+              break;
+            case Kind::CornerSeg:
+              add(c.b, (1 - g.t) * g.nx, (1 - g.t) * g.ny);
+              add(c.c, g.t * g.nx, g.t * g.ny);
+              break;
+          }
+          const int count = static_cast<int>(terms.size()) - first;
+          if (count > 0) rows.push_back({g.d - c.req, first, count});
+        }
+        if (rows.empty()) break;
+        nodes_in.clear();
+        for (const auto& t : terms) {
+          const auto k = static_cast<std::size_t>(t.node);
+          if (touched[k]) continue;
+          touched[k] = 1;
+          nodes_in.push_back(t.node);
+          dx[k] = dy[k] = 0;
+          dlo_x[k] = std::max(-rho, lox[k] - px[k]);
+          dhi_x[k] = std::min(rho, hix[k] - px[k]);
+          dlo_y[k] = std::max(-rho, loy[k] - py[k]);
+          dhi_y[k] = std::min(rho, hiy[k] - py[k]);
+        }
+        lam.assign(rows.size(), 0.0);
+        for (int pass = 0; pass < kPasses; ++pass) {
+          double change = 0;
+          for (std::size_t r = 0; r < rows.size(); ++r) {
+            double ad = 0, aa = 0;
+            for (int j = rows[r].first; j < rows[r].first + rows[r].count; ++j) {
+              const auto& t = terms[static_cast<std::size_t>(j)];
+              const auto k = static_cast<std::size_t>(t.node);
+              ad += t.gx * dx[k] + t.gy * dy[k];
+              aa += t.gx * t.gx + t.gy * t.gy;
+            }
+            if (aa == 0) continue;
+            const double nl = std::clamp(lam[r] + (-rows[r].g - ad) / aa, 0.0, kM), dl = nl - lam[r];
+            if (dl == 0) continue;
+            lam[r] = nl;
+            change = std::max(change, std::fabs(dl));
+            for (int j = rows[r].first; j < rows[r].first + rows[r].count; ++j) {
+              const auto& t = terms[static_cast<std::size_t>(j)];
+              const auto k = static_cast<std::size_t>(t.node);
+              dx[k] = std::clamp(dx[k] + dl * t.gx, dlo_x[k], dhi_x[k]);
+              dy[k] = std::clamp(dy[k] + dl * t.gy, dlo_y[k], dhi_y[k]);
+            }
+          }
+          if (change < 1e-9) break;
+        }
+        const std::vector<double> ox = px, oy = py;
+        for (int i : nodes_in) {
+          const auto k = static_cast<std::size_t>(i);
+          touched[k] = 0;
+          const double nx = px[k] + dx[k], ny = py[k] + dy[k];
+          if (!outline.empty() && !inside_outline(nx, ny, half[k] + edge)) continue;  // a move off the board is not taken
+          px[k] = nx;
+          py[k] = ny;
+        }
+        res.realize_iters_used = it + 1;
+        const auto next = tally();
+        if (next.first < cur.first || (next.first == cur.first && next.second < cur.second)) {
+          cur = next;
+        } else {
+          px = ox;
+          py = oy;
+          rho *= 0.5;
+          if (rho < kRhoMin) break;
+        }
+      }
+    }
+  }
+  // A vertex in its own pad moved within the pad's bounding box. If its track's end no longer touches the copper of a rotated, oval or
+  // rounded pad (the box's corners are not copper), the track would be unconnected, so the vertex goes back to where it was. A vertex
+  // that left the copper by less than its half width still connects; resetting those cost routes (D159).
+  auto in_pad = [&](const PadI& pd, double x, double y, double grow) {
+    const double dx = x - pd.cx, dy = y - pd.cy;
+    if (pd.circle) return std::hypot(dx, dy) <= pd.hx + grow + 1e-6;
+    const double lx = pd.ca * dx + pd.sa * dy, ly = -pd.sa * dx + pd.ca * dy;
+    return std::hypot(lx - std::clamp(lx, -pd.hx, pd.hx), ly - std::clamp(ly, -pd.hy, pd.hy)) <= pd.rr + grow + 1e-6;
+  };
+  for (std::size_t i = 0; i < n; ++i) {
+    if (own_pad[i] < 0 || fixed[i]) continue;
+    const auto& pd = pads[static_cast<std::size_t>(own_pad[i])];
+    const double touch = std::max(half[i] - 0.001, 0.0);  // the end's disc overlaps the copper by at least 1 µm
+    if (in_pad(pd, x0[i], y0[i], 0) && !in_pad(pd, px[i], py[i], touch)) px[i] = x0[i], py[i] = y0[i];
+  }
   for (const auto& c : cons) res.pairs_after += violated(c) ? 1 : 0;
+  // Experiments (doc 20 §2.3): the problem as the projection leaves it, for a realizer prototype. TM_LEGALIZE_DUMP=DIR writes
+  // DIR/legalize-<n>.json for every call that leaves pairs too close: nodes (start, now, bounds, fixed), pads and constraints.
+  if (const char* dir = std::getenv("TM_LEGALIZE_DUMP"); dir && res.pairs_after > 0) {
+    static std::atomic<int> dumps{0};
+    const std::string path = std::string(dir) + "/legalize-" + std::to_string(dumps++) + ".json";
+    if (std::FILE* f = std::fopen(path.c_str(), "w")) {
+      std::fprintf(f, "{\"margin\": %.9g, \"box\": %.9g, \"nodes\": [", margin, opt.box_mm);
+      for (std::size_t i = 0; i < n; ++i)
+        std::fprintf(f, "%s[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g]", i ? "," : "", x0[i], y0[i], px[i], py[i], lox[i], hix[i], loy[i], hiy[i],
+                     fixed[i] ? 1 : 0, own_pad[i], half[i]);
+      std::fprintf(f, "], \"pads\": [");
+      for (std::size_t i = 0; i < pads.size(); ++i)
+        std::fprintf(f, "%s[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d]", i ? "," : "", pads[i].cx, pads[i].cy, pads[i].hx, pads[i].hy, pads[i].rr, pads[i].ca,
+                     pads[i].sa, pads[i].circle ? 1 : 0);
+      std::fprintf(f, "], \"cons\": [");
+      for (std::size_t i = 0; i < cons.size(); ++i)
+        std::fprintf(f, "%s[%d,%d,%d,%d,%.9g,%.9g,%.9g]", i ? "," : "", static_cast<int>(cons[i].kind), cons[i].a, cons[i].b, cons[i].c, cons[i].qx, cons[i].qy,
+                     cons[i].req);
+      std::fprintf(f, "]}\n");
+      std::fclose(f);
+    }
+  }
   if (const char* e = std::getenv("TM_DEBUG_LEGALIZE"); e && e[0] == '2')  // list what is left
     for (const auto& c : cons) {
       Geo g{};

@@ -228,6 +228,20 @@ def generate(root: Path) -> dict:
     for prop in ['A.Reference','A.Parent.Reference','Parent.Reference','B.Reference']:
         case('reference_'+prop.replace('.','_'),pads,rule(f"{prop} == 'R1'",'pad track'))
     case('pad_type',pads,rule("A.Pad_Type == 'SMD'",'pad'))
+    # Net is the net code, a number (issue #52): a literal code, and two items' nets compared.
+    # One unitless literal drops the condition (see width_*_double); with two, the codes are compared.
+    case('net_code_lone',static,rule("A.Net == 2",'track via'))
+    case('net_code',static,rule("A.Net == 2 || A.Net == 99",'track via'))
+    case('net_code_zero',static+[track('free-net0',30,5,33,5,net=0)],rule("A.Net == 0 || A.Net == 99",'track via'))
+    h2h=[via('hh-X1',30,5),via('hh-X2',30,6.2),via('hh-Y',31.2,5,net=2)]
+    for name,condition in [('net_ne_hole_to_hole',"A.Net != B.Net"),('net_eq_hole_to_hole',"A.Net == B.Net")]:
+        case(name,h2h,rule(condition,constraint='(constraint hole_to_hole (min 1.5mm))'),types=['hole_to_hole'])
+    # Pad_Number exists on copper pads only (KiCad's isCopperPad), Pin_Name on every pad; both are strings (issue #65).
+    pin_pads=pads+[footprint('U1',30,5,pad_extra='(pinfunction "VCC")')]
+    for name,condition,words in [('pad_number',"A.Pad_Number == '1'",'pad'),('pad_number_other',"A.Pad_Number == '2'",'pad'),
+                                 ('pad_number_ne',"A.Pad_Number != '2'",'pad track via'),('pin_name',"A.Pin_Name == 'vcc'",'pad'),
+                                 ('pin_name_wildcard',"A.Pin_Name == 'V*'",'pad'),('pin_name_ne',"A.Pin_Name != 'VCC'",'pad track via')]:
+        case(name,pin_pads,rule(condition,words))
     for name,condition in [('size_x_quoted',"A.Size_X == '1mm'"),('size_x_mm','A.Size_X == 1mm'),('size_y_half_mm','A.Size_Y == 0.5mm'),('size_x_mil','A.Size_X > 40mil'),('position_x','A.Position_X > 15mm')]:
         case(name,pads,rule(condition,'pad track via'))
     width_items=[track('thin',5,5,8,5,width=0.2),track('quarter',5,9,8,9,width=0.25),track('wide',5,13,8,13,width=0.4)]

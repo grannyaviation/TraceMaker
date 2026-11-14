@@ -19,6 +19,7 @@
 #include "place/groups.hpp"
 #include "place/legalize.hpp"
 #include "place/lower_bound.hpp"
+#include "place/place_advice.hpp"
 #include "place/placer.hpp"
 #include "place/routable.hpp"
 #include "place/tidy.hpp"
@@ -418,6 +419,63 @@ TEST_CASE("decoupling capacitors are tied to an IC supply pin, objective only", 
   CHECK(total_hpwl(on, a) == total_hpwl(off, b));
   CHECK(weighted_hpwl(on, a) > weighted_hpwl(off, b));
   CHECK(count_crossings(on, a) == count_crossings(off, b));
+}
+
+TEST_CASE("D171: decoupling ties spread only for unplaced caps; the standoff target is outside the IC", "[place][fixture]") {
+  const std::string path = std::string(TM_SOURCE_DIR) + "/bench/data/freerouting/scripts/benchmark/fixtures/PCBench/ice40_stm32_fsmc_test_pcb_fsmc_ice40/unrouted.kicad_pcb";
+  if (!std::filesystem::exists(path)) SKIP("fixture missing: " + path);
+  const auto lb = io::read_board_file(path);
+  const auto rules = io::read_design_rules(path);
+  // (cap part, IC part, IC-side offset) of every decoupling tie.
+  auto ties = [](const Problem& p) {
+    std::vector<std::tuple<int, int, Point>> v;
+    for (const auto& n : p.nets)
+      if (n.affinity && n.name.starts_with("~decap ")) {
+        const Pin& a = p.pins[z(n.pins[0])];
+        const Pin& c = p.pins[z(n.pins[1])];
+        v.emplace_back(a.part, c.part, c.off[0]);
+      }
+    return v;
+  };
+  ExtractOptions on, off;
+  CHECK_FALSE(off.decap_spread);  // off by default
+  on.decap_spread = true;
+  on.decap_standoff = 0;
+  // A real placement: the caps are on the board, so nothing changes.
+  CHECK(ties(extract(lb.board, rules, path, on)) == ties(extract(lb.board, rules, path, off)));
+  // From scratch: the ties are spread, over more distinct IC pins than nearest-pin gives.
+  on.scratch = off.scratch = true;
+  const Problem ps = extract(lb.board, rules, path, on), pn = extract(lb.board, rules, path, off);
+  const auto ts = ties(ps), tn = ties(pn);
+  REQUIRE(ts.size() == tn.size());
+  REQUIRE(!ts.empty());
+  auto distinct = [](const std::vector<std::tuple<int, int, Point>>& v) {
+    std::set<std::pair<int, std::pair<Coord, Coord>>> s;
+    for (const auto& [c, ic, o] : v) s.insert({ic, {o.x, o.y}});
+    return s.size();
+  };
+  CHECK(distinct(ts) >= distinct(tn));
+  // With a standoff, a tie to an IC of 48+ pads ends that far outside the IC's body on one axis, inside its span on the other.
+  ExtractOptions so = on;
+  so.decap_standoff = 2 * MM;
+  // Off (the default) is the old behaviour whatever the standoff.
+  ExtractOptions off_so = off;
+  off_so.decap_standoff = 2 * MM;
+  CHECK(ties(extract(lb.board, rules, path, off_so)) == tn);
+  const Problem pso = extract(lb.board, rules, path, so);
+  int big = 0;
+  for (const auto& [c, ic, o] : ties(pso)) {
+    const Part& pt = pso.parts[z(ic)];
+    if (static_cast<int>(lb.board.footprints[z(pt.fp)].pads.size()) < kDecapStandoffPins) continue;
+    ++big;
+    const Box& bx = pt.geom[0].body;
+    const bool on_x = o.x == bx.x1 + 2 * MM || o.x == bx.x0 - 2 * MM;
+    const bool on_y = o.y == bx.y1 + 2 * MM || o.y == bx.y0 - 2 * MM;
+    CHECK(on_x != on_y);
+    if (on_x) CHECK((o.y >= bx.y0 && o.y <= bx.y1));
+    if (on_y) CHECK((o.x >= bx.x0 && o.x <= bx.x1));
+  }
+  CHECK(big > 0);
 }
 
 TEST_CASE("component-rule proximity pseudo-nets are objective only and skip D25-tied parts", "[place][fixture][crules]") {
@@ -1677,4 +1735,87 @@ TEST_CASE("Legality::in_board: the per-cell cache answers as the exact test does
   CHECK_FALSE(L.in_board({200'000, 200'000}));      // past the chamfer
   CHECK_FALSE(L.in_board({W - 200'000, 200'000}));  // past a round corner
   CHECK_FALSE(L.in_board({100 * MM, 15 * MM}));     // off the grid
+}
+
+TEST_CASE("placement advice: strict parsing, locked parts refused, rotation states", "[place][advice]") {
+  Problem p = board(30 * MM, 30 * MM);
+  const int a = add_part(p, {10 * MM, 10 * MM}, MM, MM, {{0, 0}}, true);
+  const int b = add_part(p, {20 * MM, 20 * MM}, MM, MM, {{0, 0}}, false);
+  p.parts[z(b)].fixed_reason = "locked";
+  p.parts[z(a)].angle0 = 90;
+  const std::string ra = p.parts[z(a)].ref, rb = p.parts[z(b)].ref;
+  const auto adv = parse_place_advice(R"({"version": 1, "note": "n", "seeds": [{"name": "s", "moves": [{"ref": ")" + ra +
+                                          R"(", "at": [12.5, 9], "rotate": 270}]}], "eco": [{"ref": ")" + ra + R"(", "at": [11, 10]}]})", p);
+  REQUIRE(adv.seeds.size() == 1);
+  CHECK(adv.seeds[0].moves[0].pos == Point{12'500'000, 9'000'000});
+  CHECK(adv.seeds[0].moves[0].rot == 2);  // 90 + 2 x 90
+  CHECK(adv.eco[0].rot == 0);             // unchanged orientation
+  CHECK(adv.note == "n");
+  const Placement t = apply_seed(Placement::initial(p), adv.seeds[0]);
+  CHECK(t.pos[z(a)] == Point{12'500'000, 9'000'000});
+  CHECK(t.pos[z(b)] == p.parts[z(b)].pos0);
+  auto refused = [&](const std::string& text, const std::string& needle) {
+    try {
+      parse_place_advice(text, p, "f.json");
+    } catch (const std::runtime_error& e) {
+      INFO(e.what());
+      CHECK(std::string(e.what()).find(needle) != std::string::npos);
+      return true;
+    }
+    return false;
+  };
+  CHECK(refused(R"({"version": 1, "eco": [{"ref": ")" + rb + R"(", "at": [1, 1]}]})", "may not move (locked)"));  // rule 6
+  CHECK(refused(R"({"version": 1, "eco": [{"ref": "NOPE", "at": [1, 1]}]})", "eco[0].ref"));
+  CHECK(refused(R"({"version": 1, "eco": [{"ref": ")" + ra + R"(", "at": [1, 1], "rotate": 45}]})", "eco[0].rotate"));
+  CHECK(refused(R"({"version": 1, "seeds": [{"moves": [{"ref": ")" + ra + R"(", "at": [1, 1], "flip": true}]}]})", "unknown key \"flip\""));
+  CHECK(refused(R"({"version": 2})", "version"));
+  CHECK(refused(R"({"version": 1, "eco": [{"ref": ")" + ra + R"(", "at": [1]}]})", "eco[0].at"));
+  CHECK(refused(R"({"version": 1, "seeds": [{"moves": []}]})", "seeds[0].moves"));
+  CHECK(refused(R"({"version": 1, "seeds": [{"moves": [{"ref": ")" + ra + R"(", "at": [1, 1]}, {"ref": ")" + ra + R"(", "at": [2, 2]}]}]})", "already moved"));
+  CHECK(refused("{", "not valid JSON"));
+}
+
+TEST_CASE("placement advice: an advised seed or ECO move is kept only when it routes more", "[place][advice][m8]") {
+  // Two parts joined by one net, 16 mm apart; the synthetic router routes nets of HPWL <= 6 mm.
+  Problem p = board(30 * MM, 30 * MM);
+  const int a = add_part(p, {5 * MM, 15 * MM}, MM, MM, {{0, 0}}, true);
+  const int b = add_part(p, {21 * MM, 15 * MM}, MM, MM, {{0, 0}}, false);
+  add_net(p, {{a, {0, 0}}, {b, {0, 0}}});
+  const RouteFn route = fake_router(p, 6 * MM);
+  const Placement start = Placement::initial(p);
+  const RouteEval e0 = route(start);
+  REQUIRE(e0.unrouted() == 1);
+  const std::string ra = p.parts[z(a)].ref;
+  // Seeds: a good one (next to b) is kept; a bad one (farther away) is routed but not kept.
+  const auto adv = parse_place_advice(R"({"version": 1, "seeds": [{"name": "far", "moves": [{"ref": ")" + ra + R"(", "at": [3, 15]}]},
+                                                                 {"name": "near", "moves": [{"ref": ")" + ra + R"(", "at": [17, 15]}]}]})", p);
+  std::vector<Candidate> seeds{{"input", start, {}, 0}};
+  for (const auto& s : adv.seeds) seeds.push_back(Candidate{"advice: " + s.name, apply_seed(start, s), {}, 0});
+  LoopOptions lo;
+  lo.rounds = 0;
+  const LoopResult r = routability_loop(p, seeds, lo, route);
+  CHECK(r.best.label == "advice: near");
+  CHECK(r.best.eval.unrouted() == 0);
+  CHECK(r.tried.size() == 3);
+  // ECO: the advised move is routed first and committed; a useless advised move alone commits nothing.
+  const auto good = parse_place_advice(R"({"version": 1, "eco": [{"ref": ")" + ra + R"(", "at": [17, 15]}]})", p);
+  EcoOptions eo;
+  eo.rounds = 1;
+  eo.candidates = 0;  // only the advice is routed
+  eo.advised = &good.eco;
+  const EcoResult er = eco_place(p, start, e0, eo, route);
+  CHECK(er.committed == 1);
+  CHECK(er.routes == 1);
+  CHECK(er.pl.pos[z(a)] == Point{17 * MM, 15 * MM});
+  REQUIRE(!er.moves.empty());
+  CHECK(er.moves[0].find("advice: ") == 0);
+  const auto bad = parse_place_advice(R"({"version": 1, "eco": [{"ref": ")" + ra + R"(", "at": [3, 15]}]})", p);
+  eo.advised = &bad.eco;
+  const EcoResult eb = eco_place(p, start, e0, eo, route);
+  CHECK(eb.committed == 0);
+  CHECK(eb.pl.pos == start.pos);
+  // An advised move onto the fixed part is not legal and is not routed.
+  const auto clash = parse_place_advice(R"({"version": 1, "eco": [{"ref": ")" + ra + R"(", "at": [21, 15]}]})", p);
+  eo.advised = &clash.eco;
+  CHECK(eco_place(p, start, e0, eo, route).routes == 0);
 }

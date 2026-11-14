@@ -26,6 +26,13 @@ What to do:
 - Board minimums should be the fab's limits, not tighter "just in case": they also floor every class.
 - `--pitch-um` overrides the automatic pitch; a coarser pitch is faster but can miss tight gaps.
 
+## Many net classes
+
+The router keeps an obstacle cache per set of class values (clearance, pair gaps, track width, via size), not per class name:
+fifty classes with the same values cost what one does. A custom rule whose condition names classes (`NetClass`,
+`hasNetclass`) keeps them apart again, one cache each. `--class-cache-mb` (default 2048 per variant) bounds the caches;
+past it the oldest are freed and computed again, which costs time and can change the result (a `note:` line says so).
+
 ## Custom rules: what keeps the caches
 
 TraceMaker reads the board's `.kicad_dru`. Whether a rule is cheap depends on its constraint and condition:
@@ -33,15 +40,17 @@ TraceMaker reads the board's `.kicad_dru`. Whether a rule is cheap depends on it
 | Rule | Router behaviour | Speed |
 |---|---|---|
 | `disallow track/via` with conditions on `NetName`, `NetClass`, `Type`, `Layer` | Enforced as per-net layer masks / via switches | Cached |
-| `disallow track/via` with `insideArea`, `intersectsArea`, `enclosedByArea`, courtyard functions, `memberOfFootprint`, `Reference`, `Pad_Type`, `Width`, `Size_X/Y`, `Position_X/Y` | Enforced on every new track and via with its real shape, width, position and via span | Cached; one rule check per lattice point the search visits |
-| `physical_hole_clearance` whose condition does not mention `NetName`, `NetClass` or `inDiffPair` | Enforced for every new via | Cached |
-| `physical_hole_clearance` that mentions a net or net class | Enforced | **Disables caches board-wide** |
+| `disallow track/via` with `insideArea`, `intersectsArea`, `enclosedByArea`, courtyard functions, `memberOfFootprint`, `Reference`, `Pad_Type`, `Pad_Number`, `Pin_Name`, `Width`, `Size_X/Y`, `Position_X/Y` | Enforced on every new track and via with its real shape, width, position and via span | Cached; one rule check per lattice point the search visits |
+| `physical_hole_clearance` whose condition does not mention `NetName`, `Net`, `NetClass` or `inDiffPair` | Enforced for every new via | Cached |
+| `physical_clearance` whose condition does not mention `NetName`, `Net`, `NetClass` or `inDiffPair` | Enforced for every new track and via against any item, same net included; left out only where a track meets copper of its own net (every connection does; a `warning:` line says so when a rule matches such a pair). A rule between a net's vias and its own tracks leaves that net without vias | Cached |
+| `hole_to_hole` or `edge_clearance` (any condition) | Kept at one board-wide value: the largest `hole_to_hole` round every new via's hole, the largest `edge_clearance` that can hold for a track or via for all new copper; a `warning:` line names a rule kept beyond its condition | Cached |
+| `physical_hole_clearance` or `physical_clearance` that mentions a net or net class | Enforced | **Disables caches board-wide** |
 | `clearance` (any condition), and any other constraint type | Enforced exactly | **Disables caches board-wide** |
 | `disallow hole/footprint/text` | Not checked by TraceMaker; KiCad DRC reports it | — |
 | Condition that does not parse, uses a property TraceMaker does not evaluate (`Parent.Reference`, ...) or has a single number without units | **Not applied by the router or `tracemaker drc`** (KiCad still applies it); named in a `warning:` line. Preflight grades it `block` | **Disables caches board-wide** |
 | Condition that calls a KiCad function TraceMaker does not evaluate (`memberOfGroup`, `hasNetclass`, `fromTo`, `getField`, `insideCourtyard`, ...) | **Kept, with that call taken as false**, so the rule misses whatever only the call selects and a `disallow` never fires through it (KiCad applies it in full); named in a `warning:` line. Preflight grades it `block` | As the rule's constraint |
 
-TraceMaker evaluates `NetClass`, `NetName`, `Type`, `Layer`, `L`, `Reference`, `Pad_Type`, `Width`, `Size_X`,
+TraceMaker evaluates `NetClass`, `NetName`, `Net` (the net code), `Type`, `Layer`, `L`, `Reference`, `Pad_Type`, `Pad_Number`, `Pin_Name`, `Width`, `Size_X`,
 `Size_Y`, `Position_X`, `Position_Y`, `isPlated()`, `existsOnLayer()`, `insideArea()`, `intersectsArea()`,
 `enclosedByArea()`, `inDiffPair()`, `memberOfFootprint()` and the three `intersects...Courtyard()` functions,
 as KiCad 10.0.3 does (checked against KiCad on a frozen corpus of rule cases). Front and back courtyards are

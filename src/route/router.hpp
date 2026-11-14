@@ -31,6 +31,7 @@ struct RouterOptions {
   double pitch_scale_small = 1.0;
   bool fine_variant = true;      // portfolio: the cheap-vias variant routes small boards at half pitch
   double pitch_scale = 1.0;      // auto pitch multiplier, applied only on large lattices (>= 3M points per layer)
+  double pitch_scale_all = 1.0;  // experiment (route --pitch-scale): multiplies the automatic pitch on every lattice, after the two above
   double time_limit_s = 120;    // wall-clock safety limit for the whole run
   // Portfolio with more variants than threads: successive halving (Jamieson and Talwalkar, AISTATS 2016) instead of
   // running only `threads` variants. Every variant runs on a small budget, the better half runs again on twice as
@@ -42,6 +43,21 @@ struct RouterOptions {
   // 8,285 / 8,309 / 8,381 / 8,371 / 8,363), but the 8-variant 120 s tiers did not confirm it (tier B 5,167 -> 5,161,
   // tier C 9,523 -> 9,512 and 63.3 % -> 60.0 % clean), so it stays 3M (doc 05 §13; --max-expansions to experiment).
   long max_expansions = 3'000'000;
+  // Via shove (D156, doc 05 §64): a boxed-in connection moves the nearest vias of other nets (and only the tracks ending at them) a little.
+  bool via_shove = false;
+  double via_shove_mm = 1.5;      // vias within this distance of the stuck connection's pads
+  int via_shove_vias = 6;         // at most this many vias, nearest first
+  double via_shove_step_mm = 0.15;  // ring spacing of the positions tried
+  int via_shove_rings = 6;        // rings of 16 positions
+  int via_shove_trials = 16;      // searches per stuck connection (one per via or pair lifted)
+  long via_shove_cap = 300'000;   // expansion limit of each attempt
+  double via_shove_share = 0.05;  // the shove stops once it has spent this share of the work budget
+  bool window_escalate = false;  // D156 (M22 item 3): a search whose last window's edge stopped it gets one whole-board window
+  bool escape_all = false;       // D156 (M22 item 6): the escape plan in every portfolio variant
+  double pin_via_pen_mm = 0;     // D156 (M22 item 6): > 0: a via in another net's dense-package pin fan-out region costs this much more (mm of track)
+  double pin_via_mm = 1.0;       // the fan-out region: this far past the pin's copper
+  bool pass_bound = false;       // D156: a negotiation pass routes only the connections queued at its start; what it rips waits for the next pass
+  long neg_strict_cap = 0;      // D156: > 0: expansion limit of the strict searches in negotiation passes (they retry first-pass failures before the negotiated search); 0 = max_expansions
   bool reach_verify = false;        // test only: run the A* even where the pre-check proved no path, count mismatches
   int reach_check = 1;              // flood-fill reachability check before strict searches (exact): 0 off, 1 likely failures, 2 all
   // Late reachability proof (doc 05 §62, D154): a strict search still open after this many expansions floods from both ends; when one
@@ -52,6 +68,8 @@ struct RouterOptions {
   bool tie_deep = false;            // A* ties on f go to the state with the larger g (the deeper one) instead of the lower state index
   bool bend_states = true;          // direction in the A* state (exact bend costs) vs. parent-direction approximation
   double heuristic_weight = 1.0;
+  double long_weight = 0;        // D156: > 1: negotiated searches of connections at least long_weight_mm long use this heuristic weight (weighted A*); 0 = off
+  double long_weight_mm = 100;
   // Plane-aware routing of all-SMD boards (doc 05 §26), all opt-in:
   bool soft_zones = false;          // zone fills do not block other nets (refilled afterwards); unused fills become plane targets
   bool via_in_pad = false;          // inner balls / enclosed SMD pads may take a minimum-size via in the pad
@@ -60,16 +78,40 @@ struct RouterOptions {
   bool field_heuristic = true;      // GPU cost-to-go field as the A* heuristic on large windows
   int field_min_cells = 60'000;     // window size (lattice points x layers) from which the field is used
   int gpu_device = 0;              // GPU backend device for fields (-1 = CPU reference)
+  long gpu_field_min_cells = 500'000;  // fields with fewer lattice cells (width x height x layers) are computed on the CPU (same result)
   int max_attempts = 4;         // per connection (window growth and learned blocks between attempts)
   int soft_attempts = 3;        // window sizes tried by negotiated searches
   double via_cost_mm = 3.0;     // equivalent track length of one via
   bool allow_vias = true;
+  bool via_retry = false;       // D153 (M22 item 5): a search that stopped at its expansion cap is searched again at once with cheap vias and its busiest layer dearer
   double polish_fraction = 0;   // share of the budget reserved for rebuilding the open connections of the best state (doc 16)
   int polish_trials = 20;       // seeded orders tried per open connection in the polish
   int lns_open_trials = 0;      // regional rebuild of open connections: seeded orders tried per open connection (0 = off, doc 16 F4)
   double lns_open_radius_mm = 2.5;  // copper within this distance of the open connection's first pad is lifted
+  // Proof-triggered pin rescue (D155, doc 05 §63): when a strict search proves a pin boxed in, the routed connections with copper
+  // within each radius in turn are lifted and the boxed connection routed first; lifted copper that still passes the exact check
+  // goes back unchanged, the rest is routed again in seeded orders. Runs in the end-game retry (and the main loop with rescue_in_loop).
+  std::vector<double> rescue_radii_mm;  // empty = off
+  int rescue_orders = 2;         // orders tried per radius (the first keeps the connection order)
+  int rescue_victims = 16;       // a radius that would lift more connections ends the rescue
+  long rescue_cap = 200'000;     // expansion cap of each search in a rescue
+  int rescue_per_conn = 1;       // rescues per connection per run
+  bool rescue_in_loop = false;   // also rescue in the main loop (lost on the failing set: work taken from routing, m22 records)
+  // End-game retry (D155): when the main loop ends, the open connections are tried again on the final board, with this share of the
+  // budget as an allowance of their own (work units with --work, else of the time limit).
+  double endgame_frac = 0;       // 0 = off
+  int plane_fallback_sources = 8;  // --plane-informed: other pads of the same fixed-copper group tried as the source of its plane join
+  double plane_fallback_mm = 10;  // --plane-informed: a pad that cannot reach its plane joins a pad of its net this near that is on the plane
+  bool plane_informed = false;   // pad-to-plane searches get a lower bound (distance to the plane's box) and the late reachability proof (D155)
+  long endgame_cap = 400'000;    // expansion cap of each end-game search
   double layer_dir_pen = -1;    // negative = automatic (-1: 0.3; otherwise the strength is the absolute value) on breakout boards only, else 0; extra cost (pitches per orthogonal step) against a layer's preferred direction: even layers horizontal, odd vertical (doc 16)
   bool layer_dir_swap = false;  // preferred directions the other way round: even layers vertical, odd horizontal
+  // Per-layer preferred directions by name (--layer-dir, issue #66, D174): route::LayerDir per copper index. Empty = the layer
+  // parity above; given, it replaces the parity (and layer_dir_swap), layers it leaves at none have no preferred direction, and a
+  // negative layer_dir_pen means that strength on any board (-1: 0.3), not only on breakout boards.
+  std::vector<std::int8_t> layer_dir;
+  // Pitches per 45-degree lattice step, per copper index (--layer-diag-pen, D174); empty or 0 = no penalty. Independent of layer_dir.
+  std::vector<double> layer_diag_pen;
   double package_pen = -1;      // -1 = automatic (3 on a two-layer board with a ball-grid package, else 0); pitches per lattice step for tracks on the pad layer inside a ball-grid package (doc 16 F3; 0 = off)
   // Strict searches from the crowded end (doc 05 §55, M20 C5): a strict search starts from the end with more routed copper of other nets
   // and more pads of other nets of its own part near it. A boxed-in source is proved in a few expansions; a boxed-in target only after the
@@ -89,6 +131,10 @@ struct RouterOptions {
   long txn_cap = 0;             // transactional negotiation: expansion cap of each victim's re-route search (0 = none)
   int txn_depth = 0;            // transactional negotiation: victims that cannot be re-routed strictly get a nested transaction of their own, this deep
   int txn_nested = 4;           // nested transactions allowed per top-level transaction
+  // Bound on the memory of the per-class fixed-obstacle caches (MB per router; 0 = none). Past it, the caches used longest
+  // ago are freed and computed again when needed (issue #54): slower, and the fields then know fewer codes, so the result may
+  // differ from an unbounded run; it is still deterministic.
+  double class_cache_mb = 2048;
   int field_cache_mb = 0;       // > 0: cost-to-go fields are kept (this many MB per router) and reused when every input is identical; results are unchanged
   int flood_work_pct = 100;     // reachability-flood cells count this percent of an expansion against the work budget (a flood cell costs far less time)
   int field_prefill = 0;        // 1: fill a class's fixed-copper cache for the whole board before its first field, so fields depend on nothing learned later (and can be cached)
@@ -98,6 +144,7 @@ struct RouterOptions {
   const std::vector<ConnRoute>* warm = nullptr;  // start from these routes (a previous result's conn_routes): they are kept, negotiation starts at once
   std::string state_out;        // portfolio: after every round the best routes so far are written here (atomically), so an interrupted or out-of-time run can be resumed
   std::string state_in;         // portfolio: start from the routes saved in this file (written by state_out); a missing file is ignored
+  const std::vector<ConnRoute>* start_routes = nullptr;  // portfolio: start from these routes as from state_in (the local relax rescue, doc 20 §2.2); state_in wins
   bool relax_late = false;      // with relax: plain rounds under the board's rules first; when they stall, start the stages afresh (not from the stalled state), and keep the best legal result of all
   bool relax = false;           // portfolio: relax, route, legalise: ramp stages at 60 % and 80 % of the board's clearance with legalisation and breathing between (D104); needs round_work (20 M by default)
   double ramp_from_mm = 0;      // portfolio: > 0 starts at this clearance (every class and the board minimum lowered by the difference) and raises it by ramp_step_mm per stage up to the board's own; each stage warm-starts from the last one's routes that are still legal (clearance continuation, doc 16 §12.3)
@@ -105,6 +152,8 @@ struct RouterOptions {
   int ramp_rounds = 2;          // a ramp stage ends after this many rounds in a row without gain over the best round of the stage (or when complete)
   int ramp_cycle = 0;           // > 0: when the final stage (the board's rules) has not improved for ramp_stall rounds, go back this many stages and climb again ("breathing"); the best result under the board's rules is returned
   bool ramp_late = false;       // start at the board's rules and use the ramp (with ramp_cycle) only once those stall
+  bool ramp_via_fixed = false;  // relaxed stages: a new via keeps the board's clearance to fixed copper only (doc 20 §2.6)
+  bool ramp_via_real = false;   // relaxed stages lower the clearance of tracks only: anything against a via keeps the board's clearance (doc 05 §67)
   int ramp_fresh = 0;           // > 0: every n-th breathing cycle starts from nothing instead of the best state (a new topology; the best result under the board's rules is kept)
   int ramp_stall = 3;           // rounds without improvement at the final stage before breathing
   int island_slack = -1;        // portfolio rounds: >= 0 lets every variant continue the next round from its own final state when that routes at least (best - island_slack) connections, instead of all from the best (islands; the best state ever seen is returned)
@@ -112,6 +161,7 @@ struct RouterOptions {
   std::vector<model::Track> warm_tracks;  // copper of a routed board (--warm-pcb) to start from: a net with one connection takes all of its tracks and vias; only what is legal under this board's rules is kept
   std::vector<model::Via> warm_vias;
   double legalize_subdivide_mm = 0;  // > 0 with legalize: route tracks are cut into pieces of at most this length so they can bend (route/legalize.hpp)
+  bool cut_prune = false;       // with legalize: first drop the routes the cut test proves cannot be legalised under these rules: vias with no room, enough wires through over-full pad-to-pad cuts (doc 05 §67)
   bool legalize = false;        // warm start: first move the vertices of the taken-over routes until the board's clearances hold (route/legalize.hpp), then keep what is legal
   bool state_recheck = false;   // warm start: take over only the routes that are legal under this board's rules (continuation from looser rules)
   int breakout_portfolio = 1;   // 1: with more than one variant, a board that looks like a ball-grid breakout gets the breakout portfolio (D101) instead of the designed eight
@@ -137,6 +187,10 @@ struct RouterOptions {
   // gives a laser via no current rating, so rails take through vias (plan §1.2; --no-stack-classes).
   std::vector<std::string> no_stack_classes;
   bool diff_pairs = false;      // route P/N pairs together as coupled tracks first (falls back to single routing)
+  // Coupled pair searches stop once they have spent this share of the budget (the work budget, else the time limit; 0 = no limit):
+  // the pairs left over are routed as single connections (issue #53: the pair phase took a whole 300 s run and the board's other
+  // 1,000 connections were never tried).
+  double pair_share = 0;
   // Component rules (doc 15 P3): these net pairs only are routed coupled first when diff_pairs is off (e.g. USB 2.0
   // D+/D- bound by tm::crules, whose names need not end in P/N or +/-). Empty = none.
   std::vector<std::pair<model::NetId, model::NetId>> pair_nets;
@@ -146,6 +200,22 @@ struct RouterOptions {
   // pin order is mirrored between its ends can still be routed coupled (doc 05 §24).
   bool pair_twists = true;
   Coord pair_skew = 0;
+  // Coupled pairs (issue #67, D175; design by quanln). Longest reach of a pair's uncoupled legs: the coupled section
+  // starts and ends within this distance of the pad midpoints (the old fixed 2.5 mm by default).
+  Coord pair_leg_max = 2'500'000;
+  // Negotiation never rips a half of a coupled pair (a ripped half takes its partner with it, and the pair is often
+  // not coupled again): the route that would rip it fails instead, as one that would rip a bus does.
+  bool protect_coupled = false;
+  // Work units the clean-up re-coupling of split pairs may spend past the search budget (0 = none: it runs only on
+  // budget left over, as before D175). Under a time limit the allowance is converted to time at the run's own work
+  // rate. Used only when pairs are routed; on the 20 pair boards of doc 05 §77 it coupled two more pairs and changed
+  // nothing else.
+  long recouple_work = 2'000'000;
+  // Pair legs may also leave a pad straight out along one of 8 directions before turning towards the coupled
+  // section, for end pads whose neighbours block every direct leg (issue #67 cause 3).
+  bool pair_pad_exits = false;
+  // A pair that finds no coupled path is tried once more with legs of up to this reach and pad exits (0 = no retry).
+  Coord pair_retry_leg = 0;
   // Per-pair limits for RouterOptions::pair_nets (same index; 0 or missing = pair_skew): component rules give each
   // interface its own limit (USB 2.0 1.27 mm, doc 15 USB2-02).
   std::vector<Coord> pair_net_skew;
@@ -168,6 +238,9 @@ struct RouterOptions {
   bool escape_plan = false;     // reserve escape corridors for the pins of dense packages (route/escape.hpp, M9)
   // Corridors of the review of the EtherCAT shield (reports/realworld/ethercat_qfn_analysis.md, doc 05 §47). All off by default: no change without them.
   double escape_length_mm = 0;  // > 0: perimeter corridors run this far past the package edge (2 mm by default), as far as no fixed copper is in the way (bundles of parallel straight escapes)
+  double fanout_heads_mm = 0;   // D157 (M22 item 8): > 0: before routing, each perimeter pin of a dense four-sided package gets the first part of its route as the designer lays it (straight, or in staggered 45-degree bundles toward its destination, side by side), this far past the package (route/fanout_heads.hpp). They are fixed copper of the pin's net while the board is routed and are not written out
+  int fanout_heads_min_pins = 24;  // perimeter pins a package needs for heads
+  bool fanout_hold = false;     // D156: with the escape plan, each open pin's straight corridor (as --escape-stubs offers it) is held by a placeholder track of its net through the strict first pass, so no other net's track or via takes it before the pin is routed; dropped when the pin is routed and before negotiation
   bool escape_stubs = false;    // with the escape plan: a pin offers the end of its (long, straight) corridor as a start point, reached by one exact off-lattice segment at a discount: parallel escapes at the pad pitch, which the lattice cannot draw
   bool soft_mask_graphics = false;  // net-less solder-mask openings drawn as footprint graphics (solder jumpers, MEMS microphones) do not keep tracks and vias out; KiCad flags what lies in them
   bool soft_copper_graphics = false;  // board copper graphics (polygons on a copper layer) take the net of the pads, tracks and vias of the one net they touch (a manual pour), so that net's pins inside are not enclosed and no other net may touch them
@@ -176,6 +249,7 @@ struct RouterOptions {
   int bundle_min_lanes = 3;     // fewer connections than this in a group are left to the ordinary router
   bool package_tunnels = false; // doc 05 §52: a connection between two perimeter pins of one dense package on one net gets a stub and a via at each pin and its run between them on the other layer (the core rail's tunnel under the package), placed before the search
   bool supply_first = false;    // doc 05 §51: nets with 2+ perimeter pins on one dense package (supply and core nets: +3V3, a core rail) and no pour are routed before everything else and may not be ripped (as --first-nets); the bundles of --bundle-escape are still placed first (placing them after the supply nets was worse: 20 against 13 unrouted on the EtherCAT shield)
+  double escape_via_keep_mm = 0;  // D156: with the escape plan, no other net's via where its copper would cover an open pin's corridor, this far past the pad edge (0 = off)
   bool escape_persist = false;  // a ripped-up connection gets its pins' corridors back; a corridor is kept while the net has other open connections at that package
   bool radial_supply = false;   // spanning tree: no edge between two pins of one dense package for a net with 3+ pins there (each pin goes to a capacitor or via; the trunk forms outside the escape band)
   double radial_penalty_mm = 10;  // what such an edge costs in the spanning tree
@@ -289,6 +363,7 @@ struct RouterOptions {
     }
   } advice;
   events::Sink* sink = nullptr;
+  std::string live_name;  // this router's row on the live page (core/live.hpp); empty: "router"
   // Shared by portfolio variants (wall-clock mode only): when one variant has routed everything at time T, the
   // others may continue until 2T + 5 s; a variant that is complete always finishes its clean-up.
   std::atomic<double>* deadline = nullptr;
@@ -340,14 +415,20 @@ struct RouteResult {
   int enclosed = 0;             // searches that proved the source boxed in (no larger window tried)
   long late_proofs = 0;         // late reachability proofs run (RouterOptions::reach_after, D154)
   long nogood_skips = 0;        // attempts skipped because an identical attempt already failed
+  int via_retried = 0;          // connections routed by the via retry (D153)
   int necked = 0;               // connections routed at the neck-down width
   int restarts = 0;
   int lns_fixed = 0;            // open connections closed by the regional rebuild (doc 16 F4)
   int lns_last_gain_sweep = -1;  // completion LNS (--lns-complete): the last sweep that gained a connection
+  int rescue_tried = 0, rescued = 0;  // pin rescues (D155): radii tried, and connections routed by one
+  int plane_fallbacks = 0;      // pad-to-plane connections re-planned to a nearby pad already on the plane (D155)
+  int endgame_tried = 0, endgame_fixed = 0;  // end-game retry (D155): connections tried, and routed
   int tidied = 0;               // connections shortened by tidy sweeps
   int txn_tried = 0, txn_kept = 0;  // transactional negotiation: routes with victims tried, and kept
   int optimized = 0;
   int pairs = 0;
+  int pairs_over_share = 0;     // pair attempts skipped because the pair searches had spent RouterOptions::pair_share of the budget
+  int pair_retried = 0;  // pairs coupled by the wider retry (RouterOptions::pair_retry_leg)
   int length_tuned = 0;
   // Buses: connections routed as a lane of their group (leaders and the members that followed one), and connections
   // of a group routed otherwise ("left the bus"), in the state returned.
@@ -360,7 +441,12 @@ struct RouteResult {
   int stacked_vias = 0;         // stacked (or staggered) laser vias in the state returned, each two micro vias
   double escape_corridor_mm = 0;   // total length of the corridors reserved (centrelines, version 1)
   int package_pin_edges = 0;       // spanning-tree edges between two pins of one dense package, for nets with 3+ pins there (--radial-supply makes them rarer)
+  int window_escalations = 0;      // --window-escalate: whole-board windows given to searches that hit their window's edge
+  int via_shoves = 0;              // --via-shove: stuck connections routed after moving another net's via
+  int via_shove_trials = 0;        // routing attempts after a via move
   int escape_reclaimed = 0;        // --escape-persist: corridors given back to the pins of a ripped-up connection
+  int fanout_heads = 0;            // --fanout-heads: pins given a head before routing
+  int fanout_holds = 0;            // --fanout-hold: placeholder tracks laid along open pins' corridors before the strict pass (all strict passes)
   int escape_corridors = 0;     // escape corridors reserved (M9)          // nets brought into their custom length range by meanders                // differential pairs routed coupled            // connections improved by the clean-up pass
   // With escape_report: per ring of the deep arrays (index 0 = perimeter), {pins to route, pins with every
   // connection routed}.
@@ -385,6 +471,8 @@ struct RouteResult {
   };
   std::vector<Unrouted> unrouted;
   bool time_limited = false;  // the wall-clock limit (--time), not the work budget, ended a search: the result depends on machine speed
+  long cache_evictions = 0;   // obstacle caches freed to stay under RouterOptions::class_cache_mb
+  int obstacle_caches = 0;    // fixed-obstacle caches the router made (one per set of class values, track width and via size)
 };
 
 // The reason code of a failure explanation (RouteResult::Unrouted::reason). The text is matched, not parsed: the
@@ -404,7 +492,10 @@ struct PortfolioResult {
   std::vector<std::string> variants;   // description per variant
   std::vector<int> routed;             // routed count per variant
   std::vector<double> seconds;         // wall time per variant (its own clock)
-  std::vector<WorkProfile> work;       // work profile per variant
+  std::vector<WorkProfile> work;       // work profile per variant, over every round
+  // Clearance ramp (relax): per relaxed stage that ran, how much the clearance was lowered and the most connections a round of it
+  // routed (under the lowered clearance, so not legal yet).
+  std::vector<std::pair<Coord, int>> ramp_stages;
 };
 // `variants`: how many variants to run (the first `variants` of the portfolio); `pick`: which variant indices to
 // run instead (non-empty: overrides `variants`). `threads`: concurrency only (0 = one thread per variant).

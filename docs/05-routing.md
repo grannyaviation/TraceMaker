@@ -134,7 +134,7 @@ them (KiCad 8+ generates teardrops itself; TraceMaker leaves them to KiCad by de
 
 | Phase | Rules |
 |---|---|
-| 1 | Clearance (all object pairs incl. copper text/graphics), track width, via size/drill/annular ring, hole-to-hole, hole clearance, edge clearance, keepouts and rule areas, net-class rules, `.kicad_dru` clearance/width conditions on net class, layer and area; `disallow` and `physical_hole_clearance` (§27) |
+| 1 | Clearance (all object pairs incl. copper text/graphics), track width, via size/drill/annular ring, hole-to-hole, hole clearance, edge clearance, keepouts and rule areas, net-class rules, `.kicad_dru` clearance/width conditions on net class, layer and area; `disallow`, `physical_hole_clearance` and `physical_clearance` (§27) |
 | 2 | Zone connections (thermal reliefs to planes), solder-mask bridge awareness, blind/buried/micro vias |
 | 3 | Differential pairs (coupled routing as a single "pair" object in search: §15), length and skew targets (meander tuning in cleanup), max uncoupled length (`diff_pair_uncoupled`) |
 
@@ -346,10 +346,10 @@ named otherwise, e.g. USB DP/DM from `--component-rules soft`; D50).
 |---|---|
 | Pair rule (`route/diff_pair.cpp`, `pair_rule`) | Width and gap, highest source first: a custom rule's `diff_pair_gap` (opt, else min); the net class's diff-pair width, gap and via gap when the project sets them; else the class width and the clearance KiCad requires between the halves (relaxed to the class diff-pair gap only for pairs KiCad recognises by name, as its DRC does). Never below the board minimums. `diff_pair_uncoupled` (max) limits the legs. Offsets carry a 1 µm rounding margin per side, so the gap comes out 2 µm wide of the rule. Coupled vias sit side by side at the via gap (and the mask web of untented vias) |
 | Coupled search (`route_pair`) | A* over (layer, lattice point, direction, which half is on the left). Moves: one straight lattice step; a 45° turn followed by K straight steps, K·pitch ≥ 2·offset·tan 22.5° + width so the inner track's miter never folds back; a coupled via pair (both halves jog out at 45° to the via spacing, change layer side by side, jog back; MV steps). Each move is checked exactly (`segment_state`, `via_state` against fixed and routed copper) on both offset tracks, so the coupled section keeps its gap by construction. Cost: length + K·pitch per turn + two vias; heuristic 2 × straight-line distance to the end pads plus a via pair while off the end pads' layers (weighted: legal, not optimal). Budget 600 states per lattice step of the pair's length (40 k–250 k). Work is the states closed plus every exact leg check of a start or goal candidate, legal or not, charged to the router's total every 64 steps, when the work budget and the time limit are also checked, so an attempt whose candidates all fail ends on either (§30, D77) |
-| Breakout and fan-in | Start candidates: every lattice point within R of the start pads' midpoint (0.3 × the pair's length, at least 1.5 × the pads' distance, 0.6–2.5 mm), 8 directions, sides by the shorter legs. Legs: straight, the two octilinear dog-legs, or the same to a point behind the end of the coupled section followed by a straight entry; at the pair width, then the neck-down width; checked exactly, against each other and against the other half's first straight run, when the A* pops the candidate. The pads must lie behind the start (ahead of the end), so legs never double back along the pair. Legs cost twice the coupled length, so coupling starts as close to the pads as the board allows. Goal candidates near the end pads wait in their own queue and are checked at least every 16 expansions; the first legal one is taken |
+| Breakout and fan-in | Start candidates: every lattice point within R of the start pads' midpoint (0.3 × the pair's length, at least 1.5 × the pads' distance, 0.6–2.5 mm; `--pair-leg-mm`, `--pair-retry-leg-mm` and `--pair-pad-exits`, §77), 8 directions, sides by the shorter legs. Legs: straight, the two octilinear dog-legs, or the same to a point behind the end of the coupled section followed by a straight entry; at the pair width, then the neck-down width; checked exactly, against each other and against the other half's first straight run, when the A* pops the candidate. The pads must lie behind the start (ahead of the end), so legs never double back along the pair. Legs cost twice the coupled length, so coupling starts as close to the pads as the board allows. Goal candidates near the end pads wait in their own queue and are checked at least every 16 expansions; the first legal one is taken |
 | Commit | Both halves are built from corners only (a node's own offset point would fold an inner miter back), collinear runs merged, checked against each other geometrically, then exactly: each half against the board, the first committed, the second checked against it too, otherwise the first is taken back. Up to four finished candidates per search |
 | Enclosed pins | A pin of another net between the two pins of an end (the ground pin between P and N on HDMI parts) is tested with a short strict search before and after the pair; a pair that boxes in a pin that could escape before is taken back |
-| Negotiation and clean-up | A coupled half ripped by negotiation takes its partner with it, and the pair is tried coupled again (twice at most) before single routing. In the clean-up, pairs that ended up routed singly are lifted and routed coupled; on failure their old copper is restored exactly, so completion is unchanged. Via optimisation, smoothing and LNS leave coupled connections alone |
+| Negotiation and clean-up | A coupled half ripped by negotiation takes its partner with it, and the pair is tried coupled again (twice at most) before single routing. In the clean-up, pairs that ended up routed singly are lifted and routed coupled; on failure their old copper is restored exactly, so completion is unchanged. Via optimisation, smoothing and LNS leave coupled connections alone (`--protect-coupled` keeps negotiation off coupled halves; the re-coupling has an allowance past the budget, `--recouple-work`, §77) |
 | Skew | `--pair-skew-mm X` (or a KiCad custom `skew` rule) meanders the shorter half in the clean-up with the length-tuning code until the halves differ by at most X/2 (meanders go to the free side) |
 | Measurement | `tracemaker pairs <board> [--pair A,B] [--json]`: per pair the track length, the coupled share (20 µm samples beside a parallel track of the other half on the same layer within gap + max(gap/4, 50 µm)), the gap kept (median, minimum), skew and vias. `tracemaker route` prints the same for the pairs it routed; `bench/pair_eval.py` routes boards off/on at a fixed budget and judges both with KiCad |
 
@@ -678,6 +678,13 @@ eight variants does not make up for that. With eight or more threads there is no
 resumable runs to pay; kept off (D59). The knowledge base's variant choice (doc 06 T3) remains the way fewer
 threads pick their variants.
 
+Halving does not combine with the options that continue from earlier routes, since every rung starts from nothing: rounds
+(`--relax`, `--rounds`, `--round-work`, `--ramp-from`, `--island-slack`) and a warm start (`--state-in`, the relax rescue's
+warm pass, §71). With any of them all the variants run the rounds and halving is off, and stderr says so (D166). Before,
+halving returned before the rounds were set up, so `--relax` was ignored without a word (issue #63). So was the rescue, which ran
+as a second plain halving run. The portfolio's own four rounds on breakout boards are a default, not an option asked for, and
+halving still replaces them.
+
 ## 23. Escape planning: what is left of M9 (2026-10-06)
 
 Two items of §12 and §14 stay unbuilt, and M9's gate is not met.
@@ -813,17 +820,20 @@ pad's own layer.
 |---|---|---|
 | `disallow track` by net, net class, type or layer, including `inDiffPair` | `RuleEngine::track_allowed` supplies per-net layer masks for pad cells, escapes, planar moves, via landings, diff-pair legs, escape corridors and fields. Through vias may pass through disallowed track layers. | `items_not_allowed`, once per item |
 | `disallow via`, `through_via`, `micro_via`, `buried_via` or `blind_via` with those conditions | `via_allowed(net, type)` is a per-net switch for each via type. `via` or `through_via` matching a through via on any layer leaves the net without vias of any type (blind, buried and micro vias are only tried where a through via is blocked). Blind/buried router probes have no span yet, so either keyword conservatively stops both; `micro_via` alone stops micro vias. | `items_not_allowed`; `blind_via` has exactly one outer span endpoint, `buried_via` none, micro remains separate (D80). |
-| Positional, footprint or pad-dependent `disallow` (`insideArea`, `intersectsArea`, `enclosedByArea`, courtyard functions, `memberOfFootprint`, `Reference`, `Pad_Type`, `Width`, `Size_X/Y`, `Position_X/Y`) | Applied to every new track and via with its actual shape, width, position and span, in the exact checks before commit, escapes, pair legs and clean-up, and in the search's lattice tests (§34, D82). Not warned. | Nanometre-valued properties and comparisons; intersection/enclosure of copper, common area layers and physical front/back courtyard polygons (§33, D80). |
+| Positional, footprint or pad-dependent `disallow` (`insideArea`, `intersectsArea`, `enclosedByArea`, courtyard functions, `memberOfFootprint`, `Reference`, `Pad_Type`, `Pad_Number`, `Pin_Name`, `Width`, `Size_X/Y`, `Position_X/Y`) | Applied to every new track and via with its actual shape, width, position and span, in the exact checks before commit, escapes, pair legs and clean-up, and in the search's lattice tests (§34, D82). Not warned. | Nanometre-valued properties and comparisons; intersection/enclosure of copper, common area layers and physical front/back courtyard polygons (§33, D80). |
 | Rules whose condition does not parse, uses an unknown property/function anywhere, or contains a single numeric literal without units | Not applied; warned by name. | Not reported, including an unknown symbol in a short-circuited branch. `Parent.Reference` is not an alias (D80). |
 | Rules that use a KiCad function TraceMaker does not evaluate (`hasNetclass`, `hasComponentClass`, `fromTo`, `isMicroVia`, `isBlindBuriedVia`, `isBlindVia`, `isBuriedVia`, `isCoupledDiffPair`, `getField`, `memberOf`, `memberOfGroup`, `memberOfSheet`, `memberOfSheetOrChildren`, `insideCourtyard`, `insideFrontCourtyard`, `insideBackCourtyard`) | Kept, because KiCad applies them; warned by name. The call is taken as false, so the rule holds where the rest of its condition decides: `A.NetName == 'X' \|\| A.hasNetclass('Y')` still applies to X. | The same; a `disallow` whose evaluation reached the call is not reported (D80). |
 | Matching `disallow` with `(severity ignore)` | Later matching rules for the same item type win, including ignore exceptions. | Ignore clears that item type's selected violation; different disallow types accumulate (D80). |
 | Item `A.Layer` versus `(layer ...)` / `existsOnLayer` | Static track/via gates retain the same distinction. | Own track layer; pads use footprint side, including PTH; vias have no layer property. A zone uses its source layer, not a fill projection; a multilayer zone has an unset layer ID (`==` false, `!=` true). Layer selectors and membership still examine occupied copper layers (D80). |
 | `disallow hole / footprint / text` | Not applied; warned by name. | Left to KiCad |
 | `physical_hole_clearance` | Between a hole and any other item's copper, whatever the nets, as KiCad reports it. `Obstacles::physical_copper_state` tests new tracks and via pads against the holes of pads and vias; `physical_hole_state` tests a new via's hole against copper; both against fixed and routed items, in the exact check before commit and in the search's cached and routed checks. A net whose vias the rule sets against its own tracks (an unconditional rule does) gets no vias: the tracks that end in a via touch its hole. For the same reason a track cannot end on a plated pad of its own net under such a rule. | `hole_clearance`, once per hole and item, any net |
+| `physical_clearance` (D167, issue #64) | Between any two copper items, whatever the nets: KiCad's provider has no net test, so a via in a pad of its own net breaks `A.Type == 'Via' && B.Type == 'Pad'`. `Obstacles::physical_state` tests new tracks and vias against fixed and routed copper in the exact check before commit and the routed checks; `physical_codes` gives the per-class caches a pad's net (a track of that net may touch it) or a block. A pair with a track of one net is left out, because a track meets its net's copper wherever it connects; a rule that matches such a pair is named in a warning, and KiCad reports each contact. A net whose vias the rule sets against its own tracks gets no vias, as above. Zone fills do not keep it (the refill warns). | `clearance` with the rule's name, once per pair (an item against a zone fill once per zone and layer), any net, severity from the rule; a later matching rule with `(severity ignore)` turns it off |
+| Custom `hole_to_hole` (D168, issue #52) | `RuleEngine::router_hole_to_hole`: the board minimum raised to every applied rule's minimum, kept between a new via's hole and every other hole (exact check, cached via codes, routed vias, pair via offsets, legaliser). A rule with a condition or a layer is kept everywhere, as D140 keeps `hole_clearance`, and warned by name: `A.Net != B.Net` at 0.5 mm also spaces a net's own vias 0.5 mm apart. | Exact, per pair of holes, with `Net` evaluated |
+| Custom `edge_clearance` (D168, issue #52) | `RuleEngine::router_edge_clearance`: the board minimum raised to every applied rule that can hold for a new track or via (each net's track and via asked on each layer; a positional condition is assumed to hold), kept for all new copper and against non-plated holes. A rule for zones or pads only leaves it alone; one that misses some tracks or vias, or has a layer, is warned by name. | Exact, per item |
 | Keepout rule areas | Tracks and vias use their respective keepout flags (§26, D65). | Unchanged |
 
-Disallow masks retain the per-class cache. Physical-hole rules do too when independent of `NetName`, `NetClass`
-and `inDiffPair`, and clearance rules when independent of `NetName` and `inDiffPair` (cached via codes probe a via, so
+Disallow masks retain the per-class cache. Physical-hole and physical clearance rules do too when independent of `NetName`, `Net`, `NetClass`
+and `inDiffPair`, and clearance rules when independent of `NetName`, `Net` and `inDiffPair` (cached via codes probe a via, so
 `Type`, `Width` and position conditions agree with the exact check). Other constraints are not read per point, and
 rules that cannot be read are not applied, so neither needs exact checks (D139).
 
@@ -1099,6 +1109,8 @@ were not distinguished.
 | `insideArea` aliases intersection; common copper layers required; enclosure checks all rounded copper against actual contours, including holes and concavity | `area_insideArea`, `area_enclosedByArea`, `area_concave_*`, `area_hole_*` |
 | Front and back courtyards are the footprint's own sides (`GetCourtyard(fp->IsFlipped() ? B_Cu : F_Cu)`): a flipped footprint's front courtyard is its B.CrtYd outline; the item's copper side does not matter. Footprint selectors are reference wildcards, or library-id wildcards when they contain `:` (courtyard functions and `memberOfFootprint`); closed lines/arcs/rectangles/circles/polygons, no interior for an open outline | `court_intersectsBackCourtyard`, `court_flipped_*`, `court_lib_id`, `membership_lib_id`, `court_line_*`, `court_arc_*`, `court_unclosed_*`; direct geometry tests cover circles, polygons and wildcards |
 | Absolute transformed pad/via anchors; tracks/arcs have undefined positions (`==`/`!=` both false, relational zero-coercion) | `position_x`, `position_anchor_shifted_pad`, `position_anchor_rotated_pad`, `position_anchor_x_ne_zero`, `position_anchor_x_lt_one` |
+| `Net` is the net code, a number: `A.Net != B.Net` compares two items' nets; `A.Net == 2` alone is one unitless literal and drops the condition, `A.Net == 2 \|\| A.Net == 99` compares codes (issue #52, KiCad 10.0.6). TraceMaker numbers nets in file order; KiCad 10 files name nets without codes, so a literal code may select another net than in KiCad | `net_code`, `net_code_lone`, `net_code_zero`, `net_ne_hole_to_hole`, `net_eq_hole_to_hole` |
+| `Pad_Number` and `Pin_Name` are pad strings (case-insensitive, wildcards), undefined on other items; NPTH pads have an empty number, so `!= '2'` selects them and `== '1'` does not (issue #65, KiCad 10.0.6) | `pad_number`, `pad_number_other`, `pad_number_ne`, `pin_name`, `pin_name_wildcard`, `pin_name_ne` |
 | Blind via spans touch exactly one outer layer; buried spans none; micro vias remain separate | `subtype_blind_via`, `subtype_buried_via`, `subtype_micro_via` |
 
 The rejection of `um`, `cm`, `mils`, `inch`, `thou` and uppercase suffixes, and non-conversion of quoted
@@ -1563,7 +1575,8 @@ obstacle model (`route::Obstacles`, the check the router commits with), touch on
 transactions (rule 4): the job counts unconnected items per net with and without the pass's result (after an
 in-engine refill when fills are soft or vias were added) and drops the result if any net has more than before
 (per net, so that a connection made in one net cannot hide one broken in another). Without the options the routed
-board is byte-identical to before.
+board is byte-identical to before. On a board with `length` or `skew` rules, these passes and the soft-zone repairs are
+also dropped when a net ends further outside such a rule than without them (§74, D173).
 
 ### 39.1 Power track widening (`--widen-power`)
 
@@ -1891,6 +1904,7 @@ hidden options are.
   vertical) cost P pitches; diagonals are free. Automatic (P = 0.3, with `--package-pen 3`) on a breakout board: two copper layers and at least 70 %
   of the connections with an end on a ball-grid-like package (at least 30 same-layer SMD pads on at least 5 × 5 distinct positions, 40 % of the grid filled). Negative values mean "automatic at that strength" (the seeded
   portfolio variants use −0.3, −0.6, −1.01). Elsewhere the penalties cost completion (quick 89.2 → 86.8 %), so they stay off.
+  Directions by layer name and a penalty for 45-degree steps: `--layer-dir`, `--layer-diag-pen` (§73, D174).
 - **Portfolio extras** (variants 9 and up) now vary the direction strength {0.3, 0.6, 1.0} and swap the directions on every fifth.
 - **More hidden options, measured and not useful:** `--polish F` (reserve a budget share for rebuilding the open connections of the best state),
   `--layer-assign-angle`, `--heuristic-weight` above 1 (weighted A*: 4 % clean at 1.5), `--lns-open`.
@@ -1931,6 +1945,7 @@ A homotopy on the design rules. `--ramp-from C0 --ramp-step S` (portfolio with `
 
 - `--warm-pcb FILE` starts from the tracks and vias of a routed board (nets with one connection take all of theirs); `--legalize` legalises every warm start (also `--state-in` and the ramp's stage hand-over); `--relax` = `--ramp-from 0.6 c --ramp-step 0.2 c --ramp-rounds 3 --ramp-cycle 2 --ramp-stall 2 --legalize` with `--round-work 20000000 --rounds 200` unless given: stage 1 routes under 60 % of the clearance, the solution is legalised to 80 %, routed again for what is missing, legalised to 100 %, and when the real rules stall for two rounds the run goes back two stages and climbs again, returning the best result under the real rules.
 - Vertices end off the lattice and off 45° multiples; track lengths grow by the small moves (at most 0.3 mm). Zones, keep-outs, mounting holes and custom `.kicad_dru` clearances are not constraints of the legaliser; they are caught by the exact check that follows, which drops the routes involved. A projection step is a heuristic: it can leave pairs too close (3-9 on the hard boards), never an illegal result.
+- Pads are what they are (D159, §67): a pad at an angle that is not a multiple of 90° is a rotated rectangle, an oval or a rounded rectangle is a rectangle grown by its corner radius. Until D159 they were the bounding boxes of sharp rectangles, which made up most of the "pairs too close" on boards with such pads and cost a third of the relaxed routes at each hand-over.
 - Prototype with a linear-programming step (sequential LP with a trust region, HiGHS, minimum total movement, scratchpad only) on the six stuck boards: 071, 039, 104 legal in one or two iterations, 103/048/072 with 3/6/11 pairs left; projection: 071, 104 legal, 039/103/048/072 with 2/5/4/9 left. Both turn a 0.06 mm solution (about 800-1000 pairs too close at 0.10 mm) into one with a handful left.
 
 ## 42. Reference-return audit of high-speed nets (issue #7, 2026-10-14, D114)
@@ -2807,6 +2822,8 @@ the step. Test: `delay_room` (it skips without `build/demos`).
 
 **Open.** mm length windows, mm pair skew and the bus tuner do not make room yet.
 
+The tuned copper is now also what the run writes (§74, D173, issue #60).
+
 
 ## 62. Search speed: late reachability proofs and output-preserving speed-ups (2026-10-29, D154)
 
@@ -2884,3 +2901,808 @@ comparison prints `Gates: FAIL` for both runs alike: KiCad's DRC list is capped 
   (output identical).
 - *Open list as a vector with a heap of structs* (needed to re-key it): 4–8 % slower on sbc and logicbone than
   `std::priority_queue` of pairs; the open list stays a `priority_queue` whose container is reached for the re-key.
+
+## 63. Finishing the last connections: end-game retry, pin rescue, plane fallback (2026-10-29, D155)
+
+Items 1, 2 and part of 4 of the M22 plan (doc 18 §18). All of it is off by default, and with it off the output is byte-identical to
+0.12.1 (the 30 `quick` boards at 1 M work, every routed `.kicad_pcb` compared). Records in `bench/records/m22-endgame`.
+
+**What was built.**
+
+- *End-game retry* (`--endgame F`, `--endgame-cap N`): when the main loop ends with connections open, the board is put back to its
+  best state (only the connections whose copper differs are lifted) and the router gets F of the budget more. Each open connection
+  that is not proved dead goes once more, shortest first, as a plain search capped at N expansions, then a pin rescue if it is boxed
+  in, then the plane fallback. The result is kept only from the best state, so the clean-up stages still run.
+- *Pin rescue* (`--rescue 2,4,8`, `--rescue-orders`, `--rescue-victims`, `--rescue-cap`, `--rescue-per-conn`, `--rescue-in-loop`):
+  for a connection proved boxed in, the routed connections with copper within r of either end are lifted (none that are coupled,
+  bus lanes, bundle lanes, first nets or bus nets for a plain net; a radius that would lift more than `--rescue-victims` ends it).
+  The boxed connection is routed first. Each lifted connection whose old copper still passes the exact check gets it back unchanged;
+  the others are routed again in seeded orders. It is kept only when all of them route; else everything is put back exactly. On failure
+  the radius widens: this is the user's "widen and randomise the last traces", applied to what is ripped, not to the search's costs.
+  By default it runs only inside the end-game; `--rescue-in-loop` also runs it in the main loop.
+- *Informed pad-to-plane searches* (`--plane-informed`, `--plane-fallback-mm`): the A* to a zone uses the octile distance to the
+  zone's box as its bound and may run the late reachability proof (§62) forward to the zone. When the search fails, the connection
+  is planned from a nearby pad already joined to the plane, from another pad of the same group, or to another fill of the net.
+
+**Measured.** The ten failing boards of the M22 study, 8 variants, 20 M work, routed connections (total of the ten):
+
+| Arm | Routed | Against the base |
+|---|--:|--:|
+| base, 20 M | 7,175 | |
+| pin rescue in the main loop (`--rescue 2,4,8 --rescue-in-loop`, first version: all victims re-routed) | 7,049 | −126 (Aleste −81, poncho −32) |
+| end-game 0.1 (first version: ran only when the loop ended in its best state) | 7,178 | +3 |
+| end-game 0.1 with rescue (same) | 7,180 | +5 |
+| end-game 0.1, from the best state | 7,179 | +4 |
+| end-game 0.1 with rescue, from the best state, old copper kept where it fits | 7,185 | +10 (poncho +4, MonApollo +4) |
+| **base, 22 M: the same budget as the end-game arms** | **7,193** | **+18** (Aleste +11, LeeChee +4, MonApollo +3) |
+
+One variant, 10 M work: teensy-fx 167 (base), 167 (end-game), 167 (with rescue), 170 (11 M); poncho 281, 285, 284, 282. The end-game
+tries few connections (2 to 11 per run), and most fail. The ones left open at 20 M work are not the ones that "route alone on the final
+board" in the study. Those came from 120 s runs that ran out of time before the first pass was over; at a fixed work budget the main
+loop already routes them. In the main loop the rescue lost because its work came from routing. In the end-game it routes something (poncho:
+2 of 5), but less than the same work spent on routing.
+
+**Status.** Kept as options, off. At the same budget, more plain routing beats every arm here, which agrees with the study's warning that
+moving budget to repair had lost before (doc 16 §11, `--polish`). The plane fallback rescued one of the PoE switch's five open plane
+connections (C123.2 through C118.2's pad); it has not been measured on PCBench.
+
+## 64. The last connections, developed on one board: via shove, fan-out hold, negotiation bounds (2026-10-30, D156)
+
+M22 developed on one board, as the user asked: `mini_mass_prog_bench_prog_rig` (995 connections, 986 routed in every earlier arm).
+Each change was tried there alone, and the other failing boards were run only at the end. Everything is off by default, and with it
+off the output is byte-identical (the 30 `quick` boards). Records in `bench/records/m22-oneboard`.
+
+**What the board showed.**
+
+- The nine open connections are all on U2, a 0.5 mm QFN-44. Six are pins boxed in by their neighbours' fan-out within 0.25-1.25 mm.
+  Three are INT nets about 450 mm long, boxed in at U2 in the first pass.
+- More budget does not move it: 40 M and 60 M route 986. The first pass is the same at every budget. In negotiation, each open
+  connection first retries strictly, which fails (25 M of 30 M at 40 M work). Its negotiated search then finds a path in 18 k-1.4 M
+  expansions.
+- Every negotiated success rips other long nets, which go back into the same pass, so the pass never ends. Bounded, the passes route
+  986, 970, 966, 961, 958, 971, 969, 974: negotiation on this board loses.
+
+**What was built.**
+
+- *Via shove* (`--via-shove`, `--via-shove-mm`, `--via-shove-step`, `--via-shove-rings`, `--via-shove-trials`, `--via-shove-share`).
+  KiCad's push-and-shove via move, as a repair step of the batch router: a boxed-in connection moves other nets' vias nearby, and only
+  the tracks ending at them.
+  - The nearest vias are lifted one at a time, then in pairs, and the connection is searched once without them (strict, capped).
+  - If it routes, each via goes down at the nearest position on 6 rings of 16 where it and its re-drawn legs pass the exact check.
+  - If no position fits beside the new route, the via is put at each position in turn and the connection searched round it.
+  - Otherwise everything is put back.
+  - It spends at most 5 % of the run's work budget. Unbounded, it routed 10 connections on kitspace_d20 and lost 41 through the
+    budget it took from the main loop.
+- *Fan-out hold* (`--fanout-hold`): each open pin's straight escape corridor is held by a placeholder track of its net through the
+  strict pass. It is dropped when the pin is routed or the pass ends.
+- *Negotiation bounds* (`--neg-strict-cap`, `--long-weight`, `--long-weight-mm`, `--pass-bound`): a cap on negotiation's strict
+  searches, weighted A* (Pohl 1970) for long negotiated searches, and passes limited to what was queued at their start (PathFinder's
+  iterations).
+- *Items 3, 5 and 6 of the plan*: `--window-escalate` (one whole-board window after an edge miss), `--via-retry` (D153, after a cap
+  miss only), `--escape-all` (the escape plan in every variant) and `--pin-via-pen` (a via in another net's dense-pin fan-out region
+  costs more).
+
+**Results.** On mini_mass the via shove routes 987: I2C_SCL, open in every earlier run, after an I2C_SDA via moves 0.45 mm. The fan-out
+hold moves the failures between U2 pins (979-987). The negotiation bounds and items 3 and 5 leave it at 986.
+
+On the ten failing boards (20 M work, 8 variants):
+
+| Arm | Routed | Open |
+|---|--:|--:|
+| base | 7,175 | 624 |
+| base at 22 M | 7,193 | 606 |
+| `--via-shove` | 7,176 | 623 |
+| `--via-shove --escape-all` | 7,197 | 602 |
+
+No board gained DRC errors. One option at a time:
+
+- `--window-escalate` cost Aleste 254 connections (15 whole-board windows take the budget).
+- `--pin-via-pen 3` cost kitspace_d20 9 and poncho 1.
+- `--escape-all` cost poncho 5, but lifts four of mini_mass's variants by 7-11.
+
+**Status.** Kept as options, off. `--via-shove --escape-all` is the first M22 arm to beat the equal-budget control, by 4 connections,
+which is within per-board noise. The gate (15 % fewer open connections) is not met.
+
+What is left on mini_mass is fan-out:
+
+- Five U2 pins are boxed in by their neighbours' tracks, not vias. Lifting the vias alone or in pairs does not free them.
+- The three INT nets route only in a negotiation that loses more than it gains.
+
+Both point at item 8, planning a package's escapes and via sites together, rather than more local repair. Moving tracks would need
+the search to accept points as endpoints, and pin rescue (§63) showed that the re-routed neighbour is then the one boxed in.
+
+## 65. Fan-out heads: the designer's escapes laid before routing (2026-10-30, D157)
+
+M22 item 8, developed on `mini_mass_prog_bench_prog_rig` like §64. Its open pins are on U2, a 0.5 mm QFN-44. Their neighbours'
+escapes and a ring of vias 1-2 mm out box them in.
+
+**The oracle.** The designer's copper near U2 was put into the unrouted board as fixed copper (variant 6, 20 M work):
+
+| Copper put in | Routed |
+|---|--:|
+| none (base) | 986 / 995 |
+| all within 5 mm | 969 / 973 (it completes 22 local connections itself) |
+| only the parts touching one pad (escape heads) | **990 / 995** |
+| only the parts joining two or more pads | 967 / 973 |
+| straight 5 mm stubs from every pin | 978 / 989 |
+| the same, no GND/+5V pins | 983 / 993 |
+
+The escape heads alone are worth four connections, and straight stubs do worse than nothing. The designer keeps each side straight,
+or bends its pins in staggered 45-degree bundles toward their destinations. A side stays straight where its bundles would run into
+the parts beside the package: on U2 the top pins' destinations are more sideways than the left pins', yet the top runs straight.
+Angle rules alone failed: always bending gave 983-984, bending past 60 degrees 986-987.
+
+**The heads** (`--fanout-heads MM`, route/fanout_heads.hpp). Before the obstacles are built, each perimeter pin of a package with
+pins on all four sides (24 or more) gets a head on its pad's layer, MM past the package.
+
+- Along a side the pins split into a block that turns toward the low end, a straight block and a block that turns toward the high
+  end. This is ordered escape with one bend (Kong, Yan and Wong, ASP-DAC 2010). A pin turns when its destination is more than 30
+  degrees off the side's normal.
+- Turning pins bend from 0.3 mm past the pad, each 0.1 mm further out than its neighbour toward the corner, so parallel diagonals
+  keep track plus clearance apart.
+- Each side is laid both ways and keeps the way with more head length.
+- Each leg stops where the exact check refuses it, and a cut head ends 0.5 mm short of the obstacle.
+- No head for:
+  - nets with a zone;
+  - pins whose nearest off-package pad of the net is within MM (local connections);
+  - copper that would come near other copper of the net (so a head joins nothing).
+
+The heads are fixed copper of their net while the board is routed: other nets go round them, and the pin's own route runs over its
+head. They are not routed copper, so they are not written out. Each route runs pad to pad, so leaving them out disconnects nothing.
+
+**Results on mini_mass.** `--fanout-heads 5` routes 989 of 995 and `--fanout-heads 3` 988; the base routes 986. Adding
+`--via-shove` keeps 989. The KiCad DRC of the output adds nothing. Still open:
+
+- RESET (U2.13);
+- USB_D- (U2.3);
+- +5V C1-R6;
+- the three INT nets (about 450 mm), which fail on the search budget, not on escape.
+
+**On the ten failing boards** (8 variants, 20 M work) `--fanout-heads 5` routes 7,175, the same as the base. The base at 22 M routes
+7,193 and `--via-shove --escape-all` 7,197. Of the six boards that get heads, two gain 3, one is unchanged, and three lose 1-3.
+Adding `--via-shove --escape-all` gives 7,190.
+
+**Status.** Off by default; with it off the output is byte-identical. What a side of a package should do is decided here from free
+head length alone. That fits U2 on mini_mass and not the packages of CoreOne, EtherCAT and poncho.
+
+**CoreOne oracle.** The same oracle on CoreOne's U801 (a 0.4 mm QFP-128) routes 785 of 806 with the designer's single-pad copper,
+against 787 of 807 for the base; our heads on U801 alone route 786. There, 51 of the designer's 70 heads end at a via within 3 mm,
+so the escapes are fan-out vias rather than F.Cu runs, and even they do not help. No better rule for the heads could win on that
+board, so the work stopped. A single variant moves by up to 10 connections between arms with the same best-of result, so the -1 to
+-3 per board above is within that spread (records: `bench/records/m22-oneboard/heads/coreone`).
+
+## 66. Throughput after M22: where the work goes, and small fields on the CPU (2026-10-30, D158)
+
+M22 ended with every repair landing within a few connections of the base given about 10 % more work (§63–§65). This section measures
+where a run's work and time go, on one board of each kind. Records: `bench/records/m23-throughput`.
+
+**Where the work goes** (one variant, 20 M work, every search logged with `TM_DEBUG_CONN` set empty; `searches/`).
+
+- **mini_mass is not held back by work.**
+  - The first pass ends at 15.8 M.
+  - In pass 2 the six boxed-in U2 connections get negotiated paths cheaply.
+  - One strict search for LED1 then spends 6 M at the per-search cap.
+  - 40 M and 60 M work route the same 986 (§64).
+  - With strict searches in negotiation capped (`--neg-strict-cap 200000`, 40 M), the three INT nets' negotiated searches spend
+    27 M at the 3 M cap. The next pass never starts.
+- **Aleste is held back by work, and spends it usefully.**
+  - It never leaves the first pass.
+  - Routed searches take 57 % of the work and searches that reach the window's edge 26 %.
+  - The larger-window retry after such a miss routes 40 of 131 connections, at about 64 k expansions each. The run's rate at its end
+    is about 4.5 connections per million, so the retry pays for itself.
+  - Predicting every failure exactly would be worth about what 2 M more work gives (+11).
+
+**Where the time goes** (gprof, Aleste, one variant, one thread, CPU fields; `profile/`). The shares are approximate:
+
+| Part | Share |
+|---|--:|
+| fields | 17 % |
+| legality against routed copper | 25 % |
+| the A* loop | 15 % |
+| fixed-copper codes | 8 % |
+
+gprof charges the samples of clones such as `cell_cost [clone .isra.0]` to the symbol before them. In the flat profile
+`add_long_stub` stands for `cell_cost`.
+
+**Small fields on the CPU** (D158).
+- **The costs.** Since D154 the CPU field costs about 72 ns per cell. The GPU costs about 26 ns per cell plus about 8.5 ms per
+  field.
+- **The rule.** A field with fewer than `gpu_field_min_cells` cells (500,000) is computed on the CPU. The two give identical fields,
+  so the routes are the same.
+- **The gain.** At 20 M work with eight variants:
+  - Aleste goes from 33.45 s to 29.55 s;
+  - mini_mass goes from 85.89 s to 78.51 s.
+
+  Both outputs are byte-identical, and so are all 30 quick-tier boards.
+
+**Negotiation on mini_mass** (`negotiation/`).
+- **At 20 M** negotiation gets only 4.3 M.
+- **With more work.** Capping its strict searches and trying one window size (`--neg-strict-cap 200000 --soft-attempts 1`) routes
+  986 at 40 M and 988 at 80 M.
+- **Putting the cap-limited connections last in later passes** changed nothing, since the three INT nets spend their work in pass 2,
+  before any requeue. It was removed.
+- **The 988** fails on other U2 pins than the base. The room around the package decides, as the fan-out heads showed (§65), not
+  the order of negotiation.
+
+## 67. Thin tracks, real vias: the cut test of a routed topology, and pads as they are (2026-10-30, D159)
+
+**The question.** If a board is routed with impossibly thin tracks and the tracks are thickened afterwards, when does the thickening work?
+Relax, route, legalise (§41.3) is this idea at 60 % of the clearance. It completed srj20 boards that hours of search had not, and it lost
+509 connections on the failing PCBench boards (doc 10 §11.3). Its legaliser could not tell a topology that cannot fit from a push that got
+stuck. Records: `bench/records/d159-thin-cut`.
+
+**The cut test** (`tracemaker cuts BOARD [--json F] [--clearance MM] [--max-gap MM]`, `route/cut_test.{hpp,cpp}`).
+- **The theorem.** Cole and Siegel, and Leiserson and Maley (STOC 1985), show that a one-layer routing can be moved to meet the rules,
+  keeping its topology, exactly when every cut has room. Gao, Jerrum, Kaufmann, Mehlhorn and Rülling (1988) give it for continuous geometry.
+- **The cuts.** For every two features (pads, vias) in sight of each other on a copper layer, up to 2 mm apart, the cut is the shortest
+  segment between their copper (between two facing edges, the middle of their overlap).
+- **Its wires** are the crossings of the routed centrelines, less pairs of crossings of one wire whose loop with the cut encloses no feature
+  (the wire can be pulled out).
+- **Its need** is the sum of the widths and of the rule clearances between neighbours (the rule engine's, so classes and custom rules
+  count). Copper of one net may overlap.
+- **s\*** is the smallest (gap − widths) / clearances over cuts with a wire or a via: the factor the clearance could be scaled by.
+- **Via room.** Vias are features of the topology. The via room test lets a via that fails a cut move anywhere in its cell (it may not cross
+  a cut between two pads). If no position keeps it clear of the pads with the wires the topology puts between them, no geometry with this
+  topology meets the rules: a proof.
+- **Limits.** Both are necessary conditions only: wire-to-wire spacing away from features, zones and the edge are not cuts.
+- **No false alarms.** On 405 boards that KiCad judged clean (the full tier A-D runs and the srj19/srj20 record runs), there is no
+  over-full cut with a wire in it and no via without room (423,870 cuts). Over-full cuts between two pads with no wire are the board's own
+  spacing (9 boards); s\* leaves them out.
+
+**What thickening needs on srj20.** The six boards complete at 0.06 mm (`bench/results/diag-c006`), judged at 0.10 mm:
+
+| Board | Wires between pads | Vias without room | Legaliser (D104) |
+|---|---|--:|---|
+| 071 | all fit | 0 | legal |
+| 104 | all fit | 0 | legal |
+| 039 | all fit | 0 | projection 2 pairs left, LP legal |
+| 103 | all fit | 0 | 3-5 pairs left |
+| 048 | all fit | 2 | 4-6 pairs left |
+| 072 | all fit | 2 | 9-11 pairs left |
+
+- The thin tracks never took a gap between two pads that cannot hold them.
+- The four vias without room each sit in a ball-grid cell with a track between the via and a pad. The cell's diagonal is 0.622 mm; a via and
+  a track need 0.3 + 0.12 + 3 × 0.1 = 0.72 mm.
+- Both legalisers (projection and the LP prototype) left their violations exactly at those four vias. On 103 and 039 nothing is proved:
+  what is left there is the legaliser's.
+
+**Two options built on it** (both off by default):
+- `--ramp-vias-real`: the relaxed stages of a ramp lower the clearance of tracks only. Anything against a via keeps the board's clearance
+  (`DesignRules::via_clearance_extra`, added by the rule engine to every clearance that involves a via, and by the legaliser).
+- `--ramp-cut-prune`: before a warm start is legalised, the cut test's proofs drop routes, which are then routed again, so the legaliser does
+  not push their neighbours about. It drops the routes whose vias have no room. For each cut between two pads that cannot hold its wires
+  (pads do not move), it also drops enough of the routes through the cut. The choice is greedy: the route that crosses most of the cuts still
+  over-full goes first, and each wire freed gives back its width and a clearance.
+
+**On srj20 neither option helps** (048 and 072, `--relax --variants 16`, one hour each):
+
+| Board | base | `--ramp-vias-real` | `--ramp-cut-prune` |
+|---|--:|--:|--:|
+| 048 (74) | 72 | 72 | 72 |
+| 072 (81) | 75 | 74 | 75 |
+
+The prune was identical to the base round by round: no hand-over of those runs had a via without room. On PCBench, with pads as they are (below), the pad-cut prune fires at the final hand-over. ardfpga dropped 2 routes and still completed
+(214/214). d20_tri dropped 40 routes (43 over-full pad cuts, s\* 0.717) and finished at 360 against 375 without it: routing them again cost
+more than letting the legaliser try. It stays off. Real vias make stage 1 route fewer
+connections (048: at most 72 instead of 74), so the thin sketch loses what made it useful. On these ball-grid boards the binding limit of
+thin-then-thicken is via room per cell, and these two blunt options do not get around it.
+
+**Where relax lost on PCBench: the legaliser's pads.**
+- **The topology fitted.** The cut test on relaxed (stage 1) solutions of four failing PCBench boards, judged at the next stage's rules,
+  found nothing over-full (s\* 1.17-1.76). The legaliser still left 136-354 pairs too close and dropped a third of the routes at each
+  hand-over.
+- **The cause.** The legaliser modelled every pad as an axis-aligned sharp rectangle, a rotated pad as the bounding box of its rotated
+  rectangle. d20_tri has 526 of 669 pads at non-right angles and 657 rounded rectangles. poncho has 182 rotated pads and 170 ovals. The
+  boxes overlapped legal tracks, the legaliser pushed them, and the pushes made real violations.
+- **The fix** (`route/legalize.cpp`, on by default, `TM_LEGALIZE_BBOX_PADS=1` for the old model). A pad is a rectangle in its own frame,
+  turned by its angle and grown by its corner radius (a rounded rectangle's, or half an oval's width). An offset pad's copper is centred
+  on its copper. Chamfered, trapezoid and custom pads stay rectangles. A vertex inside its own pad that the sweeps moved so far that its
+  track's end no longer touches the pad's copper goes back, so the track stays connected. A first version reset every vertex that
+  left the copper, even by less than the track's half width, and lost 24 connections on 21 boards (d20 375 -> 356) without a
+  disconnection to prevent. Test: `tests/test_txn.cpp`, "a rotated pad is a rotated rectangle and an oval an oval".
+- **The first hand-over.** d20 went from 1452 pairs too close before and 274 of 427 routes kept to 0 pairs and 427 of 427. poncho went
+  from 834 pairs and 245 of 373 to 42 -> 0 and 379 of 379.
+
+**The 33 failing PCBench tier B-D boards** (doc 10 §11.3's set; 100 M work, eight variants, relax as 5 rounds of 20 M; KiCad-judged;
+`bench/records/d159-thin-cut` section 6):
+
+| Arm | Routed (of 16,935) | vs base | Better / worse | KiCad-clean |
+|---|--:|--:|--:|--:|
+| base (main, no relax) | 16,166 | | | 2 |
+| `--relax`, bounding-box pads (main) | 15,683 | −483 | 8 / 16 | 3 |
+| `--relax`, exact pads (this change) | 15,925 | −241 | 8 / 15 | 5 |
+| `--relax --legalize-subdivide 0.1`, exact pads | 15,955 | −211 | 10 / 13 | 5 |
+
+- Exact pads halve what relax loses against the current base: −241 instead of −483 connections.
+- `--legalize-subdivide 0.1` (§46) adds 30 (12 boards better, 1 worse) for about 10 % more CPU. On srj20's six stuck boards at the same
+  budget it is neutral (404 and 404 of 453, 2 better and 2 worse), so `--relax` does not turn it on by itself. Add it by hand on boards
+  with many rotated or rounded pads.
+- Relax with exact pads completes five boards (serial_gw, teensy-fx, multisensor, ardfpga, mxalps). The base completes two of those.
+- Taking the better of base and relax per board gives 16,208 routed (+42) and five clean boards.
+- Relax still loses on most large boards. Its five rounds are mostly spent at relaxed rules, and the final hand-over to the board's rules
+  is where the legaliser now stalls. On poncho the cut test finds no over-full cut there (s\* 1.167). The legaliser leaves 71 track-to-track
+  and pad-corner pairs short by 0.02-0.04 mm in one dense area, and 14 routes go.
+- No arm added a DRC error. Quick tier: 30 of 30 routed boards byte-identical to main (the legaliser runs only with `--relax` and
+  `--legalize`). With srj20's axis-aligned rectangular pads, relax output is byte-identical to before (sample039).
+
+**What this says about "always 100 %".** The cut condition is a cheap, exact-enough certificate (no false alarm on 405 boards). Used as a
+diagnosis, it turned "relax loses on real boards" into a modelling bug and showed that on ball grids the thin sketch fails only at vias.
+The next steps it suggests:
+- room-aware thin routing, where each cell's via room is counted while routing ("thin geometry, thick accounting"), not blanket real-clearance vias;
+- a realizer for the final hand-over that does better than projection where the cuts say there is room;
+- relax as a rescue after a plain run on the boards it completes (built, and on by default: §68).
+
+## 68. The relax rescue: escalation by default (2026-10-30, D160)
+
+> Since §71 (D163) the rescue has two passes: relax from the plain run's routes, then from nothing.
+
+**Why.** A plain `tracemaker route` runs the portfolio and stops. Relax (§41.3, with the pads of §67) completes boards the plain run does
+not, but loses on most others, so it is no default on its own. The better of the two per board is: +42 connections and five clean
+boards against two on the 33 failing PCBench tier B-D boards (§67).
+
+**What it does** (`app/route_job.cpp`). When the plain run leaves connections open and `--relax` was not given, the board is routed again
+from nothing with `--relax`. The result that `route_result_better` prefers stands (more routed, then fewer vias, then shorter copper). A
+tie keeps the plain result. Then the advisor (doc 17), the refill repair (§36) and the passes run on what stands, as before.
+- **Budget.** The rescue gets `--time` again (as the advisor's re-run does) and, with `--work`, rounds of at most 20 M work that add
+  up to `--work`. Since D163 there are two passes, so a board left open can take three times `--time`, plus the stages after routing
+  (`bench/run.py` stops a board at 4 × `--time` + 120 s, D182). A complete board never gets a rescue.
+- **Why its own time.** Without `--work`, the plain portfolio uses all of its 120 s on hard boards: on ardfpga, teensy-fx, poncho and
+  serial_gw it was still working when the limit came (two passes on poncho). Splitting the time would give the plain run less on exactly
+  those boards.
+- **Off** with `--no-rescue`. Only `tracemaker route` has it; placement's routing and `tracemaker session` do not.
+- **Reported.** The run summary has `rescue` (`routed_before`, `routed_after`, `adopted`, `seconds`, `rounds`, `round_work`), the
+  log says what happened, the viewer gets `rescue` stage events, and `bench/run.py` keeps the summary per board. A rescue's variants
+  are in `variants` with `"stage": "rescue"`.
+
+**Measured** (`bench/records/d160-rescue`):
+
+The 33 failing PCBench tier B-D boards (100 M work, eight variants, KiCad-judged):
+
+| Arm | Routed (of 16,935) | vs plain | Better / worse | KiCad-clean | CPU s |
+|---|--:|--:|--:|--:|--:|
+| plain (main) | 16,166 | | | 2 | 64,062 |
+| `--relax` alone (D159) | 15,925 | −241 | 8 / 15 | 5 | 60,232 |
+| default with the rescue | 16,208 | +42 | 8 / 0 | 5 | 110,958 |
+
+- Every board is the better of the plain run and relax: the counts equal the maximum of the two arms on all 33, and the plain part
+  is byte for byte the plain arm's.
+- The rescue ran on the 30 boards left open and was kept on 12: eight routed more (serial_gw, ardfpga and teensy-fx complete clean;
+  CoreOne +17, V2X +6, MonApollo +5), four as many with fewer vias or shorter copper.
+- No board added a DRC error. CPU is up 73 % on this set, where every board is left open; a board that completes pays nothing.
+
+- Quick tier (`--work 1000000 --variants 1`): the rescue ran on the 19 boards left open and was kept on 8: +11 connections, 12
+  clean boards against 11 (C-BISCUIT completes), 22 of 30 boards byte-identical, gates pass. Each rescue took 1-3 s.
+- Test: `tests/integration/round_options.py` (the rescue runs when a board is left open, `--no-rescue` turns it off, a rescue that
+  does not win leaves the output byte-identical to the plain run's, and the result is never below the plain run).
+
+## 69. Why a connection is open: pins the fixed copper walls in (2026-10-30, D161)
+
+**Why.** A run that leaves connections open says so, but not whether any router could have done better. The router's own `boxed_in`
+reason means its last searches found no way out, which includes the routed copper of other nets. A user needs to know which open pins
+cannot be connected as the parts are placed (move a part or change a rule) and which are open through congestion (more search, or the
+relax rescue of §68). Doc 20 §2.4.
+
+**The proof** (`analysis/escape_proof.{hpp,cpp}`). A track of width w whose centre keeps w/2 + c from every item of another net lives in
+the free space of the plane less those items, each grown by its own w/2 + c (the configuration space of a disc; Lozano-Pérez 1983).
+Around the pin (1.5 mm beyond its copper), on each of its copper layers:
+- **Walls.** The board's fixed copper of other nets is marked on a 10 µm grid: pads, existing tracks and vias, zone fills, copper
+  graphics, holes (with the hole clearance), the board edge. Each wall carries the clearance the rule engine gives for that pair.
+  Copper that overlaps the pin itself is no wall: it is the pin's own pour, or a short already there.
+- **Flood fill.** The flood starts from the cells a track touching the pin could start from (within w/2 of its copper) and is
+  8-connected. It gets out when it leaves the window or touches other copper of the net.
+- **Vias.** A via is checked on every copper layer, including hole-to-hole spacing. It counts if it fits in the space the track
+  reaches, and in the pin's own pad only with `--via-in-pad`.
+- **Soundness.** A cell counts as free when its centre is within half a cell diagonal of being free, so the sampled free space is a
+  superset of the true one. "Walled in" is therefore a proof; "gets out" is no promise.
+
+**The three answers.** A pin walled in for its class's track and via is checked again with the board's minimum track width and via
+(KiCad's DRC checks those; a class's sizes are defaults, not limits):
+- **Proved** (`enclosed`): walled in on every layer even for the minimum track, and no minimum via fits. Nothing but a change to the
+  placement or the rules connects it. The message names the walls, nearest first, and says whether a via in the pad would fit.
+- **Class only:** a narrower track gets out (the message gives the widest one, a neck-down), or a smaller via fits.
+- **Router's settings only:** walled in only by zone fills (`--soft-zones` routes through them and refills afterwards) or by net-less
+  copper graphics on the pin, a designer's pour (`--soft-copper-graphics` gives them the net of the pads they touch).
+- Anything else is open through congestion.
+
+**Where.** `tracemaker route` checks the end pins of every connection it leaves open (at most 400 pins) after the run. The log has
+"why open" lines and the summary has `why_open` (`pins`, `walled_in`, `neck_down`, `soft_only`, `congested`, `via_in_pad`, and `proved`
+with each pin's walls and message). `--no-why-open` turns it off. The log ends with "next:" lines (the summary's `why_open.next`): what to try, by why
+the pins are open. Move a part or change a rule for proved pins. Name `--soft-zones` or `--soft-copper-graphics` for pins those free.
+Check the neck-down settings for class-only pins. Suggest more search or more copper layers (`--try-layers`) for congestion. Design
+changes are offered, never made (doc 20 §2.5). `tracemaker walled BOARD [--pin REF.NUM]` checks a board before
+routing: every pad of a net with more than one pad, or the pins named. It is read-only and does not change the routing.
+
+**Measured** (`bench/records/complete-routing/escape`):
+- **No false alarms.** On the inputs of the 405 boards that benchmark runs left KiCad-clean (tiers A-D, srj19, srj20), every pin was
+  connected under the rules. Of their 41,810 pins none is proved walled in (`legal-sweep.tsv`). The first version judged a pin at its
+  class's track width and raised six alarms on wavegen: the +3V3 pins are walled in for 1.02 mm but a 0.85 mm track gets out, and the
+  router had necked them down. Hence the minimums.
+- **The 33 failing PCBench tier B-D boards** (the rescue run's open connections, D160): 727 open connections with 1,341 end pins.
+  - 0 are walled in by the placement.
+  - 8 are walled in only for their class's track (OtterPill, DronPi, sizif ×5, Teensy).
+  - 14 are walled in only by the router's settings, all on E3: the board's net-less copper polygons (an EasyEDA import's pours) cover
+    the pins. A run of E3 with `--soft-copper-graphics` leaves none of them open (`e3-soft.log`).
+  - 1,319 are open through congestion. These boards come with their designers' routings, so all are routable as placed; the router's
+    `boxed_in` on them is congestion.
+- **Cost:** about 19 ms per pin (one thread). 579 pins of poncho take 13 s; the 65 open pins of a short E3 run took 1.8 s.
+- Test: `tests/test_escape_proof.cpp` (`[escape_proof]`): a pin in a ring of eight pads. A tight ring is a proof, with a via fitting only
+  in the pad. A ring with 0.3 mm gaps is walled in for 0.12 mm tracks but freed by a 0.1 mm neck-down, and is a proof when the
+  minimum is 0.12 mm. A ring with 0.4 mm gaps does not wall the pin in.
+
+## 70. The realizer: the legaliser's last hand-over solved at once (2026-10-30, D162)
+
+**Why.** Relax hands its routes over to the real rules through the projection legaliser (§41.3, §67), which moves one pair at a time. On
+poncho's last hand-over it leaves 71 pairs short by 0.02-0.04 mm, the same after 3000 sweeps, although the cut test finds room
+(s\* 1.167). Two clusters: a ladder of about 20 parallel tracks, each a few µm short, that has to shift together, and a track in a
+1.4 mm channel that needs a bend. Doc 20 §2.3.
+
+**What it does** (`route/legalize.cpp`, after the sweeps, only when pairs are left). Sequential quadratic programming:
+- Each round linearises the constraints within 0.05 of their target at the current positions (gradients by the envelope theorem). It
+  solves the elastic QP min ½|d|² + M Σ s subject to g + a·d + s ≥ 0 and s ≥ 0, with every move d inside its node's box and a trust
+  region ρ.
+- The QP is solved by dual coordinate ascent (Hildreth 1957): one multiplier per row in [0, M], the box kept by clipping, 200 passes,
+  rows in a fixed order. It needs no LP solver and is deterministic.
+- A round is kept if the exact recheck finds fewer pairs, or as many but less deep, and the outline still holds. Otherwise ρ halves.
+- Up to 20 rounds (`LegalizeOptions::realize_iters`, 20 by default; `TM_LEGALIZE_REALIZE=N` for experiments, 0 = projection only).
+  Every result still goes through the router's exact check before it is committed.
+- **Judged by what the router keeps** (`route/router.cpp`). The realizer counts only the pairs it models. Zones, keep-outs and custom
+  rules are left to the exact check, and its larger moves can cost routes there: on uC3Moy it took 9 pairs to 5, but the subset of
+  routes the exact check keeps went from 40 to 39, and the quick tier's gate failed. So when the realizer ran, the router also
+  legalises by projection alone and computes the conflict-free subset of both results. It keeps the realizer's only if that keeps
+  more routes; a tie keeps the projection's. The second legalisation runs only when the sweeps leave pairs.
+
+**Prototypes** (`bench/records/complete-routing/realizer/`, doc 20 §2.3). On poncho's dumped problem, linear programs (HiGHS) and this
+QP both leave 7 pairs (2 with a larger move box); a penalty method and an augmented Lagrangian leave 92. Hard linearised constraints are
+what make the difference.
+
+**Measured** (`bench/records/complete-routing/runs`):
+
+| Set | Without | With the realizer | Better / worse | Clean | CPU s |
+|---|--:|--:|--:|--:|--:|
+| poncho, last hand-over (pairs left) | 71 | 7 | | | |
+| 33 failing PCBench B-D, `--relax` (routed of 16,935) | 15,925 | 15,940 (+15) | 5 / 0 | 5 / 5 | 60,232 / 67,272 |
+| srj20's six stuck boards, `--relax` (of 453) | 404 | 411 (+7) | 4 / 0 | 0 / 0 | 13,533 / 11,741 |
+
+- The two `--relax` rows were measured before the realizer was judged by the routes kept (below). srj20's six, run again with it:
+  411, board for board the same. Quick tier with it: gates pass, 0 boards worse (§71, `bench/records/complete-routing/quick`).
+- The CPU difference goes both ways (shared machine). The realizer runs only when the sweeps leave pairs.
+- In the default run it acts through the relax rescue (§68). Per board, the better of the plain run and the realizer's relax run is
+  16,210 on the 33 boards, against 16,208.
+
+## 71. Two rescue passes: warm, then fresh (2026-10-30, D163)
+
+**Why.** The rescue of §68 routes the board again from nothing. Starting relax from the plain run's routes instead (warm; they are legal
+under the real rules, so under relaxed ones too) keeps what the plain run got right and spends the budget on what is open. Doc 20 §2.2.
+
+**Measured** on the 33 failing PCBench tier B-D boards (100 M work, eight variants, KiCad-judged; `bench/records/complete-routing/runs`):
+
+| Rescue | Routed (of 16,935) | vs fresh | Better / worse | KiCad-clean | CPU s |
+|---|--:|--:|--:|--:|--:|
+| none (plain) | 16,166 | | | 2 | 64,062 |
+| fresh (D160) | 16,208 | | | 5 | 110,958 |
+| warm | 16,259 | +51 | 14 / 5 | 4 | 86,304 |
+| best of the two per board | 16,280 | +72 | | 6 | about 133,000 |
+
+- Warm wins more often (kept on 22 boards against 12) and costs less, but it loses serial_gw and teensy-fx by one connection each,
+  where fresh completes them clean. It completes Teensy_test_layout, which fresh does not.
+- Neither is better on every board, so both run.
+
+**What it does** (`app/route_job.cpp`). `--rescue-mode both` (the default) runs the warm pass first. If connections are still open, the
+fresh pass follows. Each pass has its own budget (§68) and is kept only if `route_result_better` prefers it to the best so far.
+`--rescue-mode warm` or `fresh` runs one pass. The summary's `rescue` has `passes` (mode, routed, adopted, seconds), and variant rows
+carry `rescue_mode`.
+
+- Cost: a board left open after the warm pass is routed three times. Without `--work`, a default run can take three times `--time`. A
+  complete board pays nothing.
+- The realizer (§70) was not on in these runs. With it, both arms gain a little (§70).
+- Test: `tests/integration/round_options.py` checks the order of the passes (on its board: warm 26, fresh 27, kept).
+
+## 72. Obstacle caches: one per set of class values, bounded in memory (2026-11-03, D169)
+
+**Why.** Issue #54: a board with 83 net classes (one per impedance pair) took 181 GB with 8 variants, since each class (and track width)
+had its own fixed-obstacle cache per router, and nothing bounded their total. D154 made the caches grow only where searches go, but
+classes with equal values still each computed the same codes.
+
+**What it does** (`route/router.cpp`, `cache_for`).
+
+- A cache is keyed by what its codes depend on: the class's clearance, diff-pair gap and tuning-pair gap, the track width, and the via
+  diameter and drill. Classes with equal values share one, as the nets of one class do. A custom rule whose condition reads class names
+  (`NetClass`, `hasNetclass`, `hasExactNetclass`) keeps them per class (`RuleEngine::class_names_seen`).
+- `--class-cache-mb` (default 2048 MB per router, 0 = none) bounds them. Past it, the caches used longest ago are freed. A freed cache
+  keeps its probe net, so its codes come back the same, but the cost-to-go fields only use codes already known, so a run that reaches
+  the bound may route differently; it stays deterministic. A `note:` line in the route log gives the number of evictions.
+
+**Measured** (`bench/records/issue54/`; 3 M work, two variants, two threads, CPU fields). Each board was routed with its own classes
+and with every net in a class of its own with the same values, as WholeBoard wrote them:
+
+| Board, classes | Engine | Peak memory | Wall time | Fixed-copper checks | Output |
+|---|---|--:|--:|--:|---|
+| interf_u, 2 | main | 886 MB | 37.8 s | 3,140,539 | A |
+| interf_u, 175 (one per net) | main | 1,185 MB | 48.8 s | 5,284,040 | A |
+| interf_u, 2 | D169 | 892 MB | 37.1 s | 3,140,539 | A |
+| interf_u, 175 | D169 | 885 MB | 37.0 s | 3,140,539 | A |
+| interf_u, 175, `--class-cache-mb 20` | D169 | 841 MB | 40.4 s | 3,569,848 (17 evictions) | A |
+| StickHub, 1 | main / D169 | 296 / 297 MB | 29.6 / 30.0 s | 681,412 | B |
+| StickHub, 48 (one per net) | main / D169 | 305 / 297 MB | 28.8 / 29.3 s | 869,604 / 681,412 | B |
+
+The split boards route exactly as the originals on both engines; D169 makes the same caches for them as for the originals. The bounded
+run here also gave the same output, but its expansion count differs, as the fields knew fewer codes.
+
+## 73. Preferred directions per layer by name, and a 45-degree penalty (issue #66, 2026-11-08, D174)
+
+**Why.** `--layer-dir-pen` / `--layer-dir-swap` (§40, D98) give even layers one direction and odd layers the other, so a two-layer board
+has two choices. Hand-routed boards use other conventions (quanln's study in the issue: of 13 boards, F.Cu mostly horizontal on 6,
+vertical on 1, mixed on 7). And a 45-degree step costs nothing against either direction, so the penalty turns orthogonal runs into
+diagonal zigzags: on relaymini the 45-degree share grew from 31 to 37 % on F.Cu and from 42 to 50 % on B.Cu. Design from quanln
+(GitHub @quanln), who proposed both options.
+
+**What it does** (`route/layer_limits.cpp`, `layer_pref` and the planar moves in `route/router.cpp`).
+
+- `--layer-dir F.Cu=v,B.Cu=h` (`h`, `v` or `none` per layer; names as for `--layer-cost`, §29) replaces the parity: named layers get
+  that direction, layers not named get none, `--layer-dir-swap` has no effect (a warning says so). Its strength is `--layer-dir-pen`;
+  if that is not given, 0.3 pitches per step on any board, not only on breakout boards.
+- `--layer-diag-pen P` or `--layer-diag-pen F.Cu=P,...` (0 to 100; a bare value is every layer's, named layers override it): every
+  45-degree lattice step on that layer costs P pitches more. Independent of the directions.
+- Both are integer costs added in the search's planar move, like the parity penalty (rule 2). The cost-to-go fields (CPU and GPU)
+  do not include them, so they stay lower bounds and nothing on the GPU path changes; no new GPU code.
+- **Smoothing keeps them.** Path smoothing (pull tight, in the clean-up after the search) replaced runs by a 45-degree segment and a straight one whatever
+  they cost, which undid the diagonal penalty on the test board. With `--layer-dir`, an explicit positive `--layer-dir-pen` or a
+  diagonal penalty on the layer, a shortcut is taken only if its direction cost is not above the run's, and the two orthogonal corners
+  are candidates too, cheapest first. The automatic strengths (D98's breakout boards, the seeded portfolio variants: negative values)
+  keep the plain smoothing, so default runs do not change.
+- An unknown layer name is a warning and its entry is ignored (a convention may name inner layers a two-layer board does not have);
+  a malformed entry, a bad value or a layer given twice stops the run before the board is read.
+
+**Measured** on relaymini (`bench/records/issue66/`, 3 M work, two variants; F.Cu asked vertical, B.Cu horizontal, strength 1.0):
+
+| Run | F.Cu 45° | B.Cu 45° | F.Cu against its direction | B.Cu against | Routed |
+|---|--:|--:|--:|--:|--:|
+| Default | 31.4 % | 42.2 % | – | – | 60/72 |
+| `--layer-dir F.Cu=v,B.Cu=h --layer-dir-pen 1.0` | 36.8 % | 49.6 % | 0.6 % | 1.4 % | 61/72 |
+| ... `--layer-diag-pen 0.6` | 27.4 % | 35.2 % | 8.6 % | 9.9 % | 63/72 |
+| ... `--layer-diag-pen 1.0` | 25.5 % | 22.9 % | 8.1 % | 10.3 % | 62/72 |
+
+With both options unset the output is byte-identical to main (relaymini, and srj20 sample001 where D98's automatic directions are on).
+`--layer-dir` naming the parity's directions gives the parity's output exactly.
+
+**Limits.** One public board measured: whether a convention costs completion on other boards is not known (doc 16: the parity penalty
+cost the quick tier 89.2 → 86.8 %), so both stay off by default. The coupled-pair search (§24) and the advice file (doc 17) do not use
+them: advice runs as extra variants next to the plain ones, and a layer convention is meant for every variant. Track length grows (up
+to 25 % at strength 1.0 on relaymini).
+
+## 74. Tuned nets stay tuned (2026-11-08, D173)
+
+**Why.** Issue #60: `delay_room` (§61) failed on main after D154. The router's tuning log said D+ was tuned to 78.44 ps against D-'s
+78.50 ps, but the DRC of the written board measured D+ at 70.56 ps, 8.69 ps short of D- against a 0.5 ps rule. The soft-zone refill
+repair and the clean-up were the suspects. Neither was the cause: with debug output after each stage of `app/route_job.cpp`, the
+copper of D+ and D- came out of the router already untuned, and no later stage changed it.
+
+**Cause.** The clean-up (§9: diff-pair recoupling, via optimisation, smoothing and then the tuners) runs only when the search ends in
+its best state. When it ends away from it, the router returns the best state as it was snapshotted during the search: routed, but never
+tuned. The tuning lines in the log came from other variants of the portfolio that did end in their best state. The winning variant (fast
+bends, shortest first, crowded source) ended with 128 routed against a best of 129. Before D154 it ended in its best state on this
+board. The late reachability proofs change which connections are searched, so it no longer does.
+
+**Fix** (`route/router.cpp`, `wants_tuning`, `restore_best`). A board where the clean-up has tuning to do gets its best state back
+before the clean-up when the search ended away from it. The router puts it back the way the end-game retry does (§63): only the
+connections whose copper differs are lifted and restored. The clean-up and the tuners then run on the state the router returns.
+"Tuning to do" means any of these:
+
+- a net with a `length` rule (mm or time);
+- a net with a `skew` rule, or a diff pair's skew constraint;
+- `--pair-skew-mm`, or a component-rule pair skew above 0;
+- buses (`--bus`, `--buses`).
+
+Other boards keep the old behaviour, byte for byte. Running the clean-up on the best state of every board would change results
+everywhere and needs measuring of its own (not done here).
+
+**Guard on the stages after routing** (`app/route_job.cpp`, `drc::length_faults`). On a board with `length` or `skew` rules, these
+stages are kept only if no net is further outside such a rule with their copper than without it:
+
+- the soft-zone refill repair (§36);
+- the thermal relief repair (§36.1), for each pad;
+- the stitching vias (§39.3).
+
+The distance outside a rule is measured as the DRC measures it on the written board (KiCad's length calculation, §59;
+`DrcOptions::lengths_only` runs only those checks). A net that is in range counts as 0. These stages route or rip connections again,
+or add vias, so they can lengthen or shorten a tuned net. A sub-router does not tune a skew group whose other members it did not route.
+Widening and the tuning-profile narrowing change only widths, which KiCad's length calculation ignores, so they need no guard. On this
+board no stage touched the pair: the guard did not reject anything.
+
+**Result** (`bench/records/issue60/`, the B2 fixtures, 3 M work, `--refill --soft-zones`, 8 threads, judged by KiCad 10.0.6):
+
+| Board | main | D173 |
+|---|---|---|
+| RoyalBlue54L-Feather-delay | 129/147, 37 unconnected, `skew_out_of_range` 1 | 129/147, 39 unconnected, none added |
+| RoyalBlue54L-Feather-profile, interf_u-delay, interf_u-profile | as on main | byte-identical output |
+
+On RoyalBlue54L-Feather-delay the best state is now cleaned up and tuned: D+ ends at 79.43 ps against D-'s 79.49 ps. The meanders cut
+the soft fills once more, so the refill repair closes one connection to a zone instead of two. KiCad counts two more unconnected
+items, with the same routed count; that is what meeting the rule costs on this board. Boards without length or skew rules are
+unchanged by construction. Two quick-tier boards were checked byte-identical, and none of the 30 has a `.kicad_dru`.
+
+**Tests.** `delay_room` passes again. Unit test `length faults: a stage that shortens a tuned net is worse` (`tests/test_length.cpp`,
+runs in CI without `build/demos`): on KiCad's `time_calculations` board it halves a track of a net tuned into its 29.83-29.85 ps
+window. It checks that the lengths-only DRC reports the full DRC's length and skew violations, that the cut makes the net a fault and
+that `length_faults_no_worse` rejects it. The router fix itself has no CI test: a small board that makes the search end away from its
+best state with a tuned net was not found. `delay_room` covers it where the demos are prepared.
+
+## 75. Repair windows: finishing a partly routed board (issue #56, 2026-11-08, D172)
+
+**Why.** Without `--reroute`, every track and via of the input is fixed copper. On a WholeBoard PoE switch routed 1186/1189 the last
+pins stayed open ("fixed copper encloses the pin"): the neighbours' fan-outs wall them in and the router may not rip them. The only other
+choice was `--reroute`, a fresh two-hour run. Staged flows hit the same wall: route some nets first (`--only-net`), then the rest with
+that copper fixed.
+
+**What it does** (`passes/repair.{hpp,cpp}`, called from `app/route_job.cpp` after the rescue and the advisor).
+
+- For each connection still open, in the router's order, the *branches* of other nets with copper within r of either end pad (measured
+  from the pad's edge) are lifted. A branch is the chain of tracks and vias of one net between two stops: a pad, a zone fill, an arc or
+  copper graphic, or a junction where three or more tracks and vias meet. Track ends touch when an end point or the centreline lies
+  within 1 µm, or the end lies in a via. Whatever the lift leaves dead goes too: a track with an end that touched copper and now touches
+  nothing, or a via left with one contact. So no cut stub stays in the way (the user's manual cut at 2.5 mm left 11 open instead of 3), and
+  a big net keeps the branches outside the window.
+- The board is routed again by one router (the run's options, the open connection first), everything else fixed, on `--repair-work`
+  (3 M) work. The attempt is a transaction (rule 4): it is kept only if no two pads that were joined come apart and fewer connections are
+  open, counted per net on the router's connectivity. Otherwise the window grows (`--repair-window-mm`, default 1, 2, 4). A window that
+  would lift more than `--repair-branches` (64) branches ends the growth; at most `--repair-conns` (64) connections are tried, and
+  `--time` bounds the repair as a safety only. A kept attempt's own open list is the next one.
+- Never lifted: locked tracks and vias (rule 6), tuning patterns, free vias, branches touching arcs or copper graphics, the open
+  connection's own net, nets this run does not route, coupled pairs (`--diff-pairs`, component-rule pairs) and bus members.
+- **`--repair auto`** (default) runs only on a board that came with unlocked tracks or vias, and only when connections are left open. A
+  board routed from nothing here is unchanged: the router's negotiation could already rip that copper, and D155's pin rescue, which lifts
+  routed copper in the same way, lost against the same work spent on routing (§63). `--repair on` runs it on any board, `off` never.
+- The lifted input copper leaves the written board. `--emit-items` lists it under `removed`, and the KiCad plugin removes it from the open
+  board in the same commit (nothing is changed if an item is not found). The summary has `repair` (attempts with radius, branches,
+  tracks and vias lifted, open before and after, kept), and the viewer gets `repair` stage events.
+- **Staged routing.** `--only-net` and `--skip-net` take patterns (KiCad wildcards or regular expressions, as net-class patterns;
+  repeatable or comma separated), e.g. `route board.kicad_pcb --only-net '/USB_D*,/ETH_*' -o pass1.kicad_pcb`, then
+  `route pass1.kicad_pcb -o pass2.kicad_pcb`: the second pass routes the rest, and its repair may lift pass-one copper near a pin that
+  copper encloses. A net named exactly matches itself even when its name reads as a regular expression (`Net-(U1-Pad3)`).
+
+**Measured** (`bench/records/issue56/`). Staged flow on the nine PCBench quick-tier boards where it leaves connections open: stage 1 routes
+everything but the power nets (`--skip-net 'GND*,*GND,VCC*,VDD*,+*,*3V3*,*5V*,*VBUS*,*VIN*'`, 1 M work), stage 2 routes the board with that
+copper fixed (one variant, `--no-rescue`, 5 M work). "Plain, same work" gives the plain stage 2 the repair's work on top of its own.
+
+| Board (stage 2 connections) | Plain | Repair | Plain, same work | Attempts (kept) | Input tracks / vias lifted |
+|---|--:|--:|--:|--:|--:|
+| 655_testboard (32) | 25 | 32 | 27 | 5 (1) | 55 / 8 |
+| breakout-boards_swd-and-uart (4) | 3 | 4 | 3 | 2 (1) | 13 / 0 |
+| custom_cpu--ALU_custom_cpu--ALU (39) | 30 | 39 | 39 | 4 (4) | 21 / 1 |
+| fan_controller_fan_controller (69) | 66 | 69 | 66 | 1 (1) | 12 / 1 |
+| Hangul-Clock_Hangul (169) | 160 | 168 | 169 | 5 (3) | 3 / 0 |
+| Inkjet__autosave-InkjetDriver (39) | 38 | 39 | 39 | 1 (1) | 4 / 0 |
+| LogicBoxen_LogicBoxen (64) | 60 | 64 | 62 | 1 (1) | 21 / 1 |
+| mosavr_pcie1x_backplane (54) | 48 | 53 | 54 | 10 (4) | 10 / 0 |
+| uC3Moy_uC3Moy (17) | 16 | 16 | 17 | 3 (0) | 0 / 0 |
+| **total (487)** | **446** | **484** | **476** | | |
+
+KiCad 10.0.6's DRC (zones refilled) gives the same errors for all three arms of each board (the boards' own: outline, courtyards,
+mask bridges, annular width), so the repair adds none; its unconnected counts equal the open connections above.
+
+- Against the plain stage 2 the repair closes 38 of 41 open connections and never loses (it is a transaction). Against the same work
+  spent on the plain run it is +8: better where pins are walled in (655_testboard, LogicBoxen, breakout, fan_controller), worse where the
+  open connections only wanted more search (Hangul, mosavr, uC3Moy, one each).
+- **Default flow** (the relax rescue on, as a plain `tracemaker route` runs; repair after it): 467 of 487 with `--repair off`, 486 with
+  the default `auto`. The repair ran on the five boards the rescue left open and completed four (655_testboard, Hangul, custom_cpu,
+  fan_controller); uC3Moy stays at 16/17. The rescue alone completes LogicBoxen, breakout and mosavr; on fixed copper it cannot lift.
+- **The PoE switch** (rev6, 1186/1189, private; 2 M work for the plain run): **not finished.** The plain
+  run plans 6 connections (soft zones) and routes 2; four stay open, all at the KSZ9897 QFNs (U10, U11). Around those pins a 1 mm window
+  holds 26-40 branches of the neighbours' fan-outs (99-117 tracks), a 2 mm one more than 64; with windows of 0.2, 0.4 and 0.7 mm still
+  9-22 branches. In every attempt (3 M and 10 M work) the router could not route all the lifted branches again, so none was kept
+  (`poe6-*.log`). Dense fine-pitch fan-outs need more than a window and one router run: what each lifted connection needs is the
+  room the others used, which is the whole negotiation the two-hour run did. The repair leaves such a board as it was.
+- Cost: an attempt is one router run on the whole board: 1-6 s on the quick-tier boards, about 20-40 s on the PoE switch. Complete
+  boards and boards routed from nothing pay nothing.
+- Test: `tests/test_repair.cpp` (`[repair]`): a pin in a ring of another net's track is opened (the whole branch lifted, both nets
+  joined, no DRC error, the 2 mm window the first that lifts anything, deterministic); the same ring locked is never lifted; a branch
+  limit of 0 tries nothing. `kicad_plugin/test_offline.py` checks that the lifted copper is found on the open board.
+
+## 76. Rules below the class: the pair phase and the price of a condition (2026-11-08, D170)
+
+**Why.** Issue #53: with WholeBoard's JLCPCB rule `(condition "A.Type != 'Zone' && B.Type != 'Zone'") (constraint clearance (min
+0.09mm))` under 0.15 mm classes, six of eight `--diff-pairs` variants on the 10-port PoE switch stopped at about 116 connections in
+300 s (`bench/records/d139/`). Nothing sized from the class disagrees with the rule engine. The stalled variants were all still in the
+coupled pair phase (§15) when the time ran out: about 116 is the pairs' own connections. The pair search checks every move exactly, and
+the exact checks ask the clearance of every nearby item; evaluating the rule's condition each time (strings built, lower-cased and
+wildcard-matched for both types, both orders) made the same work 55 % slower than an unconditional 0.09 mm rule. Without the rule the
+phase only just fits in 300 s; on a loaded machine it does not fit either.
+
+**What was built** (D170).
+
+- Kind tables (`drc::RuleEngine`): a condition that reads only `A.Type` and `B.Type` is evaluated once per pair of kinds when the engine
+  is built; `custom_min` (clearance, hole clearance, hole to hole, edge clearance, track width) reads the table. Same answers by
+  construction; `use_kind_tables(false)` is the reference, compared over every item pair in the test "kind tables". On by default.
+- `--pair-share X` (default 0, no limit): the coupled pair searches stop after X of the work budget (of `--time` without one), counted
+  over every pair phase of the run; the pairs left are routed as single connections. Each pair attempt was already capped (§15); this
+  caps the phase. Off by default (below).
+
+**Measured** (`bench/records/issue53/`, `--diff-pairs --no-kb --no-rescue`; the PoE switch is WholeBoard's, not committed).
+
+| Board, rule | Run | Before (main) | D170 | Output |
+|---|---|---|---|---|
+| PoE switch, non-zone 0.09 mm | 1 variant, 2 M work | 189 s | 86 s | same file |
+| PoE switch, unconditional 0.09 mm | 1 variant, 2 M work | 122 s | 84 s | same file |
+| StickHub (8 USB pairs, 0.15 mm class), non-zone 0.09 mm | 1 variant, 5 M work, `--soft-zones` | 31.8 s CPU | 21.0 s CPU | same file, 128/128 |
+| StickHub, no rule | 1 variant, 5 M work, `--soft-zones` | 31.0 s CPU | 30.9 s CPU | same file |
+
+Eight variants, 300 s, the PoE switch with the rule, the four runs at the same time on the shared machine:
+
+| Engine | Connections per variant (0..7) | Best | Coupled pairs (best) | Work done |
+|---|---|---|---|---|
+| main | 96 96 160 96 96 1097 96 54 | 1,097 | 75 | 44.7 M |
+| D170 | 126 140 660 140 140 1105 126 106 | 1,105 | 75 | 89.7 M |
+| D170, `--pair-share 0.25` | 1027 1104 1029 1073 1034 1105 1111 1088 | 1,111 | 19 | 404.6 M |
+| D170, no rule | 106 106 148 106 106 1090 106 86 | 1,090 | 70 | 80.8 M |
+
+With the tables the rule costs nothing over no rule. `--pair-share 0.25` lifts every variant past 1,000, but the portfolio keeps only the
+best, which then couples 19 pairs instead of 75: completion +6, coupling −56. Coupling is what `--diff-pairs` asks for, so the share
+stays off. One variant at 5 M work: 88 → 126 connections with the share, 44 → 8 coupled pairs.
+
+**Open.** The pair phase is slow per unit of work (every turn and via move is an exact check; only straight steps are memoised), so at
+short time limits it still takes most of the run. Conditions that read nets or classes are still evaluated per call.
+
+## 77. Coupled pairs: leg reach, protected halves, re-coupling past the budget, pad exits (issue #67, 2026-11-08, D175)
+
+**Why.** Issue #67 (quanln, who also found the causes and designed the first two options in their fork): on a small 2-layer board
+routed with `--diff-pairs`, the two long pairs ended 0-3 % coupled where the hand-routed board is 88-100 %. (1) The coupled section
+must start within 2.5 mm of an end's pad midpoint (§15), and pads of other nets beside the pads left no legal start that near.
+(2) Negotiation ripped one coupled half, the partner went with it (D50), and the clean-up re-coupling ran only on budget left over,
+which a run that spends its budget never has. (3) End legs into 0402 pads flanked by GND pads: 82,450 goal candidates, none legal.
+
+**What it does** (`route/router.cpp`: `route_pair`, `pair_leg`, `pad_exits`, `commit`, the clean-up).
+
+| Option | Default | What |
+|---|---|---|
+| `--pair-leg-mm X` | 2.5 | The longest reach of the legs (the old clamp of §15). The pair search's window grows with it |
+| `--protect-coupled` | off | A negotiated route that would rip a half of a coupled pair fails ("would rip a coupled pair half", reason `rip_limit`) |
+| `--recouple-work N` | 2,000,000 | The clean-up re-coupling of split pairs may spend N work units past the search budget; under a time limit alone, the time that much work takes at the run's average rate. `0` = the old behaviour |
+| `--pair-pad-exits` | off | Where no direct leg (straight, dog-leg, entry from behind) of a candidate is legal, the same shapes after a straight exit from the pad centre along one of 8 directions, to r + w, 2r + w or 4r + w (r half the pad's larger side). Legal exits are found once per pad and attempt; each check is work |
+| `--pair-retry-leg-mm X` | 0 | A pair attempt that finds no coupled path is tried again with legs of up to X, then with pad exits; pairs the first attempt couples route as without it |
+
+With `--recouple-work 0` and the other options at their defaults the output is byte-identical to the router before (20 boards).
+
+**Measured** (`bench/records/issue67/`: 18 PCBench pair boards of §15 and two KiCad demos, 69 pairs, `--work 30000000`, one variant,
+KiCad 10 DRC). On the 18 PCBench boards:
+
+| Options | Pairs ≥ 80 % / ≥ 50 % / > 0 % of 60 | Median share | Routed of 2,403 | KiCad errors added |
+|---|---|--:|--:|--:|
+| before | 19 / 33 / 47 | 60 % | 2,248 | 0 |
+| `--pair-leg-mm 4` | 15 / 29 / 45 | 47 % | 2,248 | 0 |
+| `--pair-leg-mm 6` | 11 / 33 / 46 | 58 % | 2,248 | 0 |
+| `--protect-coupled` | 16 / 30 / 44 | 51 % | 2,245 | 0 |
+| `--recouple-work 2000000` (default now) | 20 / 34 / 48 | 65 % | 2,248 | 0 |
+| `--pair-pad-exits` | 15 / 30 / 46 | 50 % | 2,249 | 0 |
+| `--pair-retry-leg-mm 6` | 19 / 35 / 47 | 60 % | 2,250 | 0 |
+
+- A longer fixed reach loses coupling on these boards: the search takes the first legal goal candidate, and a far one comes up
+  first (hub 92 → 74 %, USB-C-Screen-Adapter 87 → 0 % at 4 mm). It is what quanln's board needs (CHG_D 0 → 90.4 % at 6 mm, by their
+  measurement), so it is an option, and `--pair-retry-leg-mm` is the form that leaves coupled pairs alone. That retry coupled no
+  public pair by itself; its failed attempts only shift the rest of the run's budget.
+- Protecting coupled halves cost 3 connections and 2 clean boards and lowered coupling on balance (quanln: 3 more open connections).
+- The re-coupling allowance changed 2 of 20 boards, both for the better (PmodHDMIIn's third pair 4 → 29 %, USB-C-Screen-Adapter's L2
+  0 → 89 %), with equal completion and DRC. It replaces the reserved tenth that §15 dropped: it comes after the budget, so routing gives
+  up nothing for it.
+- Pad exits are mixed (PmodHDMIIn 112 → 116 routed, RaspberryPi-PoE's second pair 24 → 73 %; USB-C-Screen-Adapter loses coupling on
+  four pairs and two connections).
+
+**Cause 3.** Pad exits are the simple model of a pad's legal entry directions: a straight run out of the free side, then the usual
+leg. The unit test (a pair whose pads are walled in on three sides) couples only with them. Whether they couple USB_D_MCU on
+quanln's board is not known; its closest goal candidate missed by 0.027 mm, which suggests the legs fail on the last few µm into the
+pad rather than on the direction, and the neck-down width is the other lever there. Not built: pad entry from the pad's edge rather than
+its centre, legs of more than one bend after an exit, and a pair whose end leg starts uncoupled at the pad and couples after the
+obstacle (the long-leg retry is the nearest form).
+
+## 78. Pad-to-plane searches: the via term, `causes` with filled zones, measured (2026-11-13, D179)
+
+The rest of M22 item 4 (§63). With `--plane-informed` the bound of a pad-to-plane search is the octile distance to the plane's box **plus
+one via for a state on another layer than the plane's** (`router.cpp`, the search's `h`): such a search has no target cells but the plane
+on its one layer, and every layer change costs at least `via_cost`, so the bound stays admissible and consistent. `tracemaker causes`
+now fills copper zones that have no fill and routes its copies with soft zones, as `route` does (§54); `--no-fill-planes` keeps the old
+reading.
+
+Measured on the M22 gate set (33 `pcbench-bd-fail` boards, 10 M work, 8 variants, `bench/records/m22-plane`): `--plane-informed` gives
+**byte-identical boards** to the base on all 33. No pad-to-plane search there reaches a point where the bound, the proof or the fallback
+changes a decision, so item 4 does nothing for the gate. The option stays off. With it, all eight items of M22 are built and off; the best
+arm (`--via-shove --escape-all`, §64) cut open connections by 3.5 % against the 15 % gate.
+

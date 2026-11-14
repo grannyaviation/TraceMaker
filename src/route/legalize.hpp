@@ -27,12 +27,19 @@ struct LegalizeOptions {
   double margin_mm = 0.003;  // clearance asked for beyond the rule (rounding to nanometres, the pairs between sweeps)
   int sweeps = 300;          // projection sweeps at most
   double edge_mm = 0.035;    // copper stays this far inside the board outline (plus the rule's edge clearance)
+  // The router's hole to hole and edge clearance (drc::RuleEngine::router_hole_to_hole, router_edge_clearance: custom rules included);
+  // -1 takes the board minimums.
+  Coord hole_to_hole = -1, edge_clearance = -1;
   // > 0: every unlocked route track is cut into pieces of at most this length (at the vertices of same-net copper that lie on it, and evenly
   // in between), so that a long straight track can bend where its neighbours are too close, instead of only moving as a whole; after the
   // sweeps the vertices that stayed on a straight line are merged again. 0 = the vertices the routes have (unchanged behaviour).
   double subdivide_mm = 0;
   std::uint64_t seed = 0;    // != 0: the pairs are visited in another (seeded) order, which leaves other pinches unresolved: portfolio variants differ
   std::vector<geom::Point> outline;  // board outline polygon (Obstacles::outline()); empty = unbounded
+  // > 0: when the sweeps leave pairs too close, up to this many rounds of the realizer (doc 20 §2.3): the constraints near their limit are
+  // linearised and the smallest move that meets them all is solved for at once, within a trust region. 0 = projection only. 20 by
+  // default (D162); the experiment switch TM_LEGALIZE_REALIZE=N overrides it.
+  int realize_iters = 20;
 };
 
 struct LegalizeResult {
@@ -42,6 +49,8 @@ struct LegalizeResult {
   int pairs_after = 0;
   double max_move_mm = 0;
   int sweeps_used = 0;
+  int pairs_projected = -1;    // with the realizer: the pairs the sweeps left (pairs_after is after the realizer); -1 = it did not run
+  int realize_iters_used = 0;
 };
 
 // Moves the vertices of `routes` (tracks and vias of the connections) so that the clearances of `rules` hold between nets, to

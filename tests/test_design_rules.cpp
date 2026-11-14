@@ -446,6 +446,95 @@ TEST_CASE("physical_hole_clearance between a net's vias and its own tracks leave
   CHECK(route_board(pads_only).routed == 2);
 }
 
+// Issue #64: physical_clearance holds whatever the nets, so "A.Type == 'Via' && B.Type == 'Pad'" keeps vias out of and away from
+// the pads of their own net, which the net-class clearance does not.
+const char* kViaNotInPad =
+    "(version 1)\n(rule \"via_not_in_pad\" (constraint physical_clearance (min 0.1mm)) (condition \"A.Type == 'Via' && B.Type == 'Pad'\"))\n";
+
+TEST_CASE("physical_clearance keeps vias out of and away from pads of their own net", "[rules][route]") {
+  const Files f("pc_vip", board_text(""), kViaNotInPad);
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto with_rule = io::read_design_rules(f.pcb.string());
+  const model::DesignRules no_rule = [&] {
+    auto r = with_rule;
+    r.custom.clear();
+    return r;
+  }();
+  // R1's SIG pad spans (3.5..4.5, 2.5..3.5) mm. A 0.6 mm via at its centre, 0.05 mm below it, and 0.2 mm below it.
+  const geom::Point in_pad{4'000'000, 3'000'000}, near{4'000'000, 3'850'000}, clear{4'000'000, 4'000'000};
+  const Coord d = 600'000, drill = 300'000;
+  {
+    route::Obstacles obs(lb.board, no_rule);
+    CHECK(obs.via_state(in_pad, d, drill, 1, 0, false) == 0);  // the net-class clearance does not hold within a net
+    CHECK(obs.via_state(near, d, drill, 1, 0, false) == 0);
+  }
+  route::Obstacles obs(lb.board, with_rule);
+  CHECK(obs.via_state(in_pad, d, drill, 1, 0, false) == 2);
+  CHECK(obs.via_state(near, d, drill, 1, 0, false) == 2);
+  CHECK(obs.via_state(clear, d, drill, 1, 0, false) == 0);
+  CHECK(obs.fixed_via_code(in_pad, d, drill, 0, 1) == route::Obstacles::kBlocked);  // the cached paths agree
+  CHECK(obs.fixed_via_code(near, d, drill, 0, 1) == route::Obstacles::kBlocked);
+  CHECK(obs.fixed_via_code_reference(near, d, drill, 0, 1) == route::Obstacles::kBlocked);
+  CHECK(obs.fixed_via_code(clear, d, drill, 0, 1) != route::Obstacles::kBlocked);
+  CHECK(obs.segment_state(in_pad, {8'000'000, 3'000'000}, 0, 250'000, 1, false) == 0);  // tracks: the rule is about vias
+  CHECK_FALSE(obs.needs_exact_routing());  // the condition does not tell nets apart: the cache stays
+  CHECK(obs.rules().warnings().empty());
+  CHECK_FALSE(obs.rules().via_rule_hits_own_tracks(1));
+  // The DRC reports a via in its own pad as KiCad does: a clearance violation named after the rule.
+  auto lv = io::read_board_file(f.pcb.string());
+  lv.board.vias.push_back({});
+  auto& v = lv.board.vias.back();
+  v.pos = in_pad, v.size = d, v.drill = drill, v.layer_top = 0, v.layer_bottom = 3, v.net = 1;
+  const auto rep = drc::run_drc(lv.board, with_rule);
+  int named = 0;
+  for (const auto& x : rep.violations) named += x.type == "clearance" && x.description.find("via_not_in_pad") != std::string::npos;
+  CHECK(named == 1);
+  CHECK_FALSE(drc::run_drc(lv.board, no_rule).counts().contains("clearance"));
+  // A later rule with severity ignore turns it off, as in KiCad.
+  auto ignored = with_rule;
+  ignored.custom.push_back(ignored.custom.front());
+  ignored.custom.back().name = "allowed";
+  ignored.custom.back().severity = "ignore";
+  CHECK_FALSE(drc::run_drc(lv.board, ignored).counts().contains("clearance"));
+  CHECK(route::Obstacles(lb.board, ignored).via_state(in_pad, d, drill, 1, 0, false) == 0);
+  // Routed under the rule, with the wall forcing vias: both nets connect, and the DRC finds no via near a pad.
+  const Files walled("pc_vip_wall", board_text(kOuterWall), kViaNotInPad);
+  const auto r = route_board(walled);
+  CHECK(r.routed == 2);
+  CHECK_FALSE(r.vias.empty());
+  auto lw = io::read_board_file(walled.pcb.string());
+  const auto rw = io::read_design_rules(walled.pcb.string());
+  lw.board.tracks.insert(lw.board.tracks.end(), r.tracks.begin(), r.tracks.end());
+  lw.board.vias.insert(lw.board.vias.end(), r.vias.begin(), r.vias.end());
+  CHECK_FALSE(drc::run_drc(lw.board, rw).counts().contains("clearance"));
+}
+
+TEST_CASE("physical_clearance between tracks and pads: kept against other nets, left out where a track meets its own pad",
+          "[rules][route]") {
+  const Files f("pc_track", board_text(""),
+                "(version 1)\n(rule \"pad keepaway\" (constraint physical_clearance (min 1mm)) (condition \"A.Type == 'Track' && B.Type == 'Pad'\"))\n");
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto rules = io::read_design_rules(f.pcb.string());
+  route::Obstacles obs(lb.board, rules);
+  // Every connection touches its pads, so the rule cannot hold there: the router leaves those pairs out and says so.
+  REQUIRE(obs.rules().warnings().size() == 1);
+  CHECK(obs.rules().warnings().front().find("rule 'pad keepaway'") != std::string::npos);
+  CHECK(obs.segment_state({4'000'000, 3'000'000}, {8'000'000, 3'000'000}, 0, 250'000, 1, false) == 0);  // SIG leaves its own pad
+  // A GND track 0.5 mm above R1's SIG pad: legal by clearance, inside the rule's 1 mm.
+  const geom::Point a{2'000'000, 1'875'000}, b{6'000'000, 1'875'000};
+  CHECK(obs.segment_state(a, b, 0, 250'000, 2, false) == 2);
+  CHECK(obs.segment_state(a, b, 1, 250'000, 2, false) == 0);  // the pad is on F.Cu only
+  // The cache: legal there only for SIG, whose tracks may touch the pad.
+  CHECK(obs.fixed_code({4'000'000, 1'875'000}, 0, 125'000, 0, 2) == 1);
+  // A rule between a net's vias and its own tracks leaves the net without vias, as physical_hole_clearance does.
+  const Files g("pc_via_track", board_text(""),
+                "(version 1)\n(rule \"via keepaway\" (constraint physical_clearance (min 0.1mm)) (condition \"A.Type == 'Via' && B.Type == 'Track'\"))\n");
+  auto lg = io::read_board_file(g.pcb.string());
+  const auto rg = io::read_design_rules(g.pcb.string());  // the engine keeps a reference
+  const drc::RuleEngine re(lg.board, rg);
+  CHECK(re.via_rule_hits_own_tracks(1));
+}
+
 TEST_CASE("a keepout that forbids only vias blocks vias and lets tracks through", "[rules][route]") {
   const std::string ko =
       "  (zone (net 0) (net_name \"\") (layers \"B.Cu\") (name \"tc\") (hatch edge 0.5) (connect_pads (clearance 0))\n"
@@ -665,6 +754,80 @@ TEST_CASE("lazy codes: unknown until written, allocated by chunk", "[route]") {
   CHECK(c.bytes() == 2 * 4096 * sizeof(std::int32_t));
   c.init(10);
   CHECK(c.get(5) == route::LazyCodes::kUnknown);
+  std::size_t held = 0;  // a counter shared by several, kept equal to the bytes they hold
+  route::LazyCodes d, e;
+  d.init(10'000, &held);
+  e.init(10'000, &held);
+  d[1] = 1;
+  d[9'000] = 2;
+  e[3] = 3;
+  CHECK(held == 3 * 4096 * sizeof(std::int32_t));
+  d.release();
+  CHECK(held == 4096 * sizeof(std::int32_t));
+  CHECK(d.get(1) == route::LazyCodes::kUnknown);
+  CHECK(e.get(3) == 3);
+}
+
+bool same_copper(const route::RouteResult& x, const route::RouteResult& y) {
+  if (x.routed != y.routed || x.tracks.size() != y.tracks.size() || x.vias.size() != y.vias.size()) return false;
+  for (std::size_t i = 0; i < x.tracks.size(); ++i) {
+    const auto &s = x.tracks[i], &t = y.tracks[i];
+    if (!(s.a == t.a && s.b == t.b && s.width == t.width && s.layer == t.layer && s.net == t.net)) return false;
+  }
+  for (std::size_t i = 0; i < x.vias.size(); ++i) {
+    const auto &u = x.vias[i], &v = y.vias[i];
+    if (!(u.pos == v.pos && u.size == v.size && u.drill == v.drill && u.net == v.net)) return false;
+  }
+  return true;
+}
+
+TEST_CASE("obstacle caches: classes with the same values share one, and the memory bound is deterministic", "[route]") {
+  // Issue #54: one cache per class (and track width) per router, so a board with a class per impedance pair ran out of memory.
+  auto run = [](const Files& f, bool split, Coord other_clearance, double mb) {
+    const auto lb = io::read_board_file(f.pcb.string());
+    auto rules = io::read_design_rules(f.pcb.string());
+    if (split) {  // SIG in a class of its own
+      model::NetClass other = rules.default_class();
+      other.name = "Other";
+      if (other_clearance > 0) other.clearance = other_clearance;
+      rules.classes.push_back(other);
+      rules.assignments["SIG"] = {"Other"};
+    }
+    route::RouterOptions o;
+    o.work_budget = 2'000'000;
+    o.gpu_device = -1;
+    o.time_limit_s = 600;
+    o.class_cache_mb = mb;
+    return route::Router(lb.board, rules, o).run();
+  };
+  const std::string board = board_text(
+      "  (footprint \"R\" (layer \"F.Cu\") (at 10 5)\n    (property \"Reference\" \"R3\" (at 0 0) (layer \"F.SilkS\"))\n"
+      "    (pad \"1\" smd rect (at 0 -2) (size 1 1) (layers \"F.Cu\") (net 1 \"SIG\"))\n"
+      "    (pad \"2\" smd rect (at 0 2) (size 1 1) (layers \"F.Cu\") (net 2 \"GND\"))\n  )\n");
+  const Files f("class_cache", board, "");
+  const auto one = run(f, false, 0, 2048);
+  REQUIRE(one.routed == 4);
+  CHECK(one.obstacle_caches == 1);
+  // Same values: one cache, as if the nets were in one class.
+  const auto two = run(f, true, 0, 2048);
+  CHECK(two.obstacle_caches == 1);
+  CHECK(same_copper(one, two));
+  CHECK(two.work.total().fixed_checks == one.work.total().fixed_checks);
+  // A rule that reads class names (it never matches, so the copper is the same) keeps them apart.
+  const Files g("class_cache_named", board,
+                "(version 1)\n(rule \"x\" (condition \"A.NetClass == 'Nope'\") (constraint clearance (min 5mm)))\n");
+  const auto named_one = run(g, false, 0, 2048), named_two = run(g, true, 0, 2048);
+  CHECK(named_one.obstacle_caches == 1);
+  CHECK(named_two.obstacle_caches == 2);
+  CHECK(same_copper(named_one, named_two));
+  // Different values: two caches. A bound below one chunk frees the other cache on each switch; the run stays deterministic.
+  const auto roomy = run(f, true, 250'000, 2048), tight = run(f, true, 250'000, 1e-6), again = run(f, true, 250'000, 1e-6);
+  CHECK(roomy.obstacle_caches == 2);
+  CHECK(roomy.cache_evictions == 0);
+  CHECK(tight.cache_evictions > 0);
+  CHECK(tight.routed == 4);
+  CHECK(same_copper(tight, again));
+  CHECK(tight.cache_evictions == again.cache_evictions);
 }
 
 TEST_CASE("inside board: the exact test by raster-row edges equals the every-edge reference", "[geom][route]") {
@@ -1307,4 +1470,131 @@ TEST_CASE("A clearance rule for vias: cached via codes probe a via, as via_state
   CHECK(blocks_sig(obs.fixed_via_code_reference(p, d, drill, 0, 1)));
   CHECK(obs.disk_state(p, 0, 125'000, 1, 0, false) == 0);  // tracks keep the class clearance
   CHECK(obs.fixed_code(p, 0, 125'000, 0, 1) == route::Obstacles::kFree);
+}
+
+TEST_CASE("Pad_Number and Pin_Name conditions are evaluated: a clearance rule for pad 2 only", "[rules][route]") {
+  // R1's pad 1 is SIG at (4, 3), its pad 2 GND at (4, 7); both 1 mm square.
+  const std::string rule =
+      "(version 1)\n(rule \"pad2_keepaway\" (constraint clearance (min 1mm))\n"
+      "  (condition \"B.Type == 'Pad' && B.Pad_Number == '2'\"))\n"
+      "(rule \"by pin name\" (constraint clearance (min 0.3mm)) (condition \"B.Pin_Name == 'VCC'\"))\n";
+  const Files f("pad_number", board_text(""), rule);
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto rules = io::read_design_rules(f.pcb.string());
+  route::Obstacles obs(lb.board, rules);
+  for (const auto& w : obs.rules().warnings()) CHECK(w.find("does not evaluate") == std::string::npos);
+  // A 0.25 mm SIG track 0.475 mm from GND's pad 2: legal by the net classes, closer than the rule.
+  CHECK(obs.segment_state({2'000'000, 5'900'000}, {6'000'000, 5'900'000}, 0, 250'000, 1, false) == 2);
+  CHECK(obs.fixed_code({4'000'000, 5'900'000}, 0, 125'000, 0, 1) == 2);  // cached path agrees: legal for GND only
+  // A GND track 0.475 mm from SIG's pad 1: the rule does not apply.
+  CHECK(obs.segment_state({2'000'000, 4'100'000}, {6'000'000, 4'100'000}, 0, 250'000, 2, false) == 0);
+  CHECK(obs.fixed_code({4'000'000, 4'100'000}, 0, 125'000, 0, 2) == route::Obstacles::kFree);
+  CHECK_FALSE(obs.needs_exact_routing());  // a pad's own property: the per-class cache stays valid
+}
+
+TEST_CASE("custom hole_to_hole and edge_clearance rules: the router keeps them, Net is the net code", "[rules][route]") {
+  // A via (0.6 mm, drill 0.3) at (10, 4.5): its hole is 0.95 mm from the 0.8 mm hole at (10, 3), more than the 0.25 mm board minimum.
+  const geom::Point p{10'000'000, 4'500'000};
+  const Coord d = 600'000, drill = 300'000;
+  auto obstacles_with = [&](const char* name, const std::string& dru, auto&& check) {
+    const Files f(name, board_text(kHoleInTheWay), dru);
+    auto lb = io::read_board_file(f.pcb.string());
+    const auto rules = io::read_design_rules(f.pcb.string());
+    route::Obstacles obs(lb.board, rules);
+    check(obs);
+  };
+  auto warned = [](const route::Obstacles& obs, const std::string& text) {
+    const auto& w = obs.rules().warnings();
+    return std::any_of(w.begin(), w.end(), [&](const std::string& s) { return s.find(text) != std::string::npos; });
+  };
+  obstacles_with("h2h_none", "", [&](const route::Obstacles& obs) {
+    CHECK(obs.via_state(p, d, drill, 1, 0, false) == 0);
+    CHECK(obs.fixed_via_code(p, d, drill, 0, 1) != route::Obstacles::kBlocked);
+  });
+  obstacles_with("h2h_net", "(version 1)\n(rule \"h2h\" (constraint hole_to_hole (min 1mm)) (condition \"A.Net != B.Net\"))\n",
+                 [&](const route::Obstacles& obs) {
+                   CHECK(obs.rules().router_hole_to_hole() == 1'000'000);
+                   CHECK(warned(obs, "rule 'h2h': the router keeps its hole to hole distance (1.000 mm)"));
+                   CHECK_FALSE(warned(obs, "does not evaluate"));
+                   CHECK(obs.via_state(p, d, drill, 1, 0, false) == 2);
+                   CHECK(obs.fixed_via_code(p, d, drill, 0, 1) == route::Obstacles::kBlocked);  // cached path agrees
+                   CHECK(obs.via_state({10'000'000, 4'600'000}, d, drill, 1, 0, false) == 0);   // 1.05 mm
+                   CHECK_FALSE(obs.needs_exact_routing());
+                 });
+  // A 0.25 mm track 0.675 mm from the outline: legal at the board's 0.5 mm, not under a 1 mm rule for tracks.
+  const geom::Point a{2'000'000, 800'000}, b{6'000'000, 800'000};
+  obstacles_with("edge_zone", "(version 1)\n(rule \"zones\" (constraint edge_clearance (min 1mm)) (condition \"A.Type == 'Zone'\"))\n",
+                 [&](const route::Obstacles& obs) {
+                   CHECK(obs.rules().router_edge_clearance() == 500'000);  // the rule cannot hold for a track or via
+                   CHECK(obs.segment_state(a, b, 0, 250'000, 1, false) == 0);
+                 });
+  obstacles_with("edge_track", "(version 1)\n(rule \"tracks\" (constraint edge_clearance (min 1mm)) (condition \"A.Net == 1 || A.Net == 99\"))\n",
+                 [&](const route::Obstacles& obs) {
+                   CHECK(obs.rules().router_edge_clearance() == 1'000'000);
+                   CHECK(warned(obs, "rule 'tracks': the router keeps its edge clearance (1.000 mm)"));
+                   CHECK(obs.segment_state(a, b, 0, 250'000, 1, false) == 2);
+                   CHECK(obs.fixed_code({4'000'000, 800'000}, 0, 125'000, 0, 1) == route::Obstacles::kBlocked);
+                 });
+  // The DRC applies the hole_to_hole rule as written: between holes of different nets only.
+  const std::string net_rule = "(version 1)\n(rule \"h2h\" (constraint hole_to_hole (min 1mm)) (condition \"A.Net != B.Net\"))\n";
+  const Files f("h2h_drc", board_text(""), net_rule);
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto rules = io::read_design_rules(f.pcb.string());
+  const drc::RuleEngine re(lb.board, rules);
+  drc::CopperItem v1, v2;
+  v1.kind = v2.kind = drc::ItemKind::Via;
+  v1.net = 1;
+  v2.net = 1;
+  CHECK(re.hole_to_hole(&v1, &v2) == 250'000);
+  v2.net = 2;
+  CHECK(re.hole_to_hole(&v1, &v2) == 1'000'000);
+}
+
+TEST_CASE("kind tables: conditions on item types alone give the same clearances as evaluating them", "[rules][drc]") {
+  // Issue #53: a condition that reads only A.Type and B.Type is evaluated once per pair of kinds. Every pair of items on the parity board
+  // (pads, tracks, vias, a zone) and probes of every kind must get the same clearance, hole clearance and edge clearance either way.
+  const std::string zone =
+      "  (zone (net 2) (net_name \"GND\") (layer \"B.Cu\") (name \"gnd\") (hatch edge 0.5) (connect_pads (clearance 0.3))\n"
+      "    (min_thickness 0.25) (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5)) (polygon (pts (xy 1 1) (xy 19 1) (xy 19 9) (xy 1 9)))\n"
+      "    (filled_polygon (layer \"B.Cu\") (pts (xy 1 8) (xy 19 8) (xy 19 9) (xy 1 9))))\n";
+  const std::string dru =
+      "(version 1)\n"
+      "(rule \"non-zone\" (condition \"A.Type != 'Zone' && B.Type != 'Zone'\") (constraint clearance (min 0.09mm)))\n"
+      "(rule \"via-pad\" (condition \"A.Type == 'Via' && B.Type == 'Pad'\") (constraint clearance (min 0.3mm)))\n"
+      "(rule \"track\" (layer outer) (condition \"A.Type == 'track' || B.Type == 'Arc'\") (constraint clearance (min 0.11mm)))\n"
+      "(rule \"vias\" (condition \"A.Type == 'Via'\") (constraint hole_clearance (min 0.27mm)) (constraint edge_clearance (min 0.4mm)))\n"
+      "(rule \"by net\" (condition \"A.NetName == 'GND' && B.Type == 'Pad'\") (constraint clearance (min 0.2mm)))\n"
+      "(rule \"always\" (condition \"true\") (constraint hole_clearance (min 0.26mm)))\n";
+  const Files f("kind_tables", board_text(std::string(kParityCopper) + zone), dru);
+  const auto lb = io::read_board_file(f.pcb.string());
+  const auto rules = io::read_design_rules(f.pcb.string());
+  drc::RuleEngine table(lb.board, rules), direct(lb.board, rules);
+  direct.use_kind_tables(false);
+  auto items = drc::build_copper(lb.board).items;
+  for (const auto kind : {drc::ItemKind::Track, drc::ItemKind::Via, drc::ItemKind::Arc, drc::ItemKind::Graphic})
+    for (const model::NetId net : {0, 1, 2}) {
+      drc::CopperItem probe;
+      probe.kind = kind;
+      probe.net = net;
+      probe.index = -1;
+      probe.layers = ~model::LayerMask{0};
+      items.push_back(probe);
+    }
+  REQUIRE(std::any_of(items.begin(), items.end(), [](const drc::CopperItem& it) { return it.kind == drc::ItemKind::Zone; }));
+  int differ = 0, rule_values = 0;
+  for (const auto& a : items) {
+    for (int layer = -1; layer < lb.board.copper_count(); ++layer) {
+      differ += table.edge_clearance(a, layer) != direct.edge_clearance(a, layer);
+      differ += table.hole_clearance(&a, a, layer) != direct.hole_clearance(&a, a, layer);
+    }
+    for (const auto& b : items)
+      for (int layer = 0; layer < lb.board.copper_count(); ++layer) {
+        const Coord c = table.clearance(a, b, layer);
+        differ += c != direct.clearance(a, b, layer);
+        differ += table.hole_clearance(&a, b, layer) != direct.hole_clearance(&a, b, layer);
+        rule_values += c == 90'000 || c == 110'000 || c == 300'000;
+      }
+  }
+  CHECK(differ == 0);
+  CHECK(rule_values > 0);  // the type rules did apply somewhere
 }

@@ -41,6 +41,8 @@ SUBCOMMANDS:
                               drills, mirroring (read-only; doc 05 §43)
   advice-check                Check an advice file (doc 17) against a board: the refusals
                               `route --advice` would give, and what each hint does
+  daemon                      Hold board sessions between clients (the KiCad plugin's "route
+                              selected nets") on a Unix socket, JSON lines (doc 19 §10)
   session                     Serve a board session to an agent over MCP (stdin/stdout) or JSON
                               lines: list open connections, route with hints, rip, undo, save
                               (doc 19)
@@ -49,6 +51,11 @@ SUBCOMMANDS:
   causes                      Why connections stay open on a routed board: each open connection
                               is routed again with other nets' copper removed near its ends,
                               away from them or everywhere (doc 05 §55)
+  cuts                        Cut test of a routed board's topology: cuts between pads and vias
+                              that cannot hold their wires, vias with no room in their cell
+                              (doc 05 §67)
+  walled                      Pins no track can leave past the board's fixed copper on any
+                              layer, with no room for a via (doc 20 §2.4)
   layers                      Write a copy of a board with another copper layer count (inner
                               layers added, or empty ones removed; doc 05 §53)
   srj-import                  Convert a Simple Route JSON problem (tscircuit) to a KiCad board
@@ -178,6 +185,10 @@ OPTIONS:
           --seed UINT
           --layer-assign      Prefer per connection the layer with the fewest crossings
                               (two-layer boards; doc 16 F2)
+          --layer-dir-pen FLOAT
+                              Cost (pitches per step) of orthogonal steps against the layer's
+                              preferred direction (by default even layers horizontal, odd
+                              vertical; automatic 0.3 on breakout boards and with --layer-dir)
           --crowded-source    Every strict search starts from the end with more copper and pads
                               of other nets near it, a boxed-in pin is proved at once (doc 05
                               §55; the portfolio does so in four of its eight variants by
@@ -215,6 +226,10 @@ OPTIONS:
                               through vias only, F.Cu-In2 included: rails take no laser via
           --diff-pairs        Route differential pairs (KiCad P/N or +/- names) as coupled
                               pairs first (doc 05 §15)
+          --pair-share FLOAT:FLOAT in [0 - 1]
+                              Coupled pair searches stop after this share of the work budget
+                              (else of --time); the pairs left are routed as single connections
+                              (0 = no limit)
           --pair-twists, --no-pair-twists{false}
                               Coupled pairs may swap sides at a layer change, for pairs whose
                               pin order is mirrored between the ends (default on; only with
@@ -222,6 +237,19 @@ OPTIONS:
           --pair-skew-mm FLOAT
                               Intra-pair skew limit for coupled pairs: meanders on the shorter
                               half (0 = custom skew rules only)
+          --pair-leg-mm FLOAT:FLOAT in [0.6 - 50]
+                              Coupled pairs: longest reach of the uncoupled legs from the pads
+                              to the coupled section (default 2.5)
+          --protect-coupled   Coupled pairs: negotiation never rips a half of a coupled pair
+                              (the route that would fails instead)
+          --recouple-work INT:NONNEGATIVE
+                              Coupled pairs: work units the clean-up re-coupling of split pairs
+                              may spend past the budget (default 2000000, 0 = none)
+          --pair-retry-leg-mm FLOAT:FLOAT in [0 - 50]
+                              Coupled pairs: a pair that finds no coupled path is tried again
+                              with legs of up to this reach and pad exits (0 = no retry)
+          --pair-pad-exits    Coupled pairs: legs may leave an end pad straight out in any of 8
+                              directions before turning to the pair
           --global            Global routing first: detailed search follows coarse corridors
           --no-optimize{false}
                               Skip the post-routing clean-up pass (fewer vias, shorter tracks)
@@ -231,12 +259,19 @@ OPTIONS:
           --escape-plan, --no-escape-plan{false}
                               Reserve escape corridors for the pins of dense packages (QFP,
                               BGA) before routing
+          --soft-copper-graphics
+                              Board copper graphics (polygons on a copper layer, e.g. an
+                              EasyEDA import's pours) take the net of the one net whose pads,
+                              tracks or vias they touch: that net may touch them, no other
+                              (default: net-less copper nothing may touch)
           --escape-flow       Escape plan v2: min-cost-flow channel and layer assignment for
                               deep BGA arrays (implies --escape-plan; experimental)
           --reroute           Remove every unlocked track and via first and route the whole
                               board again
           --halving           With more --variants than --threads: successive halving over all
-                              the variants instead of running only the first ones
+                              the variants instead of running only the first ones; not with
+                              --relax, rounds or a warm start (including the relax rescue),
+                              which then run all the variants
           --cut-report        Report straight lines across the board that more nets must cross
                               than tracks fit (proof that the placement cannot be routed)
           --escape-report     Report the pins of deep BGA arrays per ring and how many were
@@ -256,6 +291,43 @@ OPTIONS:
           --vias-off-pads-below FLOAT
                               Pad width (mm) below which --keep-vias-off-pads applies (default
                               2)
+          --no-rescue{false}  Do not route again with --relax when connections are left open
+                              (by default the rescue runs, each pass on a budget of its own,
+                              --time and --work again, and a result is kept only if it is
+                              better; doc 05 §68, §71)
+          --no-why-open{false}
+                              Do not check the pins of open connections for a way out (by
+                              default each is flood-filled against the board's fixed copper,
+                              and a pin walled in on every layer with no room for a via is
+                              reported as unconnectable as placed; doc 20 §2.4)
+          --only-net TEXT ... Route only the nets that match one of these patterns (KiCad
+                              wildcards such as '/I2S_*', or regular expressions; repeatable or
+                              comma separated); the other nets are left unrouted and their
+                              copper stays (staged routing)
+          --skip-net TEXT ... Leave the nets that match these patterns unrouted (KiCad
+                              wildcards or regular expressions; repeatable or comma separated)
+          --repair TEXT:{auto,on,off}
+                              Repair windows for connections still open at the end: the
+                              unlocked copper near each is lifted (a window that grows on each
+                              failure) and routed again; an attempt is kept only if no joined
+                              pads come apart and fewer connections are open. auto (default):
+                              only on a board that came with unlocked tracks or vias; on: also
+                              on a board routed from nothing; off (doc 05 §75)
+          --repair-window-mm FLOAT ...
+                              Repair: window radii round each end of an open connection, tried
+                              in turn (default 1,2,4)
+          --repair-work INT   Repair: work budget of each attempt in search expansions (default
+                              3000000)
+          --repair-branches INT
+                              Repair: a window that would lift more branches (the tracks and
+                              vias of one net between two pads or junctions) stops growing
+                              (default 64)
+          --repair-conns INT  Repair: open connections tried at most (default 64)
+          --rescue-mode TEXT:{warm,fresh,both}
+                              How the rescue routes again with relax: warm (from the plain
+                              run's routes), fresh (from nothing) or both (warm, then fresh
+                              while connections are open; each pass on its own budget, kept
+                              only if better; default both; doc 05 §71)
           --no-neck-nets TEXT ...
                               Comma-separated nets that are never narrowed below their class
                               width nor given the small neck-down via (power nets of a
@@ -282,6 +354,11 @@ OPTIONS:
           --no-field{false}   Use the octile heuristic only (no cost-to-go fields)
           --kb TEXT           Knowledge base file (failure memory across runs)
           --no-kb             Do not read or update the knowledge base
+          --class-cache-mb FLOAT:NONNEGATIVE
+                              Memory bound of each router's fixed-obstacle caches, in MB (0 =
+                              none; default 2048). Past it the oldest are freed and computed
+                              again: more time, and the result may differ from an unbounded run
+                              (still deterministic)
           --threads INT       Threads for the portfolio (differently configured routers, best
                               kept). Without --variants it is also the portfolio size, except
                               with --work, where all variants run and the output is identical
@@ -295,6 +372,13 @@ OPTIONS:
           --layer-cost TEXT ...
                               Track cost per layer as LAYER=FACTOR, e.g. In1.Cu=4,In2.Cu=4 (1 =
                               normal, at most 1000)
+          --layer-dir TEXT ...
+                              Preferred direction per copper layer as LAYER=h|v|none, e.g.
+                              F.Cu=v,B.Cu=h (replaces the even/odd rule; strength
+                              --layer-dir-pen, 0.3 if not given)
+          --layer-diag-pen TEXT ...
+                              Extra cost (pitches per step) of 45-degree steps, as
+                              LAYER=PITCHES entries or one value for every layer, e.g. F.Cu=0.3
           --no-fill-planes    Leave zones that have no fill unfilled while routing (default:
                               fill them in memory and route with --soft-zones, so plane nets
                               drop vias into their planes)
@@ -674,6 +758,32 @@ OPTIONS:
           --json TEXT         Write what each hint became as JSON
 ```
 
+### `tracemaker daemon`
+
+```text
+Hold board sessions between clients (the KiCad plugin's "route selected nets")
+on a Unix socket, JSON lines (doc 19 §10)
+
+
+tracemaker daemon [OPTIONS]
+
+
+OPTIONS:
+  -h,     --help              Print this help message and exit
+          --socket TEXT       Socket path (default $XDG_RUNTIME_DIR/tracemaker/daemon.sock,
+                              else /tmp/tracemaker-UID/daemon.sock)
+          --idle-exit INT:NONNEGATIVE [1800]
+                              Exit after this many seconds without a client (0 = never)
+          --max-sessions INT:INT in [1 - 64] [4]
+                              Sessions held at once; the least recently used is closed beyond
+                              this
+          --threads INT [4]   Portfolio threads of a route call with several variants (the
+                              result does not depend on it)
+          --gpu               Cost-to-go fields on the GPU (default: the CPU reference; same
+                              results)
+          --print-socket      Print the default socket path and exit
+```
+
 ### `tracemaker session`
 
 ```text
@@ -761,6 +871,57 @@ OPTIONS:
                               default 8)
           --seed UINT         Router seed (default 1)
           --baseline-only     Only the run on the board as it is (for a copy with more layers)
+          --soft-zones        Zone fills do not block other nets (as route --soft-zones)
+          --no-fill-planes{false}
+                              Do not fill zones that have no fill (route fills them in memory
+                              and routes soft)
+```
+
+### `tracemaker cuts`
+
+```text
+Cut test of a routed board's topology: cuts between pads and vias that cannot
+hold their wires, vias with no room in their cell (doc 05 §67)
+
+
+tracemaker cuts [OPTIONS] board
+
+
+POSITIONALS:
+  board TEXT:FILE REQUIRED    A routed board
+
+OPTIONS:
+  -h,     --help              Print this help message and exit
+          --json TEXT         Write the over-full cuts and the vias without room as JSON
+          --rules-from TEXT:FILE
+                              Read the design rules beside this board instead
+          --clearance FLOAT:NONNEGATIVE
+                              Judge against this clearance (mm) instead of the board's
+          --max-gap FLOAT:POSITIVE
+                              Check cuts up to this gap (mm, default 2)
+```
+
+### `tracemaker walled`
+
+```text
+Pins no track can leave past the board's fixed copper on any layer, with no room
+for a via (doc 20 §2.4)
+
+
+tracemaker walled [OPTIONS] board
+
+
+POSITIONALS:
+  board TEXT:FILE REQUIRED    A board
+
+OPTIONS:
+  -h,     --help              Print this help message and exit
+          --pin TEXT ...      Only these pins (REF.NUM; repeatable); by default every pad of a
+                              net with more than one pad
+          --json TEXT         Write the walled-in pins as JSON
+          --soft-zones        Zone fills of other nets, and net-less copper graphics on the
+                              pin, are no walls (route --soft-zones, --soft-copper-graphics)
+          --via-in-pad        A via may sit in the pin's own pad (route --via-in-pad)
 ```
 
 ### `tracemaker layers`
@@ -898,6 +1059,15 @@ OPTIONS:
                               nearest legal spot). Off by default: the placement model is
                               stricter than KiCad's DRC
           --no-decap-affinity Do not tie decoupling capacitors to their IC's supply pins
+          --decap-spread      Decoupling capacitors whose input position is a pile (--scratch,
+                              or beside the board) are spread over their IC's supply pins
+                              instead of tied to the pin nearest the pile (D171; off by
+                              default)
+          --decap-standoff-mm FLOAT:FLOAT in [0 - 20]
+                              With --decap-spread: a capacitor tied to an IC with 48 or more
+                              pads is pulled to a point this far outside the IC's body,
+                              straight out from its pin, keeping the band next to the pin rows
+                              for escapes (0 = onto the pin; default 2)
           --component-rules TEXT:{off,report,soft,on}
                               Component-aware layout rules (doc 15): off, report (detect and
                               list only), soft (proximity pseudo-nets: crystal, ESD, regulator
@@ -968,6 +1138,10 @@ OPTIONS:
                               --route-check, 0 = off)
           --record TEXT       routable: write the placement timelapse (JSONL: header, then one
                               frame per stage)
+          --place-advice TEXT:FILE
+                              routable/eco: placement advice file (JSON: seeds = proposed
+                              placements, eco = proposed moves; doc 17 stage 4), each kept only
+                              if it routes more
           --loop-time FLOAT   routable: wall-time stop in seconds; checked between seeds and
                               routes, keeps the best placement so far (0 = none)
 ```

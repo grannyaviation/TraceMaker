@@ -917,6 +917,44 @@
         ]
       ]
     },
+    "net_code": {
+      "items_not_allowed": [
+        [
+          "Y-front"
+        ],
+        [
+          "Y-through"
+        ]
+      ]
+    },
+    "net_code_lone": {},
+    "net_code_zero": {
+      "items_not_allowed": [
+        [
+          "free-net0"
+        ]
+      ]
+    },
+    "net_eq_hole_to_hole": {
+      "hole_to_hole": [
+        [
+          "hh-X1",
+          "hh-X2"
+        ]
+      ]
+    },
+    "net_ne_hole_to_hole": {
+      "hole_to_hole": [
+        [
+          "hh-X1",
+          "hh-Y"
+        ],
+        [
+          "hh-X2",
+          "hh-Y"
+        ]
+      ]
+    },
     "number_exponent": {},
     "number_inexact_eq_mil": {},
     "number_inexact_eq_mm": {},
@@ -1046,6 +1084,42 @@
         ]
       ]
     },
+    "pad_number": {
+      "items_not_allowed": [
+        [
+          "C1:pad1"
+        ],
+        [
+          "R1:pad1"
+        ],
+        [
+          "R2:pad1"
+        ],
+        [
+          "U1:pad1"
+        ]
+      ]
+    },
+    "pad_number_ne": {
+      "items_not_allowed": [
+        [
+          "C1:pad1"
+        ],
+        [
+          "H1:pad1"
+        ],
+        [
+          "R1:pad1"
+        ],
+        [
+          "R2:pad1"
+        ],
+        [
+          "U1:pad1"
+        ]
+      ]
+    },
+    "pad_number_other": {},
     "pad_type": {
       "items_not_allowed": [
         [
@@ -1069,6 +1143,36 @@
         [
           "R1:pad1",
           "via-in-SMD"
+        ]
+      ]
+    },
+    "pin_name": {
+      "items_not_allowed": [
+        [
+          "U1:pad1"
+        ]
+      ]
+    },
+    "pin_name_ne": {
+      "items_not_allowed": [
+        [
+          "C1:pad1"
+        ],
+        [
+          "H1:pad1"
+        ],
+        [
+          "R1:pad1"
+        ],
+        [
+          "R2:pad1"
+        ]
+      ]
+    },
+    "pin_name_wildcard": {
+      "items_not_allowed": [
+        [
+          "U1:pad1"
         ]
       ]
     },
